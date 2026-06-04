@@ -1,0 +1,30 @@
+{
+  "name": "memory",
+  "version": "0.1.2",
+  "description": "Mémoire persistante Claude Code (SQLite + FTS5) — capture via hooks, recherche via MCP.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsup && node scripts/postbuild.mjs",
+    "postinstall": "node scripts/postinstall.mjs",
+    "dev": "tsx src/server.ts",
+    "migrate": "node --no-warnings dist/migrate.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.25.0",
+    "sqlite-vec": "^0.1.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

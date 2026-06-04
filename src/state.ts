@@ -1,0 +1,64 @@
+import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import type { MemoryConfig } from './config.js';
+
+/** État accumulé par session entre les invocations de hooks (processus séparés). */
+export interface SessionState {
+  promptNumber: number;
+  obsSeq: number;
+  turnSeq: number;
+  lines: number; // lignes du transcript déjà traitées (curseur Stop)
+  prompts: string[];
+  filesModified: string[];
+  filesRead: string[];
+  tools: string[];
+  project?: string;
+  branch?: string;
+  cwd?: string;
+  startedAt: string;
+}
+
+function defaultState(): SessionState {
+  return {
+    promptNumber: 0,
+    obsSeq: 0,
+    turnSeq: 0,
+    lines: 0,
+    prompts: [],
+    filesModified: [],
+    filesRead: [],
+    tools: [],
+    startedAt: new Date().toISOString(),
+  };
+}
+
+function stateDir(cfg: MemoryConfig): string {
+  return path.join(cfg.dataDir, 'state');
+}
+
+function statePath(cfg: MemoryConfig, sessionId: string): string {
+  const safe = sessionId.replace(/[^A-Za-z0-9_.-]/g, '_');
+  return path.join(stateDir(cfg), `${safe}.json`);
+}
+
+export function loadState(cfg: MemoryConfig, sessionId: string): SessionState {
+  try {
+    const raw = readFileSync(statePath(cfg, sessionId), 'utf8');
+    return { ...defaultState(), ...JSON.parse(raw) };
+  } catch {
+    return defaultState();
+  }
+}
+
+export function saveState(cfg: MemoryConfig, sessionId: string, state: SessionState): void {
+  mkdirSync(stateDir(cfg), { recursive: true });
+  writeFileSync(statePath(cfg, sessionId), JSON.stringify(state), 'utf8');
+}
+
+export function clearState(cfg: MemoryConfig, sessionId: string): void {
+  try {
+    rmSync(statePath(cfg, sessionId));
+  } catch {
+    /* déjà absent */
+  }
+}

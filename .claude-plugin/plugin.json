@@ -1,0 +1,10 @@
+{
+  "name": "memory",
+  "version": "0.1.2",
+  "description": "Mémoire persistante pour Claude Code : capture brute via hooks (SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd), recherche hybride BM25 + sémantique (sqlite-vec + embeddings locaux transformers.js) via MCP. Stockage SQLite local embarqué — zéro serveur, zéro démon, zéro cloud.",
+  "author": {
+    "name": "yoannyviquel"
+  },
+  "mcpServers": "./.mcp.json",
+  "commands": "./commands/"
+}

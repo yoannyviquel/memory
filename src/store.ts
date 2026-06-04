@@ -1,0 +1,556 @@
+import { mkdirSync, existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+
+export type MemoryType = 'observation' | 'prompt' | 'turn' | 'session';
+
+/** Document de mémoire. Tous les champs sont optionnels selon le type. */
+export interface MemoryDoc {
+  type: MemoryType;
+  session_id?: string;
+  project?: string;
+  branch?: string;
+  cwd?: string;
+  ts?: string;
+  prompt_number?: number;
+  user_prompt?: string;
+  assistant_text?: string;
+  summary?: string;
+  tool_name?: string;
+  tool_brief?: string;
+  tools?: string[];
+  files_read?: string[];
+  files_modified?: string[];
+  prompts?: string[];
+  turn_count?: number;
+  started_at?: string;
+  ended_at?: string;
+  end_reason?: string;
+  source?: string;
+}
+
+export interface SearchParams {
+  query: string;
+  project?: string;
+  type?: MemoryType;
+  limit?: number;
+  /** Embedding de la requête (active la recherche hybride si fourni et vecteurs activés). */
+  embedding?: number[] | null;
+}
+
+export interface RecentParams {
+  project?: string;
+  type?: MemoryType;
+  limit?: number;
+}
+
+export interface BulkItem {
+  id: string;
+  doc: MemoryDoc;
+  embedding?: number[] | null;
+}
+
+export interface StatsResult {
+  dbPath: string;
+  total: number;
+  byType: Record<string, number>;
+  byProject: Record<string, number>;
+  vectorEnabled: boolean;
+  vectorCount: number;
+}
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+// Colonnes persistées dans `memories` (ordre = ordre des params d'upsert).
+const COLS = [
+  'mem_id', 'type', 'session_id', 'project', 'branch', 'cwd', 'ts', 'ts_epoch',
+  'prompt_number', 'user_prompt', 'assistant_text', 'summary', 'tool_name', 'tool_brief',
+  'tools', 'files_read', 'files_modified', 'prompts', 'prompts_text', 'turn_count',
+  'started_at', 'ended_at', 'end_reason', 'source',
+] as const;
+
+const FTS_COLS = ['summary', 'user_prompt', 'assistant_text', 'tool_brief', 'prompts_text'];
+const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.0, 1.5';
+const RRF_K = 60;
+
+/** Charge node:sqlite via un specifier en variable (empêche esbuild de réécrire le préfixe node:). */
+let _DatabaseSync: any;
+async function getDatabaseSync(): Promise<any> {
+  if (_DatabaseSync) return _DatabaseSync;
+  const spec = 'node:sqlite';
+  ({ DatabaseSync: _DatabaseSync } = await import(spec));
+  return _DatabaseSync;
+}
+
+/** Localise la lib chargeable sqlite-vec (dev via node_modules, ou copiée dans dist/). */
+function resolveVecExtension(): string | null {
+  const libName =
+    process.platform === 'win32'
+      ? 'vec0.dll'
+      : process.platform === 'darwin'
+        ? 'vec0.dylib'
+        : 'vec0.so';
+  const candidates: Array<string | undefined> = [process.env.MEMORY_VEC_EXTENSION];
+  try {
+    const req = createRequire(import.meta.url);
+    candidates.push(req('sqlite-vec').getLoadablePath());
+  } catch {
+    /* wrapper absent (build shippé) */
+  }
+  candidates.push(path.join(HERE, libName));
+  for (const c of candidates) {
+    if (c && existsSync(c)) return c;
+  }
+  return null;
+}
+
+function ftsQuery(q: string): string | null {
+  const tokens = (q.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []).filter((t) => t.length > 1);
+  if (tokens.length === 0) return null;
+  return tokens.map((t) => `"${t}"*`).join(' OR ');
+}
+
+function toEpoch(ts?: string): number {
+  if (!ts) return Date.now();
+  const n = Date.parse(ts);
+  return Number.isNaN(n) ? Date.now() : n;
+}
+
+function jsonArr(v: unknown): string[] {
+  if (!v || typeof v !== 'string') return [];
+  try {
+    const a = JSON.parse(v);
+    return Array.isArray(a) ? a.filter((x) => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToDoc(r: any): MemoryDoc {
+  return {
+    type: r.type,
+    session_id: r.session_id ?? undefined,
+    project: r.project ?? undefined,
+    branch: r.branch ?? undefined,
+    cwd: r.cwd ?? undefined,
+    ts: r.ts ?? undefined,
+    prompt_number: r.prompt_number ?? undefined,
+    user_prompt: r.user_prompt ?? undefined,
+    assistant_text: r.assistant_text ?? undefined,
+    summary: r.summary ?? undefined,
+    tool_name: r.tool_name ?? undefined,
+    tool_brief: r.tool_brief ?? undefined,
+    tools: jsonArr(r.tools),
+    files_read: jsonArr(r.files_read),
+    files_modified: jsonArr(r.files_modified),
+    prompts: jsonArr(r.prompts),
+    turn_count: r.turn_count ?? undefined,
+    started_at: r.started_at ?? undefined,
+    ended_at: r.ended_at ?? undefined,
+    end_reason: r.end_reason ?? undefined,
+    source: r.source ?? undefined,
+  };
+}
+
+function toBlob(arr: number[]): Uint8Array {
+  return new Uint8Array(Float32Array.from(arr).buffer);
+}
+
+/**
+ * Stockage des mémoires en SQLite local. Index full-text FTS5 (BM25) + index vectoriel
+ * optionnel (sqlite-vec) pour la recherche sémantique hybride. Aucun serveur, in-process.
+ */
+export class MemoryStore {
+  private db: any;
+  private _vectorEnabled = false;
+
+  constructor(
+    private readonly dbPath: string,
+    private readonly dim = 384,
+    private readonly model = '',
+  ) {}
+
+  get path(): string {
+    return this.dbPath;
+  }
+  get vectorEnabled(): boolean {
+    return this._vectorEnabled;
+  }
+
+  private metaGet(k: string): string | null {
+    try {
+      const r = this.db.prepare('SELECT v FROM meta WHERE k = ?').get(k);
+      return r ? String(r.v) : null;
+    } catch {
+      return null;
+    }
+  }
+  private metaSet(k: string, v: string): void {
+    this.db
+      .prepare('INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v')
+      .run(k, v);
+  }
+
+  async init(): Promise<void> {
+    if (this.db) return;
+    const DatabaseSync = await getDatabaseSync();
+    mkdirSync(path.dirname(this.dbPath), { recursive: true });
+    this.db = new DatabaseSync(this.dbPath, { allowExtension: true });
+    this.db.exec('PRAGMA journal_mode=WAL;');
+    this.db.exec('PRAGMA busy_timeout=3000;');
+    this.db.exec('PRAGMA synchronous=NORMAL;');
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS memories (
+        rowid INTEGER PRIMARY KEY,
+        mem_id TEXT UNIQUE,
+        type TEXT, session_id TEXT, project TEXT, branch TEXT, cwd TEXT,
+        ts TEXT, ts_epoch INTEGER, prompt_number INTEGER,
+        user_prompt TEXT, assistant_text TEXT, summary TEXT,
+        tool_name TEXT, tool_brief TEXT,
+        tools TEXT, files_read TEXT, files_modified TEXT,
+        prompts TEXT, prompts_text TEXT,
+        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT
+      );
+    `);
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);');
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+        ${FTS_COLS.join(', ')}, content='memories', content_rowid='rowid'
+      );
+    `);
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+        INSERT INTO memories_fts(rowid, ${FTS_COLS.join(', ')})
+        VALUES (new.rowid, ${FTS_COLS.map((c) => 'new.' + c).join(', ')});
+      END;
+    `);
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, ${FTS_COLS.join(', ')})
+        VALUES ('delete', old.rowid, ${FTS_COLS.map((c) => 'old.' + c).join(', ')});
+      END;
+    `);
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+        INSERT INTO memories_fts(memories_fts, rowid, ${FTS_COLS.join(', ')})
+        VALUES ('delete', old.rowid, ${FTS_COLS.map((c) => 'old.' + c).join(', ')});
+        INSERT INTO memories_fts(rowid, ${FTS_COLS.join(', ')})
+        VALUES (new.rowid, ${FTS_COLS.map((c) => 'new.' + c).join(', ')});
+      END;
+    `);
+
+    this.db.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);');
+
+    // Index vectoriel optionnel : si l'extension ne charge pas, on continue en BM25 seul.
+    const ext = resolveVecExtension();
+    if (ext) {
+      try {
+        this.db.enableLoadExtension(true);
+        this.db.loadExtension(ext);
+
+        // Si le modèle/dimension a changé depuis la dernière fois, les anciens vecteurs ne sont
+        // plus comparables → on recrée l'index vide ; le backfill du serveur revectorisera.
+        const prevModel = this.metaGet('embed_model');
+        const prevDim = this.metaGet('embed_dim');
+        // Modèle connu et différent (ou meta absente alors que des vecteurs existent déjà) →
+        // les anciens vecteurs ne sont plus comparables : on repart d'un index vide.
+        const changed =
+          this.model !== '' &&
+          (prevModel !== this.model || (prevDim !== null && Number(prevDim) !== this.dim));
+        if (changed) this.db.exec('DROP TABLE IF EXISTS vec_memories;');
+
+        this.db.exec(
+          `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`,
+        );
+        this.metaSet('embed_model', this.model);
+        this.metaSet('embed_dim', String(this.dim));
+        this._vectorEnabled = true;
+      } catch {
+        this._vectorEnabled = false;
+      } finally {
+        try {
+          this.db.enableLoadExtension(false);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  }
+
+  private docToParams(id: string, d: MemoryDoc): unknown[] {
+    const prompts = d.prompts ?? [];
+    const promptsText = prompts.join(' \n ');
+    const map: Record<string, unknown> = {
+      mem_id: id,
+      type: d.type,
+      session_id: d.session_id ?? null,
+      project: d.project ?? null,
+      branch: d.branch ?? null,
+      cwd: d.cwd ?? null,
+      ts: d.ts ?? null,
+      ts_epoch: toEpoch(d.ts ?? d.ended_at ?? d.started_at),
+      prompt_number: d.prompt_number ?? null,
+      user_prompt: d.user_prompt ?? null,
+      assistant_text: d.assistant_text ?? null,
+      summary: d.summary ?? null,
+      tool_name: d.tool_name ?? null,
+      tool_brief: d.tool_brief ?? null,
+      tools: JSON.stringify(d.tools ?? []),
+      files_read: JSON.stringify(d.files_read ?? []),
+      files_modified: JSON.stringify(d.files_modified ?? []),
+      prompts: JSON.stringify(prompts),
+      prompts_text: promptsText || null,
+      turn_count: d.turn_count ?? null,
+      started_at: d.started_at ?? null,
+      ended_at: d.ended_at ?? null,
+      end_reason: d.end_reason ?? null,
+      source: d.source ?? null,
+    };
+    return COLS.map((c) => map[c]);
+  }
+
+  private upsertSql(): string {
+    const placeholders = COLS.map(() => '?').join(', ');
+    const updates = COLS.filter((c) => c !== 'mem_id')
+      .map((c) => `${c}=excluded.${c}`)
+      .join(', ');
+    return `INSERT INTO memories (${COLS.join(', ')}) VALUES (${placeholders})
+            ON CONFLICT(mem_id) DO UPDATE SET ${updates};`;
+  }
+
+  private rowidOf(memId: string): number | null {
+    const r = this.db.prepare('SELECT rowid FROM memories WHERE mem_id = ?').get(memId);
+    return r ? Number(r.rowid) : null;
+  }
+
+  /** Met à jour le vecteur d'un doc (vec0 ne supporte pas OR REPLACE → DELETE+INSERT). */
+  private upsertVector(rowid: number, embedding?: number[] | null): void {
+    if (!this._vectorEnabled || !embedding || embedding.length !== this.dim) return;
+    try {
+      this.db.prepare('DELETE FROM vec_memories WHERE rowid = ?').run(BigInt(rowid));
+      this.db
+        .prepare('INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)')
+        .run(BigInt(rowid), toBlob(embedding));
+    } catch {
+      /* ne jamais casser l'upsert principal */
+    }
+  }
+
+  /** Insère ou met à jour un document (idempotent sur mem_id) + son vecteur si fourni. */
+  upsert(id: string, doc: MemoryDoc, embedding?: number[] | null): void {
+    this.db.prepare(this.upsertSql()).run(...this.docToParams(id, doc));
+    if (embedding) {
+      const rid = this.rowidOf(id);
+      if (rid != null) this.upsertVector(rid, embedding);
+    }
+  }
+
+  /** Affecte/Met à jour le vecteur d'un doc par rowid (utilisé par le backfill du serveur). */
+  setVectorByRowid(rowid: number, embedding: number[]): void {
+    this.upsertVector(rowid, embedding);
+  }
+
+  /**
+   * Documents vectorisables (prompt/turn/session) sans vecteur, plus récents d'abord.
+   * Renvoie le rowid + le texte à plonger. Vide si index vectoriel désactivé.
+   */
+  missingVectorDocs(limit = 32): Array<{ rowid: number; text: string }> {
+    if (!this._vectorEnabled) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT rowid, summary, user_prompt, assistant_text, prompts_text
+         FROM memories
+         WHERE type IN ('prompt','turn','session')
+           AND rowid NOT IN (SELECT rowid FROM vec_memories)
+         ORDER BY ts_epoch DESC LIMIT ?;`,
+      )
+      .all(limit);
+    return rows.map((r: any) => ({
+      rowid: Number(r.rowid),
+      text: [r.summary, r.user_prompt, r.assistant_text, r.prompts_text]
+        .filter((s: unknown) => typeof s === 'string' && s.trim())
+        .join('\n')
+        .slice(0, 2000),
+    }));
+  }
+
+  /** Nombre de docs vectorisables encore sans vecteur (lag du backfill). */
+  countMissingVectors(): number {
+    if (!this._vectorEnabled) return 0;
+    try {
+      return Number(
+        (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) c FROM memories
+               WHERE type IN ('prompt','turn','session')
+                 AND rowid NOT IN (SELECT rowid FROM vec_memories);`,
+            )
+            .get() as any
+        ).c,
+      );
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Upsert en masse dans une transaction. */
+  bulkUpsert(items: BulkItem[]): { indexed: number; errors: number } {
+    if (items.length === 0) return { indexed: 0, errors: 0 };
+    const stmt = this.db.prepare(this.upsertSql());
+    let indexed = 0;
+    let errors = 0;
+    this.db.exec('BEGIN;');
+    try {
+      for (const it of items) {
+        try {
+          stmt.run(...this.docToParams(it.id, it.doc));
+          if (it.embedding) {
+            const rid = this.rowidOf(it.id);
+            if (rid != null) this.upsertVector(rid, it.embedding);
+          }
+          indexed++;
+        } catch {
+          errors++;
+        }
+      }
+      this.db.exec('COMMIT;');
+    } catch (err) {
+      this.db.exec('ROLLBACK;');
+      throw err;
+    }
+    return { indexed, errors };
+  }
+
+  /** Rowids BM25 ordonnés par pertinence. */
+  private bm25Rows(query: string, project?: string, type?: MemoryType, n = 40): number[] {
+    const ftsq = ftsQuery(query);
+    if (!ftsq) return [];
+    const where = ['memories_fts MATCH ?'];
+    const args: unknown[] = [ftsq];
+    if (project) {
+      where.push('m.project = ?');
+      args.push(project);
+    }
+    if (type) {
+      where.push('m.type = ?');
+      args.push(type);
+    }
+    args.push(n);
+    const sql = `SELECT m.rowid FROM memories_fts f JOIN memories m ON m.rowid = f.rowid
+                 WHERE ${where.join(' AND ')}
+                 ORDER BY bm25(memories_fts, ${BM25_WEIGHTS}) LIMIT ?;`;
+    return this.db.prepare(sql).all(...args).map((r: any) => Number(r.rowid));
+  }
+
+  /** Rowids KNN (sémantique) ordonnés par distance, filtrés par project/type. */
+  private vecRows(embedding: number[], project?: string, type?: MemoryType, n = 40): number[] {
+    if (!this._vectorEnabled || embedding.length !== this.dim) return [];
+    const knn = this.db
+      .prepare(
+        'SELECT rowid, distance FROM vec_memories WHERE embedding MATCH ? ORDER BY distance LIMIT ?;',
+      )
+      .all(toBlob(embedding), n)
+      .map((r: any) => Number(r.rowid));
+    if (knn.length === 0 || (!project && !type)) return knn;
+    // Filtre project/type en préservant l'ordre KNN.
+    const placeholders = knn.map(() => '?').join(',');
+    const where = [`rowid IN (${placeholders})`];
+    const args: unknown[] = [...knn];
+    if (project) {
+      where.push('project = ?');
+      args.push(project);
+    }
+    if (type) {
+      where.push('type = ?');
+      args.push(type);
+    }
+    const kept = new Set<number>(
+      this.db
+        .prepare(`SELECT rowid FROM memories WHERE ${where.join(' AND ')};`)
+        .all(...args)
+        .map((r: any) => Number(r.rowid)),
+    );
+    return knn.filter((rid: number) => kept.has(rid));
+  }
+
+  private docsByRowids(rowids: number[]): MemoryDoc[] {
+    if (rowids.length === 0) return [];
+    const placeholders = rowids.map(() => '?').join(',');
+    const rows = this.db
+      .prepare(`SELECT * FROM memories WHERE rowid IN (${placeholders});`)
+      .all(...rowids);
+    const byRowid = new Map<number, any>(rows.map((r: any) => [Number(r.rowid), r]));
+    return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
+  }
+
+  /** Recherche : BM25 seul, ou hybride (RRF de BM25 + KNN) si un embedding est fourni. */
+  search(params: SearchParams): MemoryDoc[] {
+    const limit = params.limit ?? 10;
+    const cand = Math.max(limit * 4, 40);
+    const bm = this.bm25Rows(params.query, params.project, params.type, cand);
+    const vec =
+      params.embedding && this._vectorEnabled
+        ? this.vecRows(params.embedding, params.project, params.type, cand)
+        : [];
+    if (vec.length === 0) return this.docsByRowids(bm.slice(0, limit));
+
+    // Reciprocal Rank Fusion.
+    const score = new Map<number, number>();
+    bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+    vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+    const ordered = [...score.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, limit)
+      .map((e) => e[0]);
+    return this.docsByRowids(ordered);
+  }
+
+  recent(params: RecentParams): MemoryDoc[] {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (params.project) {
+      where.push('project = ?');
+      args.push(params.project);
+    }
+    if (params.type) {
+      where.push('type = ?');
+      args.push(params.type);
+    }
+    args.push(params.limit ?? 10);
+    const sql = `SELECT * FROM memories
+                 ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                 ORDER BY ts_epoch DESC LIMIT ?;`;
+    return this.db.prepare(sql).all(...args).map(rowToDoc);
+  }
+
+  stats(): StatsResult {
+    const total = Number((this.db.prepare('SELECT COUNT(*) c FROM memories').get() as any).c);
+    const byType: Record<string, number> = {};
+    for (const r of this.db.prepare('SELECT type, COUNT(*) c FROM memories GROUP BY type').all())
+      byType[r.type] = Number(r.c);
+    const byProject: Record<string, number> = {};
+    for (const r of this.db
+      .prepare('SELECT project, COUNT(*) c FROM memories GROUP BY project ORDER BY c DESC LIMIT 20')
+      .all())
+      byProject[r.project ?? '?'] = Number(r.c);
+    let vectorCount = 0;
+    if (this._vectorEnabled) {
+      try {
+        vectorCount = Number((this.db.prepare('SELECT COUNT(*) c FROM vec_memories').get() as any).c);
+      } catch {
+        /* ignore */
+      }
+    }
+    return { dbPath: this.dbPath, total, byType, byProject, vectorEnabled: this._vectorEnabled, vectorCount };
+  }
+
+  close(): void {
+    try {
+      this.db?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
