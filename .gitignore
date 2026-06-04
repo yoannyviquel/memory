@@ -80,7 +80,9 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-dist
+# dist/ est VOLONTAIREMENT committé : le plugin est distribué via github et
+# Claude Code ne lance pas `npm run build` à l'install (seulement `npm install`).
+# dist
 .output
 
 # Gatsby files
