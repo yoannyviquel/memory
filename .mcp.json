@@ -3,7 +3,10 @@
     "memory": {
       "type": "stdio",
       "command": "node",
-      "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/dist/server.js"]
+      "args": ["--no-warnings", "${CLAUDE_PLUGIN_ROOT}/dist/server.js"],
+      "env": {
+        "MEMORY_EMBED_TIER": "${user_config.embedTier}"
+      }
     }
   }
 }
