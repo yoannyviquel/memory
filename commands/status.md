@@ -1,33 +1,34 @@
 ---
 name: memory:status
-description: Diagnostique l'état de la base SQLite des mémoires
+description: Diagnose the state of the memories SQLite database
 ---
 
-# État memory
+# memory status
 
-Vérifie l'état du système de mémoire.
+Checks the state of the memory system.
 
-Marche à suivre :
-1. Appelle l'outil MCP **`memory_stats`** (aucun argument requis).
-2. Rapporte :
-   - le chemin de la base SQLite,
-   - le nombre total de documents,
-   - la répartition par `type` (observation / prompt / turn / session),
-   - la répartition par `project` (top projets),
-   - l'état de l'index vectoriel (activé/désactivé, indexés vs en attente),
-   - le modèle d'embedding et s'il est chargé.
-3. Pour diagnostiquer un démarrage lent ou un téléchargement de modèle figé, indique
-   le journal `~/.claude-memory/logs/memory.log` (lignes `[server]` / `[embed] download …%`).
+Steps:
+1. Call the MCP tool **`memory_stats`** (no argument required).
+2. Report:
+   - the path of the SQLite database,
+   - the total number of documents,
+   - the breakdown by `type` (observation / prompt / turn / session),
+   - the breakdown by `project` (top projects),
+   - the state of the vector index (enabled/disabled, indexed vs pending),
+   - the embedding model and whether it is loaded.
+3. To diagnose a slow startup or a stuck model download, point to
+   the log `~/.claude-memory/logs/memory.log` (`[server]` / `[embed] download …%` lines).
 
-## Rappel de présence dans la status line (optionnel)
+## Presence reminder in the status line (optional)
 
-Le serveur écrit `~/.claude-memory/status.json` et un snippet prêt à l'emploi
-`~/.claude-memory/statusline.mjs`. Pour afficher en permanence « 🧠 mem » (rappel que le
-plugin est actif et indexe en fond), ajouter à `settings.json` :
+The server writes `~/.claude-memory/status.json` and a ready-to-use snippet
+`~/.claude-memory/statusline.mjs`. To permanently show "🧠 mem" (a reminder that the
+plugin is active and indexing in the background), add to `settings.json`:
 
 ```json
 { "statusLine": { "type": "command", "command": "node ~/.claude-memory/statusline.mjs" } }
 ```
 
-La barre affiche `🧠 mem` au repos, `🧠 mem ⚙` pendant une indexation, `🧠 mem ⏳x%` pendant
-le téléchargement d'un modèle. (Elle se rafraîchit sur activité de conversation, pas en continu.)
+The bar shows `🧠 mem` when idle, `🧠 mem ⚙` during indexing, `🧠 mem ⏳x%` during
+a model download. (It refreshes on conversation activity, not continuously.)
+</content>

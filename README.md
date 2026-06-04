@@ -1,74 +1,74 @@
 # memory
 
-Mémoire persistante pour Claude Code, stockée en **SQLite local**, avec recherche **hybride
-BM25 + sémantique**. Alternative légère à claude-mem : **base embarquée, embeddings locaux,
-zéro serveur, zéro démon, aucun appel LLM/cloud**. Les hooks ne bloquent jamais Claude Code.
+Persistent memory for Claude Code, stored in **local SQLite**, with **hybrid BM25 +
+semantic** search. A lightweight alternative to claude-mem: **embedded database, local
+embeddings, zero server, zero daemon, no LLM/cloud calls**. The hooks never block Claude Code.
 
-## Pourquoi SQLite (et pas Elasticsearch)
+## Why SQLite (and not Elasticsearch)
 
-SQLite est une base **embarquée** : une lib + un fichier ouvert in-process. Pas de serveur à
-installer ni à démarrer. Elasticsearch est un **serveur** (JVM, port, ~1-2 Go RAM) qu'il faut
-lancer à côté — exactement le type de dépendance externe (comme Chroma/uvx) qui a rendu claude-mem
-fragile. Ici, FTS5 (BM25) et l'index vectoriel (sqlite-vec) sont chargés in-process dans le SQLite
-de Node, et les embeddings sont calculés en local par transformers.js — rien à installer à côté.
+SQLite is an **embedded** database: a library + a file opened in-process. No server to install
+or start. Elasticsearch is a **server** (JVM, port, ~1-2 GB RAM) you have to run alongside —
+exactly the kind of external dependency (like Chroma/uvx) that made claude-mem fragile. Here,
+FTS5 (BM25) and the vector index (sqlite-vec) are loaded in-process inside Node's SQLite, and
+embeddings are computed locally by transformers.js — nothing to run alongside.
 
-## Recherche : BM25 + sémantique (hybride)
+## Search: BM25 + semantic (hybrid)
 
-- **BM25 (FTS5)** : lexical, toujours actif, zéro dépendance. Excellent sur les identifiants
-  exacts (fichiers, erreurs, commandes).
-- **Sémantique** : embeddings calculés en local (**transformers.js**, modèle ONNX) et stockés dans
-  **sqlite-vec**. Trouve par le sens (synonymes, paraphrase) même sans mot commun. Pas de cloud,
-  pas de clé, pas de démon. Le modèle est téléchargé une fois (cache local) au 1er usage.
-- Les deux classements sont fusionnés (**Reciprocal Rank Fusion**).
-- **Si l'embedder est indisponible → recherche en BM25 seul, sans erreur.**
+- **BM25 (FTS5)**: lexical, always on, zero dependency. Excellent on exact identifiers
+  (files, errors, commands).
+- **Semantic**: embeddings computed locally (**transformers.js**, ONNX model) and stored in
+  **sqlite-vec**. Finds by meaning (synonyms, paraphrase) even without a common word. No cloud,
+  no key, no daemon. The model is downloaded once (local cache) on first use.
+- The two rankings are fused (**Reciprocal Rank Fusion**).
+- **If the embedder is unavailable → BM25-only search, no error.**
 
-### Architecture des embeddings (important)
+### Embeddings architecture (important)
 
-Les **hooks sont des process éphémères** : charger un modèle à chaque hook serait trop lent. Donc
-les hooks **capturent sans vectoriser** (BM25 immédiat). C'est le **serveur MCP persistant** qui,
-en tâche de fond (au démarrage puis toutes les 60 s), vectorise les documents en attente
-(*backfill*) — le modèle n'est chargé qu'une fois, dans ce process. Les observations (appels
-d'outils, surtout des identifiants) ne sont pas vectorisées : BM25 y suffit.
+The **hooks are ephemeral processes**: loading a model on every hook would be too slow. So the
+hooks **capture without vectorizing** (immediate BM25). It's the **persistent MCP server** that,
+in the background (at startup then every 60 s), vectorizes the pending documents (*backfill*) —
+the model is loaded only once, in that process. Observations (tool calls, mostly identifiers)
+are not vectorized: BM25 is enough for them.
 
-### Paliers de modèle (multilingue)
+### Model tiers (multilingual)
 
-Trois paliers, famille **e5** (multilingue, bon en français), via `/memory:config <palier>` ou
-le fichier `~/.claude-memory/config.json` (`{"embedTier":"medium"}`) :
+Three tiers, **e5** family (multilingual, good in French), via `/memory:config <tier>` or the
+`~/.claude-memory/config.json` file (`{"embedTier":"medium"}`):
 
-| Palier | Modèle | Dim | Taille (q8) | Usage |
+| Tier | Model | Dim | Size (q8) | Use |
 |---|---|---|---|---|
-| `light` (défaut) | `Xenova/multilingual-e5-small` | 384 | ~120 Mo | rapide |
-| `medium` | `Xenova/multilingual-e5-base` | 768 | ~280 Mo | meilleur compromis |
-| `heavy` | `Xenova/multilingual-e5-large` | 1024 | ~560 Mo | qualité max |
+| `light` (default) | `Xenova/multilingual-e5-small` | 384 | ~120 MB | fast |
+| `medium` | `Xenova/multilingual-e5-base` | 768 | ~280 MB | best trade-off |
+| `heavy` | `Xenova/multilingual-e5-large` | 1024 | ~560 MB | max quality |
 
-Les modèles sont chargés en **q8 (quantifié)** par défaut : ~4× plus légers à télécharger qu'en
-fp32, pour une perte de qualité négligeable en recherche sémantique. Forcer la pleine précision :
+Models are loaded in **q8 (quantized)** by default: ~4× lighter to download than fp32, for a
+negligible quality loss in semantic search. Force full precision:
 `MEMORY_EMBED_DTYPE=fp32`.
 
-**Changer de palier est sans risque** : le modèle/dimension changeant, les anciens vecteurs sont
-automatiquement effacés (détection via une table `meta`) et **revectorisés en tâche de fond** ; les
-documents restent cherchables en BM25 entre-temps. Override avancé : env `MEMORY_EMBED_MODEL` +
+**Changing tier is safe**: since the model/dimension changes, the old vectors are automatically
+cleared (detected via a `meta` table) and **re-vectorized in the background**; documents stay
+searchable via BM25 in the meantime. Advanced override: env `MEMORY_EMBED_MODEL` +
 `MEMORY_EMBED_DIM`.
 
-## Ce que ça fait
+## What it does
 
-- **Capture** automatique via hooks (mêmes événements que claude-mem) :
-  - `SessionStart` → **injecte** les mémoires récentes du projet dans le contexte (économie de tokens).
-  - `UserPromptSubmit` → indexe le prompt utilisateur.
-  - `PostToolUse` → indexe une observation par appel d'outil (outil, fichiers touchés).
-  - `Stop` → indexe le tour assistant (texte, outils, fichiers).
-  - `SessionEnd` → indexe une synthèse de session.
-- **Recherche** via MCP : `memory_search` (hybride), `memory_recent`, `memory_stats`.
-- **Migration** de l'historique claude-mem (SQLite) → base memory.
+- **Automatic capture** via hooks (same events as claude-mem):
+  - `SessionStart` → **injects** the project's recent memories into the context (token savings).
+  - `UserPromptSubmit` → indexes the user prompt.
+  - `PostToolUse` → indexes one observation per tool call (tool, touched files).
+  - `Stop` → indexes the assistant turn (text, tools, files).
+  - `SessionEnd` → indexes a session summary.
+- **Search** via MCP: `memory_search` (hybrid), `memory_recent`, `memory_stats`.
+- **Migration** of claude-mem history (SQLite) → memory database.
 
-Tous les hooks tournent en `suppressOutput` (aucun bruit dans le contexte), sauf `SessionStart`
-qui émet `additionalContext`.
+All hooks run with `suppressOutput` (no noise in the context), except `SessionStart` which
+emits `additionalContext`.
 
-## Prérequis
+## Requirements
 
-- **Node ≥ 22.5** (module `node:sqlite` + FTS5 + chargement d'extension). Lancé via `node --no-warnings`.
-- Le sémantique fonctionne sans rien installer d'autre (transformers.js + onnxruntime-node prebuilt
-  via `npm install` ; modèle téléchargé au 1er usage). Désactivable avec `MEMORY_EMBED_ENABLED=0`.
+- **Node ≥ 22.5** (`node:sqlite` module + FTS5 + extension loading). Launched via `node --no-warnings`.
+- Semantic search works without installing anything else (transformers.js + onnxruntime-node prebuilt
+  via `npm install`; model downloaded on first use). Can be disabled with `MEMORY_EMBED_ENABLED=0`.
 
 ## Installation
 
@@ -78,90 +78,92 @@ npm install
 npm run build      # -> dist/server.js, dist/hook.js, dist/migrate.js, dist/vec0.dll
 ```
 
-Dans Claude Code (ajouter le dépôt comme marketplace local, puis installer) :
+In Claude Code (add the repo as a local marketplace, then install):
 
 ```
 /plugin marketplace add C:/tfs/yoannyviquel/memory
 /plugin install memory
 ```
 
-Relance Claude Code (ou `/reload-plugins`) pour activer hooks + serveur MCP.
+Restart Claude Code (or `/reload-plugins`) to activate hooks + MCP server.
 
 ## Configuration
 
-Deux mécanismes, **l'env est prioritaire sur le fichier** :
-- Fichier `~/.claude-memory/config.json`, ex. `{ "embedTier": "medium" }` (clés : `embedTier`,
-  `embedEnabled`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Modifiable via `/memory:config`.
-- Variables d'environnement système (overrides) :
+Two mechanisms, **env takes precedence over the file**:
+- File `~/.claude-memory/config.json`, e.g. `{ "embedTier": "medium" }` (keys: `embedTier`,
+  `embedEnabled`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
+- System environment variables (overrides):
 
-| Variable | Défaut | Rôle |
+| Variable | Default | Role |
 |---|---|---|
-| `MEMORY_EMBED_TIER` | `light` | Palier modèle : `light` / `medium` / `heavy` (voir ci-dessus) |
-| `MEMORY_DB_PATH` | `~/.claude-memory/memories.db` | Fichier SQLite des mémoires |
-| `MEMORY_DATA_DIR` | `~/.claude-memory` | Dossier (db + curseurs + cache modèles + config.json) |
-| `MEMORY_CONTEXT_LIMIT` | `10` | Mémoires injectées au `SessionStart` |
-| `MEMORY_EMBED_ENABLED` | _(activé)_ | `0` pour désactiver le sémantique (BM25 seul) |
-| `MEMORY_EMBED_MODEL` | _(selon palier)_ | Force un modèle précis (override du palier) |
-| `MEMORY_EMBED_DIM` | _(selon palier)_ | Force la dimension (doit matcher le modèle) |
-| `MEMORY_EMBED_DTYPE` | `q8` | Précision ONNX : `q8` (quantifié) ou `fp32` (pleine précision) |
-| `MEMORY_EMBED_CACHE_DIR` | `~/.claude-memory/models` | Cache des modèles ONNX |
-| `MEMORY_VEC_EXTENSION` | _(auto)_ | Chemin explicite de la lib sqlite-vec |
+| `MEMORY_EMBED_TIER` | `light` | Model tier: `light` / `medium` / `heavy` (see above) |
+| `MEMORY_DB_PATH` | `~/.claude-memory/memories.db` | Memories SQLite file |
+| `MEMORY_DATA_DIR` | `~/.claude-memory` | Folder (db + cursors + model cache + config.json) |
+| `MEMORY_CONTEXT_LIMIT` | `10` | Memories injected at `SessionStart` |
+| `MEMORY_EMBED_ENABLED` | _(enabled)_ | `0` to disable semantic search (BM25 only) |
+| `MEMORY_EMBED_MODEL` | _(per tier)_ | Force a specific model (overrides the tier) |
+| `MEMORY_EMBED_DIM` | _(per tier)_ | Force the dimension (must match the model) |
+| `MEMORY_EMBED_DTYPE` | `q8` | ONNX precision: `q8` (quantized) or `fp32` (full precision) |
+| `MEMORY_EMBED_CACHE_DIR` | `~/.claude-memory/models` | ONNX model cache |
+| `MEMORY_VEC_EXTENSION` | _(auto)_ | Explicit path to the sqlite-vec library |
 
-> Le plugin lui-même ne demande **aucune** config à l'installation. Changer de modèle/palier est sûr :
-> les anciens vecteurs sont détectés (table `meta`), effacés et revectorisés en fond automatiquement.
+> The plugin itself requires **no** config at install time. Changing model/tier is safe:
+> old vectors are detected (`meta` table), cleared and re-vectorized in the background automatically.
 
-## Schéma
+## Schema
 
-Table `memories` (4 `type` : `observation`, `prompt`, `turn`, `session`) + FTS5 `memories_fts`
-(triggers de sync) + `vec_memories` (sqlite-vec). `mem_id` déterministe
-(`{session}:obs:{n}`, `…:prompt:{n}`, `…:turn:{n}`, `…:session`) → upsert idempotent
-(`ON CONFLICT`). Mode WAL pour l'accès concurrent hooks/serveur.
+Table `memories` (4 `type`s: `observation`, `prompt`, `turn`, `session`) + FTS5 `memories_fts`
+(sync triggers) + `vec_memories` (sqlite-vec). Deterministic `mem_id`
+(`{session}:obs:{n}`, `…:prompt:{n}`, `…:turn:{n}`, `…:session`) → idempotent upsert
+(`ON CONFLICT`). WAL mode for concurrent hook/server access.
 
-## Migration depuis claude-mem
+## Migration from claude-mem
 
 ```bash
-node --no-warnings dist/migrate.js --dry-run            # compte sans écrire
-node --no-warnings dist/migrate.js                      # importe (BM25 ; vecteurs faits par le serveur ensuite)
-node --no-warnings dist/migrate.js --embed              # importe + vectorise tout de suite (modèle local)
+node --no-warnings dist/migrate.js --dry-run            # counts without writing
+node --no-warnings dist/migrate.js                      # imports (BM25; vectors done by the server afterwards)
+node --no-warnings dist/migrate.js --embed              # imports + vectorizes right away (local model)
 ```
 
-Options : `--db <chemin>` (défaut `~/.claude-mem/claude-mem.db`), `--project <nom>`, `--batch <n>`,
-`--embed`. Lecture seule sur la base claude-mem. Docs migrés préfixés `migrated:` → relançable
-sans doublon. Mappe `observations`, `session_summaries`, `user_prompts`.
+Options: `--db <path>` (default `~/.claude-mem/claude-mem.db`), `--project <name>`, `--batch <n>`,
+`--embed`. Read-only on the claude-mem database. Migrated docs prefixed `migrated:` → re-runnable
+without duplicates. Maps `observations`, `session_summaries`, `user_prompts`.
 
-Sans `--embed`, les docs migrés seront vectorisés progressivement par le backfill du serveur MCP.
+Without `--embed`, migrated docs will be vectorized progressively by the MCP server's backfill.
 
-Ou via la commande : `/memory:migrate`.
+Or via the command: `/memory:migrate`.
 
-## Commandes
+## Commands
 
-- `/memory:search <texte>` — recherche hybride.
-- `/memory:status` — base + index vectoriel + état de l'embedder + lag de backfill.
-- `/memory:config <light|medium|heavy>` — change le palier du modèle d'embedding.
-- `/memory:migrate` — migration claude-mem.
+- `/memory:search <text>` — hybrid search.
+- `/memory:status` — database + vector index + embedder state + backfill lag.
+- `/memory:config <light|medium|heavy>` — change the embedding model tier.
+- `/memory:migrate` — claude-mem migration.
 
-## Diagnostic & status line
+## Diagnostics & status line
 
-- **Logs** : `~/.claude-memory/logs/memory.log` (rotation 1 Mo). Au démarrage : version, node,
-  base, modèle, `dtype`, état des vecteurs et présence du modèle sur disque. Le téléchargement
-  d'un modèle est tracé (`[embed] download model.onnx 40%…`) — utile si un 1er usage paraît figé.
-- **État courant** : le serveur écrit `~/.claude-memory/status.json`
-  (`idle` / `loading` / `downloading` / `backfilling`) consultable aussi via `memory_stats`.
-- **Rappel de présence (opt-in)** : un snippet prêt à l'emploi est généré dans
-  `~/.claude-memory/statusline.mjs`. Pour afficher en permanence que le plugin est actif, ajouter
-  à `settings.json` :
+- **Logs**: `~/.claude-memory/logs/memory.log` (1 MB rotation). At startup: version, node,
+  database, model, `dtype`, vector state and whether the model is present on disk. A model
+  download is traced (`[embed] download model.onnx 40%…`) — useful if a first use seems stuck.
+- **Current state**: the server writes `~/.claude-memory/status.json`
+  (`idle` / `loading` / `downloading` / `backfilling`) also readable via `memory_stats`.
+- **Presence reminder (opt-in)**: a ready-to-use snippet is generated in
+  `~/.claude-memory/statusline.mjs`. To permanently show that the plugin is active, add
+  to `settings.json`:
 
   ```json
   { "statusLine": { "type": "command", "command": "node ~/.claude-memory/statusline.mjs" } }
   ```
 
-  La barre affiche `🧠 mem` au repos, `🧠 mem ⚙` pendant une indexation, `🧠 mem ⏳x%` pendant un
-  téléchargement (rafraîchie sur activité de conversation, pas en continu).
+  The bar shows `🧠 mem` when idle, `🧠 mem ⚙` during indexing, `🧠 mem ⏳x%` during a
+  download (refreshed on conversation activity, not continuously).
 
-## Robustesse
+## Robustness
 
-Si quoi que ce soit échoue (base verrouillée, modèle indisponible, sqlite-vec absent), tout dégrade
-proprement : les hooks sortent `{"continue":true,"suppressOutput":true}` (exit 0), la recherche
-retombe sur BM25, le backfill réessaie. Claude Code n'est jamais bloqué. Aucun serveur, aucun
-démon, aucun cloud, aucune compilation native (sqlite-vec = binaire prebuilt ; onnxruntime-node =
-binaire prebuilt installé par npm).
+If anything fails (locked database, unavailable model, missing sqlite-vec), everything degrades
+gracefully: hooks output `{"continue":true,"suppressOutput":true}` (exit 0), search falls back
+to BM25, the backfill retries. Claude Code is never blocked. No server, no daemon, no cloud, no
+native compilation (sqlite-vec = prebuilt binary; onnxruntime-node = prebuilt binary installed
+by npm).
+</content>
+</invoke>

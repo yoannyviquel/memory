@@ -293,7 +293,7 @@ var MemoryStore = class {
     const r = this.db.prepare("SELECT rowid FROM memories WHERE mem_id = ?").get(memId);
     return r ? Number(r.rowid) : null;
   }
-  /** Met à jour le vecteur d'un doc (vec0 ne supporte pas OR REPLACE → DELETE+INSERT). */
+  /** Updates a doc's vector (vec0 doesn't support OR REPLACE → DELETE+INSERT). */
   upsertVector(rowid, embedding) {
     if (!this._vectorEnabled || !embedding || embedding.length !== this.dim) return;
     try {
@@ -302,7 +302,7 @@ var MemoryStore = class {
     } catch {
     }
   }
-  /** Insère ou met à jour un document (idempotent sur mem_id) + son vecteur si fourni. */
+  /** Inserts or updates a document (idempotent on mem_id) + its vector if provided. */
   upsert(id, doc, embedding) {
     this.db.prepare(this.upsertSql()).run(...this.docToParams(id, doc));
     if (embedding) {
@@ -310,13 +310,13 @@ var MemoryStore = class {
       if (rid != null) this.upsertVector(rid, embedding);
     }
   }
-  /** Affecte/Met à jour le vecteur d'un doc par rowid (utilisé par le backfill du serveur). */
+  /** Sets/updates a doc's vector by rowid (used by the server's backfill). */
   setVectorByRowid(rowid, embedding) {
     this.upsertVector(rowid, embedding);
   }
   /**
-   * Documents vectorisables (prompt/turn/session) sans vecteur, plus récents d'abord.
-   * Renvoie le rowid + le texte à plonger. Vide si index vectoriel désactivé.
+   * Vectorizable documents (prompt/turn/session) without a vector, most recent first.
+   * Returns the rowid + the text to embed. Empty if the vector index is disabled.
    */
   missingVectorDocs(limit = 32) {
     if (!this._vectorEnabled) return [];
@@ -332,7 +332,7 @@ var MemoryStore = class {
       text: [r.summary, r.user_prompt, r.assistant_text, r.prompts_text].filter((s) => typeof s === "string" && s.trim()).join("\n").slice(0, 2e3)
     }));
   }
-  /** Nombre de docs vectorisables encore sans vecteur (lag du backfill). */
+  /** Number of vectorizable docs still without a vector (backfill lag). */
   countMissingVectors() {
     if (!this._vectorEnabled) return 0;
     try {
@@ -347,7 +347,7 @@ var MemoryStore = class {
       return 0;
     }
   }
-  /** Upsert en masse dans une transaction. */
+  /** Bulk upsert within a transaction. */
   bulkUpsert(items) {
     if (items.length === 0) return { indexed: 0, errors: 0 };
     const stmt = this.db.prepare(this.upsertSql());
@@ -374,7 +374,7 @@ var MemoryStore = class {
     }
     return { indexed, errors };
   }
-  /** Rowids BM25 ordonnés par pertinence. */
+  /** BM25 rowids ordered by relevance. */
   bm25Rows(query, project, type, n = 40) {
     const ftsq = ftsQuery(query);
     if (!ftsq) return [];
@@ -394,7 +394,7 @@ var MemoryStore = class {
                  ORDER BY bm25(memories_fts, ${BM25_WEIGHTS}) LIMIT ?;`;
     return this.db.prepare(sql).all(...args).map((r) => Number(r.rowid));
   }
-  /** Rowids KNN (sémantique) ordonnés par distance, filtrés par project/type. */
+  /** KNN (semantic) rowids ordered by distance, filtered by project/type. */
   vecRows(embedding, project, type, n = 40) {
     if (!this._vectorEnabled || embedding.length !== this.dim) return [];
     const knn = this.db.prepare(
@@ -424,7 +424,7 @@ var MemoryStore = class {
     const byRowid = new Map(rows.map((r) => [Number(r.rowid), r]));
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
-  /** Recherche : BM25 seul, ou hybride (RRF de BM25 + KNN) si un embedding est fourni. */
+  /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params) {
     const limit = params.limit ?? 10;
     const cand = Math.max(limit * 4, 40);
@@ -538,7 +538,7 @@ async function getPipe(cfg) {
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
       const dtype = cfg.dtype || "q8";
-      log(cfg.dataDir, `[embed] chargement ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
+      log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
       writeStatus(cfg.dataDir, { state: "loading", model: cfg.model, progress: void 0, file: void 0 });
       const lastPct = {};
       const progress_callback = (p) => {
@@ -552,9 +552,9 @@ async function getPipe(cfg) {
             }
             writeStatus(cfg.dataDir, { state: "downloading", model: cfg.model, file: p.file, progress: pct });
           } else if (p?.status === "done" && p.file) {
-            log(cfg.dataDir, `[embed] t\xE9l\xE9charg\xE9 ${p.file}`);
+            log(cfg.dataDir, `[embed] downloaded ${p.file}`);
           } else if (p?.status === "ready") {
-            log(cfg.dataDir, `[embed] mod\xE8le pr\xEAt (${cfg.model})`);
+            log(cfg.dataDir, `[embed] model ready (${cfg.model})`);
           }
         } catch {
         }
@@ -565,7 +565,7 @@ async function getPipe(cfg) {
       } catch (e) {
         log(
           cfg.dataDir,
-          `[embed] dtype=${dtype} indisponible (${e instanceof Error ? e.message : String(e)}); repli fp32`
+          `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
         );
         pipe = await tf.pipeline("feature-extraction", cfg.model, { dtype: "fp32", progress_callback });
       }
@@ -575,9 +575,9 @@ async function getPipe(cfg) {
     } catch (err) {
       _failed = true;
       const message = err instanceof Error ? err.message : String(err);
-      log(cfg.dataDir, `[embed] indisponible: ${message}`);
+      log(cfg.dataDir, `[embed] unavailable: ${message}`);
       writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
-      process.stderr.write(`[memory] embedder indisponible: ${message}
+      process.stderr.write(`[memory] embedder unavailable: ${message}
 `);
       return null;
     } finally {
@@ -644,7 +644,7 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cfg = loadConfig();
   if (!existsSync3(args.db)) {
-    console.error(`\u274C Base SQLite claude-mem introuvable: ${args.db}`);
+    console.error(`\u274C claude-mem SQLite database not found: ${args.db}`);
     process.exit(1);
   }
   const sqliteModule = "node:sqlite";
@@ -653,7 +653,7 @@ async function main() {
     ({ DatabaseSync } = await import(sqliteModule));
   } catch {
     console.error(
-      `\u274C Module 'node:sqlite' indisponible. Node ${process.version} ; requiert Node \u2265 22.5.`
+      `\u274C Module 'node:sqlite' unavailable. Node ${process.version}; requires Node \u2265 22.5.`
     );
     process.exit(1);
   }
@@ -661,7 +661,7 @@ async function main() {
   if (args.embed && !args.dryRun) {
     if (!await embedReady(embedCfg)) {
       console.error(
-        `\u274C --embed demand\xE9 mais l'embedder local (${embedCfg.model}) n'a pas pu se charger. Migre sans --embed, ou v\xE9rifie l'acc\xE8s au mod\xE8le.`
+        `\u274C --embed requested but the local embedder (${embedCfg.model}) failed to load. Migrate without --embed, or check model access.`
       );
       process.exit(1);
     }
@@ -671,7 +671,7 @@ async function main() {
     try {
       return db.prepare(sql).all();
     } catch (err) {
-      console.error(`\u26A0\uFE0F Lecture \xE9chou\xE9e (${sql}): ${err instanceof Error ? err.message : err}`);
+      console.error(`\u26A0\uFE0F Read failed (${sql}): ${err instanceof Error ? err.message : err}`);
       return [];
     }
   };
@@ -699,11 +699,11 @@ async function main() {
         summary: clip(o.title, 1e3) || clip(o.subtitle, 1e3),
         assistant_text: joinParts(
           [
-            ["D\xE9couverte", o.title],
-            ["D\xE9tail", o.subtitle],
-            ["R\xE9cit", o.narrative],
-            ["Faits", o.facts],
-            ["Texte", o.text]
+            ["Discovery", o.title],
+            ["Detail", o.subtitle],
+            ["Narrative", o.narrative],
+            ["Facts", o.facts],
+            ["Text", o.text]
           ],
           12e3
         ),
@@ -727,11 +727,11 @@ async function main() {
         summary: clip(s.request, 1e3),
         assistant_text: joinParts(
           [
-            ["Demande", s.request],
-            ["Investigu\xE9", s.investigated],
-            ["Appris", s.learned],
-            ["R\xE9alis\xE9", s.completed],
-            ["Prochaines \xE9tapes", s.next_steps],
+            ["Request", s.request],
+            ["Investigated", s.investigated],
+            ["Learned", s.learned],
+            ["Completed", s.completed],
+            ["Next steps", s.next_steps],
             ["Notes", s.notes]
           ],
           12e3
@@ -758,16 +758,16 @@ async function main() {
   }
   db.close();
   console.error(
-    `\u{1F4CA} Lu : observations=${counts.observations}, session_summaries=${counts.session_summaries}, user_prompts=${counts.user_prompts} \u2192 ${items.length} documents.`
+    `\u{1F4CA} Read: observations=${counts.observations}, session_summaries=${counts.session_summaries}, user_prompts=${counts.user_prompts} \u2192 ${items.length} documents.`
   );
   if (args.dryRun) {
-    console.error(`\u{1F7E1} --dry-run : aucune \xE9criture.${args.embed ? " (--embed serait appliqu\xE9)" : ""}`);
+    console.error(`\u{1F7E1} --dry-run: no writes.${args.embed ? " (--embed would be applied)" : ""}`);
     process.exit(0);
   }
   const store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model);
   await store.init();
   if (args.embed && !store.vectorEnabled) {
-    console.error("\u26A0\uFE0F --embed demand\xE9 mais index vectoriel indisponible (sqlite-vec) \u2192 import sans vecteurs.");
+    console.error("\u26A0\uFE0F --embed requested but vector index unavailable (sqlite-vec) \u2192 importing without vectors.");
   }
   const doEmbed = args.embed && store.vectorEnabled;
   let indexed = 0;
@@ -786,12 +786,12 @@ async function main() {
     indexed += res.indexed;
     errors += res.errors;
     console.error(
-      `  \u2026index\xE9s ${indexed}/${items.length} (erreurs: ${errors}${doEmbed ? `, vecteurs: ${embedded}` : ""})`
+      `  \u2026indexed ${indexed}/${items.length} (errors: ${errors}${doEmbed ? `, vectors: ${embedded}` : ""})`
     );
   }
   store.close();
   console.error(
-    `\u2705 Migration termin\xE9e : ${indexed} index\xE9s, ${errors} erreurs${doEmbed ? `, ${embedded} vecteurs` : ""} \u2192 ${cfg.dbPath}`
+    `\u2705 Migration done: ${indexed} indexed, ${errors} errors${doEmbed ? `, ${embedded} vectors` : ""} \u2192 ${cfg.dbPath}`
   );
   process.exit(errors > 0 ? 2 : 0);
 }

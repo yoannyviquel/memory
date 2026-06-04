@@ -2,12 +2,12 @@ import { mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import type { MemoryConfig } from './config.js';
 
-/** État accumulé par session entre les invocations de hooks (processus séparés). */
+/** State accumulated per session across hook invocations (separate processes). */
 export interface SessionState {
   promptNumber: number;
   obsSeq: number;
   turnSeq: number;
-  lines: number; // lignes du transcript déjà traitées (curseur Stop)
+  lines: number; // transcript lines already processed (Stop cursor)
   prompts: string[];
   filesModified: string[];
   filesRead: string[];
@@ -59,6 +59,6 @@ export function clearState(cfg: MemoryConfig, sessionId: string): void {
   try {
     rmSync(statePath(cfg, sessionId));
   } catch {
-    /* déjà absent */
+    /* already absent */
   }
 }

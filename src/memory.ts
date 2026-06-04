@@ -1,27 +1,27 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-/** Nom de projet = basename du répertoire de travail. */
+/** Project name = basename of the working directory. */
 export function projectFromCwd(cwd?: string): string {
   if (!cwd) return 'unknown';
   const base = path.basename(cwd.replace(/[\\/]+$/, ''));
   return base || 'unknown';
 }
 
-/** Branche git lue depuis .git/HEAD (sans spawn de process). */
+/** Git branch read from .git/HEAD (without spawning a process). */
 export function gitBranch(cwd?: string): string | undefined {
   if (!cwd) return undefined;
   try {
     const head = readFileSync(path.join(cwd, '.git', 'HEAD'), 'utf8').trim();
     const m = head.match(/ref:\s*refs\/heads\/(.+)$/);
     if (m) return m[1];
-    return head.slice(0, 12); // detached HEAD : début du SHA
+    return head.slice(0, 12); // detached HEAD: start of the SHA
   } catch {
     return undefined;
   }
 }
 
-/** Résumé court : 1re phrase ou ~200 premiers caractères. */
+/** Short summary: first sentence or ~first 200 characters. */
 export function summarize(text: string, max = 200): string {
   const clean = text.replace(/\s+/g, ' ').trim();
   if (!clean) return '';
@@ -39,7 +39,7 @@ export interface ToolFiles {
   filesModified: string[];
 }
 
-/** Extrait les fichiers lus/modifiés d'un tool_input PostToolUse. */
+/** Extracts the read/modified files from a PostToolUse tool_input. */
 export function filesFromToolInput(toolName: string, input: any): ToolFiles {
   const out: ToolFiles = { filesRead: [], filesModified: [] };
   const file = input?.file_path || input?.notebook_path || input?.path;
@@ -50,7 +50,7 @@ export function filesFromToolInput(toolName: string, input: any): ToolFiles {
   return out;
 }
 
-/** Brief lisible d'un appel d'outil (commande Bash, motif de recherche, params tronqués). */
+/** Readable brief of a tool call (Bash command, search pattern, truncated params). */
 export function toolBrief(toolName: string, input: any): string {
   if (!input || typeof input !== 'object') return toolName;
   if (typeof input.command === 'string') return input.command.slice(0, 300);
@@ -73,7 +73,7 @@ export function nowIso(): string {
   return new Date().toISOString();
 }
 
-/** Déduplique en préservant l'ordre. */
+/** Deduplicates while preserving order. */
 export function uniq(arr: string[]): string[] {
   return [...new Set(arr.filter(Boolean))];
 }

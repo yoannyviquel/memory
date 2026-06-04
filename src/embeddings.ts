@@ -5,13 +5,13 @@ export interface EmbedConfig {
   model: string;
   dim: number;
   cacheDir: string;
-  /** Précision ONNX : 'q8' (quantifié, défaut, ~4× plus léger) ou 'fp32' (pleine précision). */
+  /** ONNX precision: 'q8' (quantized, default, ~4× lighter) or 'fp32' (full precision). */
   dtype: string;
-  /** Racine des données (logs + status.json), pour journaliser le chargement du modèle. */
+  /** Data root (logs + status.json), to log the model loading. */
   dataDir: string;
 }
 
-/** Construit le texte à plonger pour un document (champs porteurs de sens). */
+/** Builds the text to embed for a document (meaning-bearing fields). */
 export function embedText(parts: Array<string | undefined>, max = 2000): string {
   return parts
     .filter((p): p is string => !!p && p.trim().length > 0)
@@ -19,7 +19,7 @@ export function embedText(parts: Array<string | undefined>, max = 2000): string 
     .slice(0, max);
 }
 
-// Singleton de pipeline transformers.js (chargé une fois par process).
+// transformers.js pipeline singleton (loaded once per process).
 let _pipe: any = null;
 let _loading: Promise<any> | null = null;
 let _failed = false;
@@ -31,17 +31,17 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
   if (_loading) return _loading;
   _loading = (async () => {
     try {
-      // Specifier en variable : laisse l'import résoluble au runtime depuis node_modules.
+      // Specifier as a variable: keeps the import resolvable at runtime from node_modules.
       const mod = '@huggingface/transformers';
       const tf: any = await import(mod);
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
 
       const dtype = cfg.dtype || 'q8';
-      log(cfg.dataDir, `[embed] chargement ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
+      log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
       writeStatus(cfg.dataDir, { state: 'loading', model: cfg.model, progress: undefined, file: undefined });
 
-      // Progression de téléchargement HuggingFace → logs + status.json (throttlé par décile).
+      // HuggingFace download progress → logs + status.json (throttled by decile).
       const lastPct: Record<string, number> = {};
       const progress_callback = (p: any) => {
         try {
@@ -54,9 +54,9 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
             }
             writeStatus(cfg.dataDir, { state: 'downloading', model: cfg.model, file: p.file, progress: pct });
           } else if (p?.status === 'done' && p.file) {
-            log(cfg.dataDir, `[embed] téléchargé ${p.file}`);
+            log(cfg.dataDir, `[embed] downloaded ${p.file}`);
           } else if (p?.status === 'ready') {
-            log(cfg.dataDir, `[embed] modèle prêt (${cfg.model})`);
+            log(cfg.dataDir, `[embed] model ready (${cfg.model})`);
           }
         } catch {
           /* best-effort */
@@ -67,10 +67,10 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
       try {
         pipe = await tf.pipeline('feature-extraction', cfg.model, { dtype, progress_callback });
       } catch (e) {
-        // Le palier n'expose pas forcément la variante quantifiée → repli pleine précision.
+        // The tier doesn't necessarily expose the quantized variant → fall back to full precision.
         log(
           cfg.dataDir,
-          `[embed] dtype=${dtype} indisponible (${e instanceof Error ? e.message : String(e)}); repli fp32`,
+          `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`,
         );
         pipe = await tf.pipeline('feature-extraction', cfg.model, { dtype: 'fp32', progress_callback });
       }
@@ -80,9 +80,9 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
     } catch (err) {
       _failed = true;
       const message = err instanceof Error ? err.message : String(err);
-      log(cfg.dataDir, `[embed] indisponible: ${message}`);
+      log(cfg.dataDir, `[embed] unavailable: ${message}`);
       writeStatus(cfg.dataDir, { state: 'idle', progress: undefined, file: undefined });
-      process.stderr.write(`[memory] embedder indisponible: ${message}\n`);
+      process.stderr.write(`[memory] embedder unavailable: ${message}\n`);
       return null;
     } finally {
       _loading = null;
@@ -91,7 +91,7 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
   return _loading;
 }
 
-/** True si le modèle est chargeable (déclenche le chargement). */
+/** True if the model is loadable (triggers loading). */
 export async function embedReady(cfg: EmbedConfig): Promise<boolean> {
   return !!(await getPipe(cfg));
 }
@@ -101,7 +101,7 @@ export async function embed(text: string, cfg: EmbedConfig): Promise<number[] | 
   return r[0] ?? null;
 }
 
-/** Embeddings en lot (mean pooling + normalisation L2). null par entrée en cas d'échec. */
+/** Batch embeddings (mean pooling + L2 normalization). null per entry on failure. */
 export async function embedBatch(
   texts: string[],
   cfg: EmbedConfig,

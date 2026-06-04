@@ -10,7 +10,7 @@ export interface MemoryConfig {
   embed: EmbedConfig;
 }
 
-/** Paliers d'embedding multilingues (famille e5). Chaque palier fixe modèle + dimension cohérents. */
+/** Multilingual embedding tiers (e5 family). Each tier sets a consistent model + dimension. */
 export const EMBED_TIERS: Record<string, { model: string; dim: number }> = {
   light: { model: 'Xenova/multilingual-e5-small', dim: 384 },
   medium: { model: 'Xenova/multilingual-e5-base', dim: 768 },
@@ -27,9 +27,9 @@ function readConfigFile(dataDir: string): Record<string, unknown> {
 }
 
 /**
- * Charge la configuration. Priorité : variable d'environnement > fichier
- * `<dataDir>/config.json` > défaut. Le fichier permet de configurer sans dépendre du
- * mécanisme `${}` des plugins (peu fiable quand un champ est laissé vide).
+ * Loads the configuration. Priority: environment variable > file
+ * `<dataDir>/config.json` > default. The file allows configuring without relying on the
+ * plugins' `${}` mechanism (unreliable when a field is left empty).
  */
 export function loadConfig(): MemoryConfig {
   const dataDir = process.env.MEMORY_DATA_DIR || path.join(os.homedir(), '.claude-memory');
@@ -50,7 +50,7 @@ export function loadConfig(): MemoryConfig {
   const dim = Number(get('MEMORY_EMBED_DIM', 'embedDim')) || picked.dim;
   const enabled = get('MEMORY_EMBED_ENABLED', 'embedEnabled') !== '0';
   const cacheDir = get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
-  // Quantifié par défaut : ~4× plus léger à télécharger, perte de qualité négligeable en retrieval.
+  // Quantized by default: ~4× lighter to download, negligible quality loss in retrieval.
   const dtype = (get('MEMORY_EMBED_DTYPE', 'embedDtype') || 'q8').toLowerCase();
 
   return {

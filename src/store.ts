@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export type MemoryType = 'observation' | 'prompt' | 'turn' | 'session';
 
-/** Document de mémoire. Tous les champs sont optionnels selon le type. */
+/** Memory document. All fields are optional depending on the type. */
 export interface MemoryDoc {
   type: MemoryType;
   session_id?: string;
@@ -35,7 +35,7 @@ export interface SearchParams {
   project?: string;
   type?: MemoryType;
   limit?: number;
-  /** Embedding de la requête (active la recherche hybride si fourni et vecteurs activés). */
+  /** Query embedding (enables hybrid search if provided and vectors enabled). */
   embedding?: number[] | null;
 }
 
@@ -62,7 +62,7 @@ export interface StatsResult {
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-// Colonnes persistées dans `memories` (ordre = ordre des params d'upsert).
+// Columns persisted in `memories` (order = order of upsert params).
 const COLS = [
   'mem_id', 'type', 'session_id', 'project', 'branch', 'cwd', 'ts', 'ts_epoch',
   'prompt_number', 'user_prompt', 'assistant_text', 'summary', 'tool_name', 'tool_brief',
@@ -74,7 +74,7 @@ const FTS_COLS = ['summary', 'user_prompt', 'assistant_text', 'tool_brief', 'pro
 const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.0, 1.5';
 const RRF_K = 60;
 
-/** Charge node:sqlite via un specifier en variable (empêche esbuild de réécrire le préfixe node:). */
+/** Loads node:sqlite via a specifier variable (prevents esbuild from rewriting the node: prefix). */
 let _DatabaseSync: any;
 async function getDatabaseSync(): Promise<any> {
   if (_DatabaseSync) return _DatabaseSync;
@@ -83,7 +83,7 @@ async function getDatabaseSync(): Promise<any> {
   return _DatabaseSync;
 }
 
-/** Localise la lib chargeable sqlite-vec (dev via node_modules, ou copiée dans dist/). */
+/** Locates the loadable sqlite-vec library (dev via node_modules, or copied into dist/). */
 function resolveVecExtension(): string | null {
   const libName =
     process.platform === 'win32'
@@ -96,7 +96,7 @@ function resolveVecExtension(): string | null {
     const req = createRequire(import.meta.url);
     candidates.push(req('sqlite-vec').getLoadablePath());
   } catch {
-    /* wrapper absent (build shippé) */
+    /* wrapper absent (shipped build) */
   }
   candidates.push(path.join(HERE, libName));
   for (const c of candidates) {
@@ -158,8 +158,8 @@ function toBlob(arr: number[]): Uint8Array {
 }
 
 /**
- * Stockage des mémoires en SQLite local. Index full-text FTS5 (BM25) + index vectoriel
- * optionnel (sqlite-vec) pour la recherche sémantique hybride. Aucun serveur, in-process.
+ * Stores memories in local SQLite. FTS5 full-text index (BM25) + optional vector index
+ * (sqlite-vec) for hybrid semantic search. No server, in-process.
  */
 export class MemoryStore {
   private db: any;
@@ -242,19 +242,19 @@ export class MemoryStore {
 
     this.db.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);');
 
-    // Index vectoriel optionnel : si l'extension ne charge pas, on continue en BM25 seul.
+    // Optional vector index: if the extension doesn't load, we continue with BM25 only.
     const ext = resolveVecExtension();
     if (ext) {
       try {
         this.db.enableLoadExtension(true);
         this.db.loadExtension(ext);
 
-        // Si le modèle/dimension a changé depuis la dernière fois, les anciens vecteurs ne sont
-        // plus comparables → on recrée l'index vide ; le backfill du serveur revectorisera.
+        // If the model/dimension changed since last time, the old vectors are no longer
+        // comparable → we recreate the index empty; the server's backfill will re-vectorize.
         const prevModel = this.metaGet('embed_model');
         const prevDim = this.metaGet('embed_dim');
-        // Modèle connu et différent (ou meta absente alors que des vecteurs existent déjà) →
-        // les anciens vecteurs ne sont plus comparables : on repart d'un index vide.
+        // Known and different model (or meta absent while vectors already exist) →
+        // the old vectors are no longer comparable: we start from an empty index.
         const changed =
           this.model !== '' &&
           (prevModel !== this.model || (prevDim !== null && Number(prevDim) !== this.dim));
@@ -324,7 +324,7 @@ export class MemoryStore {
     return r ? Number(r.rowid) : null;
   }
 
-  /** Met à jour le vecteur d'un doc (vec0 ne supporte pas OR REPLACE → DELETE+INSERT). */
+  /** Updates a doc's vector (vec0 doesn't support OR REPLACE → DELETE+INSERT). */
   private upsertVector(rowid: number, embedding?: number[] | null): void {
     if (!this._vectorEnabled || !embedding || embedding.length !== this.dim) return;
     try {
@@ -333,11 +333,11 @@ export class MemoryStore {
         .prepare('INSERT INTO vec_memories(rowid, embedding) VALUES (?, ?)')
         .run(BigInt(rowid), toBlob(embedding));
     } catch {
-      /* ne jamais casser l'upsert principal */
+      /* never break the main upsert */
     }
   }
 
-  /** Insère ou met à jour un document (idempotent sur mem_id) + son vecteur si fourni. */
+  /** Inserts or updates a document (idempotent on mem_id) + its vector if provided. */
   upsert(id: string, doc: MemoryDoc, embedding?: number[] | null): void {
     this.db.prepare(this.upsertSql()).run(...this.docToParams(id, doc));
     if (embedding) {
@@ -346,14 +346,14 @@ export class MemoryStore {
     }
   }
 
-  /** Affecte/Met à jour le vecteur d'un doc par rowid (utilisé par le backfill du serveur). */
+  /** Sets/updates a doc's vector by rowid (used by the server's backfill). */
   setVectorByRowid(rowid: number, embedding: number[]): void {
     this.upsertVector(rowid, embedding);
   }
 
   /**
-   * Documents vectorisables (prompt/turn/session) sans vecteur, plus récents d'abord.
-   * Renvoie le rowid + le texte à plonger. Vide si index vectoriel désactivé.
+   * Vectorizable documents (prompt/turn/session) without a vector, most recent first.
+   * Returns the rowid + the text to embed. Empty if the vector index is disabled.
    */
   missingVectorDocs(limit = 32): Array<{ rowid: number; text: string }> {
     if (!this._vectorEnabled) return [];
@@ -375,7 +375,7 @@ export class MemoryStore {
     }));
   }
 
-  /** Nombre de docs vectorisables encore sans vecteur (lag du backfill). */
+  /** Number of vectorizable docs still without a vector (backfill lag). */
   countMissingVectors(): number {
     if (!this._vectorEnabled) return 0;
     try {
@@ -395,7 +395,7 @@ export class MemoryStore {
     }
   }
 
-  /** Upsert en masse dans une transaction. */
+  /** Bulk upsert within a transaction. */
   bulkUpsert(items: BulkItem[]): { indexed: number; errors: number } {
     if (items.length === 0) return { indexed: 0, errors: 0 };
     const stmt = this.db.prepare(this.upsertSql());
@@ -423,7 +423,7 @@ export class MemoryStore {
     return { indexed, errors };
   }
 
-  /** Rowids BM25 ordonnés par pertinence. */
+  /** BM25 rowids ordered by relevance. */
   private bm25Rows(query: string, project?: string, type?: MemoryType, n = 40): number[] {
     const ftsq = ftsQuery(query);
     if (!ftsq) return [];
@@ -444,7 +444,7 @@ export class MemoryStore {
     return this.db.prepare(sql).all(...args).map((r: any) => Number(r.rowid));
   }
 
-  /** Rowids KNN (sémantique) ordonnés par distance, filtrés par project/type. */
+  /** KNN (semantic) rowids ordered by distance, filtered by project/type. */
   private vecRows(embedding: number[], project?: string, type?: MemoryType, n = 40): number[] {
     if (!this._vectorEnabled || embedding.length !== this.dim) return [];
     const knn = this.db
@@ -454,7 +454,7 @@ export class MemoryStore {
       .all(toBlob(embedding), n)
       .map((r: any) => Number(r.rowid));
     if (knn.length === 0 || (!project && !type)) return knn;
-    // Filtre project/type en préservant l'ordre KNN.
+    // Filter project/type while preserving the KNN order.
     const placeholders = knn.map(() => '?').join(',');
     const where = [`rowid IN (${placeholders})`];
     const args: unknown[] = [...knn];
@@ -485,7 +485,7 @@ export class MemoryStore {
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
 
-  /** Recherche : BM25 seul, ou hybride (RRF de BM25 + KNN) si un embedding est fourni. */
+  /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params: SearchParams): MemoryDoc[] {
     const limit = params.limit ?? 10;
     const cand = Math.max(limit * 4, 40);

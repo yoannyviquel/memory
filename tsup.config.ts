@@ -10,7 +10,7 @@ export default defineConfig({
   clean: true,
   banner: { js: '#!/usr/bin/env node' },
   define: { __PKG_VERSION__: JSON.stringify(pkg.version) },
-  // Résolus au runtime depuis node_modules (gros packages / binaires natifs) :
+  // Resolved at runtime from node_modules (large packages / native binaries):
   external: ['@huggingface/transformers', 'onnxruntime-node', 'sharp', 'sqlite-vec'],
   splitting: false,
   sourcemap: true,

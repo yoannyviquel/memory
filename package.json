@@ -1,7 +1,7 @@
 {
   "name": "memory",
   "version": "0.1.2",
-  "description": "Mémoire persistante Claude Code (SQLite + FTS5) — capture via hooks, recherche via MCP.",
+  "description": "Persistent memory for Claude Code (SQLite + FTS5) — capture via hooks, search via MCP.",
   "type": "module",
   "private": true,
   "engines": {
@@ -18,6 +18,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.25.0",
+    "memory": "file:",
     "sqlite-vec": "^0.1.9"
   },
   "devDependencies": {

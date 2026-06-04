@@ -1,7 +1,7 @@
 {
   "name": "memory",
   "version": "0.1.2",
-  "description": "Mémoire persistante pour Claude Code : capture brute via hooks (SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd), recherche hybride BM25 + sémantique (sqlite-vec + embeddings locaux transformers.js) via MCP. Stockage SQLite local embarqué — zéro serveur, zéro démon, zéro cloud.",
+  "description": "Persistent memory for Claude Code: raw capture via hooks (SessionStart/UserPromptSubmit/PostToolUse/Stop/SessionEnd), hybrid BM25 + semantic search (sqlite-vec + local transformers.js embeddings) via MCP. Embedded local SQLite storage — zero server, zero daemon, zero cloud.",
   "author": {
     "name": "yoannyviquel"
   },
@@ -10,8 +10,8 @@
   "userConfig": {
     "embedTier": {
       "type": "string",
-      "title": "Palier d'embedding sémantique",
-      "description": "light = e5-small (384 dim, ~120 Mo, rapide) · medium = e5-base (768 dim, ~280 Mo, meilleur compromis FR) · heavy = e5-large (1024 dim, ~560 Mo, qualité max). Modifiable ensuite via /memory:config.",
+      "title": "Semantic embedding tier",
+      "description": "light = e5-small (384 dim, ~120 MB, fast) · medium = e5-base (768 dim, ~280 MB, best FR trade-off) · heavy = e5-large (1024 dim, ~560 MB, max quality). Changeable later via /memory:config.",
       "required": false,
       "default": "light"
     }

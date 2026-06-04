@@ -1,19 +1,20 @@
 ---
 name: memory:search
-description: Recherche full-text (BM25) dans les mémoires de session
+description: Full-text search (BM25) in session memories
 ---
 
-# Rechercher dans les mémoires
+# Search the memories
 
-Utilise l'outil MCP `memory_search` pour interroger les mémoires de session (SQLite local).
+Uses the MCP tool `memory_search` to query the session memories (local SQLite).
 
-Arguments fournis par l'utilisateur : `$ARGUMENTS`
+Arguments provided by the user: `$ARGUMENTS`
 
-Marche à suivre :
-1. Appelle l'outil MCP **`memory_search`** avec :
-   - `query` = le texte fourni dans `$ARGUMENTS` (obligatoire).
-   - `project` = nom du projet courant (basename du répertoire) pour limiter au projet courant ; sinon vide.
-   - `limit` = 10 par défaut.
-   - `type` = optionnel (`turn` | `observation` | `prompt` | `session`).
-2. Présente les résultats de façon compacte : projet, date, type et résumé pour chaque hit.
-3. Si aucun résultat, suggère `/memory:status` pour vérifier l'état de la base.
+Steps:
+1. Call the MCP tool **`memory_search`** with:
+   - `query` = the text provided in `$ARGUMENTS` (required).
+   - `project` = name of the current project (basename of the directory) to limit to the current project; otherwise empty.
+   - `limit` = 10 by default.
+   - `type` = optional (`turn` | `observation` | `prompt` | `session`).
+2. Present the results compactly: project, date, type and summary for each hit.
+3. If no result, suggest `/memory:status` to check the state of the database.
+</content>

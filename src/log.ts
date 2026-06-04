@@ -1,7 +1,7 @@
 import { appendFileSync, mkdirSync, existsSync, statSync, renameSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-/** Répertoire des logs (sous le dataDir, à côté de la base et des modèles). */
+/** Logs directory (under dataDir, next to the database and the models). */
 export function logDir(dataDir: string): string {
   return path.join(dataDir, 'logs');
 }
@@ -9,9 +9,9 @@ export function logDir(dataDir: string): string {
 const MAX_LOG_BYTES = 1_000_000;
 
 /**
- * Journalisation best-effort vers `<dataDir>/logs/memory.log`. Rotation simple à 1 Mo
- * (un seul fichier de backup `.1`). Ne jette jamais : un échec de log ne doit pas casser
- * le serveur ni un hook.
+ * Best-effort logging to `<dataDir>/logs/memory.log`. Simple rotation at 1 MB
+ * (a single backup file `.1`). Never throws: a logging failure must not break
+ * the server or a hook.
  */
 export function log(dataDir: string, msg: string): void {
   try {
@@ -36,7 +36,7 @@ export type MemState = 'idle' | 'loading' | 'downloading' | 'backfilling';
 export interface MemStatus {
   state: MemState;
   model?: string;
-  /** % de téléchargement courant (état downloading). */
+  /** current download % (downloading state). */
   progress?: number;
   file?: string;
   vectorized?: number;
@@ -44,12 +44,12 @@ export interface MemStatus {
   updatedAt: string;
 }
 
-/** Chemin du fichier d'état lu par le snippet statusLine. */
+/** Path of the state file read by the statusLine snippet. */
 export function statusPath(dataDir: string): string {
   return path.join(dataDir, 'status.json');
 }
 
-/** Écrit/merge l'état courant du plugin (best-effort) pour la status line et le diagnostic. */
+/** Writes/merges the plugin's current state (best-effort) for the status line and diagnostics. */
 export function writeStatus(dataDir: string, patch: Partial<MemStatus>): void {
   try {
     mkdirSync(dataDir, { recursive: true });
@@ -58,7 +58,7 @@ export function writeStatus(dataDir: string, patch: Partial<MemStatus>): void {
     try {
       cur = JSON.parse(readFileSync(file, 'utf8'));
     } catch {
-      /* premier écrit / fichier absent */
+      /* first write / file absent */
     }
     writeFileSync(file, JSON.stringify({ ...cur, ...patch, updatedAt: new Date().toISOString() }));
   } catch {

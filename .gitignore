@@ -80,8 +80,8 @@ out
 
 # Nuxt.js build / generate output
 .nuxt
-# dist/ est VOLONTAIREMENT committé : le plugin est distribué via github et
-# Claude Code ne lance pas `npm run build` à l'install (seulement `npm install`).
+# dist/ is INTENTIONALLY committed: the plugin is distributed via github and
+# Claude Code does not run `npm run build` on install (only `npm install`).
 # dist
 .output
 

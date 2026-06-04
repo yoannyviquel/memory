@@ -1,26 +1,27 @@
 ---
 name: memory:migrate
-description: Migre l'historique claude-mem (SQLite) vers la base memory
+description: Migrate the claude-mem history (SQLite) to the memory database
 ---
 
 # Migration claude-mem → memory
 
-Importe les mémoires déjà capturées par claude-mem dans la base SQLite de ce plugin. Lecture
-seule sur la base claude-mem (jamais modifiée). Idempotent.
+Imports the memories already captured by claude-mem into this plugin's SQLite database. Read-only
+on the claude-mem database (never modified). Idempotent.
 
-Marche à suivre :
-1. **Dry-run d'abord** (Bash) :
+Steps:
+1. **Dry-run first** (Bash):
    `node --no-warnings "${CLAUDE_PLUGIN_ROOT}/dist/migrate.js" --dry-run`
-   Rapporte le nombre de lignes lues par table et le nombre de documents qui seraient importés.
-2. Demande confirmation à l'utilisateur.
-3. **Migration réelle** :
+   Reports the number of rows read per table and the number of documents that would be imported.
+2. Ask the user for confirmation.
+3. **Actual migration**:
    `node --no-warnings "${CLAUDE_PLUGIN_ROOT}/dist/migrate.js"`
-   Rapporte le récap final (lus / indexés / erreurs).
+   Reports the final recap (read / indexed / errors).
 
-Options :
-- `--db <chemin>` : base claude-mem source (défaut `~/.claude-mem/claude-mem.db`).
-- `--project <nom>` : force le `project` de tous les docs migrés.
-- `--batch <n>` : taille des lots (défaut 500).
-- `--dry-run` : compte sans écrire.
+Options:
+- `--db <path>`: source claude-mem database (default `~/.claude-mem/claude-mem.db`).
+- `--project <name>`: force the `project` of all migrated docs.
+- `--batch <n>`: batch size (default 500).
+- `--dry-run`: count without writing.
 
-Documents migrés préfixés `migrated:` → relançable sans doublon.
+Migrated documents prefixed `migrated:` → re-runnable without duplicates.
+</content>

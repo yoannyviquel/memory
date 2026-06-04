@@ -1,5 +1,5 @@
 {
-  "description": "memory ingestion hooks — capture brute des mémoires de session vers SQLite local",
+  "description": "memory ingestion hooks — raw capture of session memories to local SQLite",
   "hooks": {
     "SessionStart": [
       {

@@ -298,7 +298,7 @@ var MemoryStore = class {
     const r = this.db.prepare("SELECT rowid FROM memories WHERE mem_id = ?").get(memId);
     return r ? Number(r.rowid) : null;
   }
-  /** Met à jour le vecteur d'un doc (vec0 ne supporte pas OR REPLACE → DELETE+INSERT). */
+  /** Updates a doc's vector (vec0 doesn't support OR REPLACE → DELETE+INSERT). */
   upsertVector(rowid, embedding) {
     if (!this._vectorEnabled || !embedding || embedding.length !== this.dim) return;
     try {
@@ -307,7 +307,7 @@ var MemoryStore = class {
     } catch {
     }
   }
-  /** Insère ou met à jour un document (idempotent sur mem_id) + son vecteur si fourni. */
+  /** Inserts or updates a document (idempotent on mem_id) + its vector if provided. */
   upsert(id, doc, embedding) {
     this.db.prepare(this.upsertSql()).run(...this.docToParams(id, doc));
     if (embedding) {
@@ -315,13 +315,13 @@ var MemoryStore = class {
       if (rid != null) this.upsertVector(rid, embedding);
     }
   }
-  /** Affecte/Met à jour le vecteur d'un doc par rowid (utilisé par le backfill du serveur). */
+  /** Sets/updates a doc's vector by rowid (used by the server's backfill). */
   setVectorByRowid(rowid, embedding) {
     this.upsertVector(rowid, embedding);
   }
   /**
-   * Documents vectorisables (prompt/turn/session) sans vecteur, plus récents d'abord.
-   * Renvoie le rowid + le texte à plonger. Vide si index vectoriel désactivé.
+   * Vectorizable documents (prompt/turn/session) without a vector, most recent first.
+   * Returns the rowid + the text to embed. Empty if the vector index is disabled.
    */
   missingVectorDocs(limit = 32) {
     if (!this._vectorEnabled) return [];
@@ -337,7 +337,7 @@ var MemoryStore = class {
       text: [r.summary, r.user_prompt, r.assistant_text, r.prompts_text].filter((s) => typeof s === "string" && s.trim()).join("\n").slice(0, 2e3)
     }));
   }
-  /** Nombre de docs vectorisables encore sans vecteur (lag du backfill). */
+  /** Number of vectorizable docs still without a vector (backfill lag). */
   countMissingVectors() {
     if (!this._vectorEnabled) return 0;
     try {
@@ -352,7 +352,7 @@ var MemoryStore = class {
       return 0;
     }
   }
-  /** Upsert en masse dans une transaction. */
+  /** Bulk upsert within a transaction. */
   bulkUpsert(items) {
     if (items.length === 0) return { indexed: 0, errors: 0 };
     const stmt = this.db.prepare(this.upsertSql());
@@ -379,7 +379,7 @@ var MemoryStore = class {
     }
     return { indexed, errors };
   }
-  /** Rowids BM25 ordonnés par pertinence. */
+  /** BM25 rowids ordered by relevance. */
   bm25Rows(query, project, type, n = 40) {
     const ftsq = ftsQuery(query);
     if (!ftsq) return [];
@@ -399,7 +399,7 @@ var MemoryStore = class {
                  ORDER BY bm25(memories_fts, ${BM25_WEIGHTS}) LIMIT ?;`;
     return this.db.prepare(sql).all(...args).map((r) => Number(r.rowid));
   }
-  /** Rowids KNN (sémantique) ordonnés par distance, filtrés par project/type. */
+  /** KNN (semantic) rowids ordered by distance, filtered by project/type. */
   vecRows(embedding, project, type, n = 40) {
     if (!this._vectorEnabled || embedding.length !== this.dim) return [];
     const knn = this.db.prepare(
@@ -429,7 +429,7 @@ var MemoryStore = class {
     const byRowid = new Map(rows.map((r) => [Number(r.rowid), r]));
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
-  /** Recherche : BM25 seul, ou hybride (RRF de BM25 + KNN) si un embedding est fourni. */
+  /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params) {
     const limit = params.limit ?? 10;
     const cand = Math.max(limit * 4, 40);
@@ -540,7 +540,7 @@ async function getPipe(cfg) {
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
       const dtype = cfg.dtype || "q8";
-      log(cfg.dataDir, `[embed] chargement ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
+      log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
       writeStatus(cfg.dataDir, { state: "loading", model: cfg.model, progress: void 0, file: void 0 });
       const lastPct = {};
       const progress_callback = (p) => {
@@ -554,9 +554,9 @@ async function getPipe(cfg) {
             }
             writeStatus(cfg.dataDir, { state: "downloading", model: cfg.model, file: p.file, progress: pct });
           } else if (p?.status === "done" && p.file) {
-            log(cfg.dataDir, `[embed] t\xE9l\xE9charg\xE9 ${p.file}`);
+            log(cfg.dataDir, `[embed] downloaded ${p.file}`);
           } else if (p?.status === "ready") {
-            log(cfg.dataDir, `[embed] mod\xE8le pr\xEAt (${cfg.model})`);
+            log(cfg.dataDir, `[embed] model ready (${cfg.model})`);
           }
         } catch {
         }
@@ -567,7 +567,7 @@ async function getPipe(cfg) {
       } catch (e) {
         log(
           cfg.dataDir,
-          `[embed] dtype=${dtype} indisponible (${e instanceof Error ? e.message : String(e)}); repli fp32`
+          `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
         );
         pipe = await tf.pipeline("feature-extraction", cfg.model, { dtype: "fp32", progress_callback });
       }
@@ -577,9 +577,9 @@ async function getPipe(cfg) {
     } catch (err) {
       _failed = true;
       const message = err instanceof Error ? err.message : String(err);
-      log(cfg.dataDir, `[embed] indisponible: ${message}`);
+      log(cfg.dataDir, `[embed] unavailable: ${message}`);
       writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
-      process.stderr.write(`[memory] embedder indisponible: ${message}
+      process.stderr.write(`[memory] embedder unavailable: ${message}
 `);
       return null;
     } finally {
@@ -613,7 +613,7 @@ var TYPES = ["observation", "prompt", "turn", "session"];
 function fmtDoc(d) {
   const date = (d.ts ?? d.ended_at ?? "").slice(0, 16).replace("T", " ");
   const proj = d.project ?? "?";
-  const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts.join(" | ") || d.tool_brief || "(sans r\xE9sum\xE9)";
+  const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts.join(" | ") || d.tool_brief || "(no summary)";
   const text = label.replace(/\s+/g, " ").trim().slice(0, 300);
   const files = (d.files_modified ?? []).slice(0, 4);
   const filesLine = files.length ? `
@@ -623,24 +623,24 @@ function fmtDoc(d) {
 }
 var memorySearch = {
   name: "memory_search",
-  description: "Recherche dans les m\xE9moires de session Claude Code (SQLite local). Hybride : full-text BM25 + s\xE9mantique (embeddings locaux) si disponible. Utile pour retrouver comment un probl\xE8me a \xE9t\xE9 r\xE9solu, ce qui a \xE9t\xE9 d\xE9cid\xE9, quels fichiers touch\xE9s lors de sessions pr\xE9c\xE9dentes.",
+  description: "Searches the Claude Code session memories (local SQLite). Hybrid: BM25 full-text + semantic (local embeddings) if available. Useful to recall how a problem was solved, what was decided, which files were touched in previous sessions.",
   inputSchema: {
     type: "object",
     properties: {
-      query: { type: "string", description: "Texte \xE0 rechercher." },
+      query: { type: "string", description: "Text to search for." },
       project: {
         type: "string",
-        description: "Limiter \xE0 un projet (basename du r\xE9pertoire). Optionnel."
+        description: "Limit to a project (directory basename). Optional."
       },
-      type: { type: "string", enum: TYPES, description: "Filtrer par type de m\xE9moire. Optionnel." },
-      limit: { type: "number", description: "Nombre de r\xE9sultats (d\xE9faut 10)." }
+      type: { type: "string", enum: TYPES, description: "Filter by memory type. Optional." },
+      limit: { type: "number", description: "Number of results (default 10)." }
     },
     required: ["query"],
     additionalProperties: false
   },
   handler: async (args, { store, embedCfg }) => {
     const query = String(args.query ?? "").trim();
-    if (!query) return "\u274C `query` est requis.";
+    if (!query) return "\u274C `query` is required.";
     const embedding = store.vectorEnabled ? await embed(query, embedCfg) : null;
     const docs = store.search({
       query,
@@ -649,22 +649,22 @@ var memorySearch = {
       limit: args.limit ? Number(args.limit) : 10,
       embedding
     });
-    if (docs.length === 0) return `Aucune m\xE9moire pour \xAB ${query} \xBB.`;
-    const mode = embedding ? "hybride BM25+s\xE9mantique" : "BM25";
-    return `\u{1F50E} **${docs.length} m\xE9moire(s)** pour \xAB ${query} \xBB _(${mode})_ :
+    if (docs.length === 0) return `No memory for "${query}".`;
+    const mode = embedding ? "hybrid BM25+semantic" : "BM25";
+    return `\u{1F50E} **${docs.length} memory(ies)** for "${query}" _(${mode})_:
 
 ${docs.map(fmtDoc).join("\n")}`;
   }
 };
 var memoryRecent = {
   name: "memory_recent",
-  description: "Liste les m\xE9moires les plus r\xE9centes (tri\xE9es par date), optionnellement filtr\xE9es par projet ou type.",
+  description: "Lists the most recent memories (sorted by date), optionally filtered by project or type.",
   inputSchema: {
     type: "object",
     properties: {
-      project: { type: "string", description: "Limiter \xE0 un projet. Optionnel." },
-      type: { type: "string", enum: TYPES, description: "Filtrer par type. Optionnel." },
-      limit: { type: "number", description: "Nombre de r\xE9sultats (d\xE9faut 10)." }
+      project: { type: "string", description: "Limit to a project. Optional." },
+      type: { type: "string", enum: TYPES, description: "Filter by type. Optional." },
+      limit: { type: "number", description: "Number of results (default 10)." }
     },
     additionalProperties: false
   },
@@ -674,33 +674,33 @@ var memoryRecent = {
       type: args.type ? String(args.type) : void 0,
       limit: args.limit ? Number(args.limit) : 10
     });
-    if (docs.length === 0) return "Aucune m\xE9moire index\xE9e.";
-    return `\u{1F551} **${docs.length} m\xE9moire(s) r\xE9cente(s)** :
+    if (docs.length === 0) return "No indexed memory.";
+    return `\u{1F551} **${docs.length} recent memory(ies)**:
 
 ${docs.map(fmtDoc).join("\n")}`;
   }
 };
 var memoryStats = {
   name: "memory_stats",
-  description: "Diagnostic : chemin de la base SQLite, total de documents, r\xE9partition par type/projet, \xE9tat de l'index vectoriel et de l'embedder local.",
+  description: "Diagnostics: SQLite database path, total documents, breakdown by type/project, state of the vector index and the local embedder.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   handler: async (_args, { store, embedCfg }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
     const embedderUp = embedCfg.enabled && s.vectorEnabled ? await embedReady(embedCfg) : false;
     const lines = [];
-    lines.push(`**memory \u2014 \xE9tat**`);
-    lines.push(`- Base SQLite : \`${s.dbPath}\``);
-    lines.push(`- Documents : **${s.total}**`);
+    lines.push(`**memory \u2014 state**`);
+    lines.push(`- SQLite database: \`${s.dbPath}\``);
+    lines.push(`- Documents: **${s.total}**`);
     const byType = Object.entries(s.byType).map(([k, v]) => `${k}=${v}`).join(", ");
     const byProj = Object.entries(s.byProject).slice(0, 10).map(([k, v]) => `${k}=${v}`).join(", ");
-    if (byType) lines.push(`- Par type : ${byType}`);
-    if (byProj) lines.push(`- Par projet : ${byProj}`);
+    if (byType) lines.push(`- By type: ${byType}`);
+    if (byProj) lines.push(`- By project: ${byProj}`);
     lines.push(
-      `- Vecteurs (sqlite-vec) : ${s.vectorEnabled ? `\u2705 activ\xE9 (${s.vectorCount} index\xE9s, ${missing} en attente)` : "\u274C d\xE9sactiv\xE9"}`
+      `- Vectors (sqlite-vec): ${s.vectorEnabled ? `\u2705 enabled (${s.vectorCount} indexed, ${missing} pending)` : "\u274C disabled"}`
     );
     lines.push(
-      `- Embedder (${embedCfg.model}) : ${!embedCfg.enabled ? "d\xE9sactiv\xE9 (MEMORY_EMBED_ENABLED=0)" : embedderUp ? "\u2705 charg\xE9" : "\u23F3 pas encore charg\xE9 / indisponible"}`
+      `- Embedder (${embedCfg.model}): ${!embedCfg.enabled ? "disabled (MEMORY_EMBED_ENABLED=0)" : embedderUp ? "\u2705 loaded" : "\u23F3 not loaded yet / unavailable"}`
     );
     return lines.join("\n");
   }
@@ -794,7 +794,7 @@ async function main() {
     const tool = allTools.find((t) => t.name === req.params.name);
     if (!tool) {
       return {
-        content: [{ type: "text", text: `\u274C Outil inconnu: ${req.params.name}` }],
+        content: [{ type: "text", text: `\u274C Unknown tool: ${req.params.name}` }],
         isError: true
       };
     }
@@ -807,21 +807,21 @@ async function main() {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return {
-        content: [{ type: "text", text: `\u274C \xC9chec de ${tool.name}: ${message}` }],
+        content: [{ type: "text", text: `\u274C ${tool.name} failed: ${message}` }],
         isError: true
       };
     }
   });
   await server.connect(new StdioServerTransport());
   process.stderr.write(
-    `memory v${PKG_VERSION} ready (stdio) \u2192 ${config.dbPath} | vecteurs: ${store.vectorEnabled ? "on" : "off"}
+    `memory v${PKG_VERSION} ready (stdio) \u2192 ${config.dbPath} | vectors: ${store.vectorEnabled ? "on" : "off"}
 `
   );
   ensureStatusLineScript(config.dataDir);
   log(config.dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
-  log(config.dataDir, `[server] db=${config.dbPath} mod\xE8le=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vecteurs=${store.vectorEnabled ? "on" : "off"}`);
+  log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? "on" : "off"}`);
   const modelDir = path4.join(config.embed.cacheDir, ...config.embed.model.split("/"));
-  log(config.dataDir, `[server] cache mod\xE8le: ${existsSync3(modelDir) ? "pr\xE9sent" : "absent \u2192 t\xE9l\xE9chargement au 1er usage"} (${modelDir})`);
+  log(config.dataDir, `[server] model cache: ${existsSync3(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);
   writeStatus(config.dataDir, {
     state: "idle",
     model: config.embed.model,

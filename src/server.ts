@@ -13,9 +13,9 @@ import { allTools } from './tools/index.js';
 import { log, writeStatus } from './log.js';
 
 /**
- * Snippet statusLine (opt-in) : lit status.json et affiche un rappel discret de présence
- * « 🧠 mem » (+ ⚙ pendant un backfill, ⏳x% pendant un téléchargement). Écrit à un chemin
- * stable dans le dataDir pour que la conf settings.json ne dépende pas de la version du plugin.
+ * statusLine snippet (opt-in): reads status.json and shows a discreet presence reminder
+ * "🧠 mem" (+ ⚙ during a backfill, ⏳x% during a download). Written to a stable path
+ * in dataDir so the settings.json config doesn't depend on the plugin version.
  */
 function statusLineScript(dataDir: string): string {
   const status = JSON.stringify(path.join(dataDir, 'status.json'));
@@ -46,15 +46,15 @@ function ensureStatusLineScript(dataDir: string): void {
 declare const __PKG_VERSION__: string;
 const PKG_VERSION = typeof __PKG_VERSION__ !== 'undefined' ? __PKG_VERSION__ : '0.0.0-dev';
 
-// Le SDK MCP communique en stdout : on protège des console.log (transformers.js loggue le
-// téléchargement du modèle via console → redirigé en stderr pour ne pas corrompre le protocole).
+// The MCP SDK communicates on stdout: we guard against console.log (transformers.js logs the
+// model download via console → redirected to stderr so as not to corrupt the protocol).
 console.log = (...args: unknown[]) => console.error('[stdout-redirected]', ...args);
 
 const BACKFILL_BATCH = 32;
 const BACKFILL_INTERVAL_MS = 60_000;
 let backfilling = false;
 
-/** Vectorise en tâche de fond les docs capturés par les hooks (qui n'embarquent pas le modèle). */
+/** Vectorizes in the background the docs captured by the hooks (which don't bundle the model). */
 async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!(await embedReady(cfg.embed))) return;
@@ -115,7 +115,7 @@ async function main(): Promise<void> {
     const tool = allTools.find((t) => t.name === req.params.name);
     if (!tool) {
       return {
-        content: [{ type: 'text', text: `❌ Outil inconnu: ${req.params.name}` }],
+        content: [{ type: 'text', text: `❌ Unknown tool: ${req.params.name}` }],
         isError: true,
       };
     }
@@ -128,7 +128,7 @@ async function main(): Promise<void> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return {
-        content: [{ type: 'text', text: `❌ Échec de ${tool.name}: ${message}` }],
+        content: [{ type: 'text', text: `❌ ${tool.name} failed: ${message}` }],
         isError: true,
       };
     }
@@ -136,15 +136,15 @@ async function main(): Promise<void> {
 
   await server.connect(new StdioServerTransport());
   process.stderr.write(
-    `memory v${PKG_VERSION} ready (stdio) → ${config.dbPath} | vecteurs: ${store.vectorEnabled ? 'on' : 'off'}\n`,
+    `memory v${PKG_VERSION} ready (stdio) → ${config.dbPath} | vectors: ${store.vectorEnabled ? 'on' : 'off'}\n`,
   );
 
-  // Diagnostic de premier démarrage (capture aussi les téléchargements de modèle lents).
+  // First-startup diagnostics (also captures slow model downloads).
   ensureStatusLineScript(config.dataDir);
   log(config.dataDir, `[server] memory v${PKG_VERSION} — node ${process.version} ${process.platform}/${process.arch}`);
-  log(config.dataDir, `[server] db=${config.dbPath} modèle=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vecteurs=${store.vectorEnabled ? 'on' : 'off'}`);
+  log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? 'on' : 'off'}`);
   const modelDir = path.join(config.embed.cacheDir, ...config.embed.model.split('/'));
-  log(config.dataDir, `[server] cache modèle: ${existsSync(modelDir) ? 'présent' : 'absent → téléchargement au 1er usage'} (${modelDir})`);
+  log(config.dataDir, `[server] model cache: ${existsSync(modelDir) ? 'present' : 'absent → download on first use'} (${modelDir})`);
   writeStatus(config.dataDir, {
     state: 'idle',
     model: config.embed.model,
@@ -152,7 +152,7 @@ async function main(): Promise<void> {
     missing: store.countMissingVectors(),
   });
 
-  // Vectorisation en fond (non bloquante) : au démarrage puis périodiquement.
+  // Background vectorization (non-blocking): at startup then periodically.
   if (store.vectorEnabled && config.embed.enabled) {
     void backfill(store, config);
     const timer = setInterval(() => void backfill(store, config), BACKFILL_INTERVAL_MS);

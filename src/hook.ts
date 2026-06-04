@@ -47,18 +47,18 @@ function baseFields(payload: HookPayload, state: SessionState): Partial<MemoryDo
   };
 }
 
-// Les hooks sont des process éphémères → AUCUN embedding ici (charger un modèle à chaque hook
-// serait trop lent). La capture est BM25-only ; la vectorisation est faite en tâche de fond par
-// le serveur MCP persistant (backfill).
+// The hooks are ephemeral processes → NO embedding here (loading a model on every hook
+// would be too slow). Capture is BM25-only; vectorization is done in the background by
+// the persistent MCP server (backfill).
 
 function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): string {
   const project = projectFromCwd(payload.cwd);
   const recent = store.recent({ project, limit: cfg.contextLimit });
 
-  // En-tête de présence : rappelle que le plugin est actif et consomme un peu de ressource
-  // (indexation en fond). Transport stdio → pas d'URL/port à exposer.
+  // Presence header: reminds that the plugin is active and uses a little resource
+  // (background indexing). stdio transport → no URL/port to expose.
   const total = store.stats().total;
-  const header = `🧠 mem actif — db: ${cfg.dbPath} · modèle: ${cfg.embed.model} · ${total} docs · vecteurs: ${store.vectorEnabled ? 'on' : 'off'}`;
+  const header = `🧠 mem active — db: ${cfg.dbPath} · model: ${cfg.embed.model} · ${total} docs · vectors: ${store.vectorEnabled ? 'on' : 'off'}`;
 
   if (recent.length === 0) {
     return JSON.stringify({
@@ -69,8 +69,8 @@ function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: Hook
   const lines: string[] = [];
   lines.push(header);
   lines.push('');
-  lines.push(`## Mémoire projet « ${project} »`);
-  lines.push(`Dernières mémoires de sessions précédentes :`);
+  lines.push(`## Project memory "${project}"`);
+  lines.push(`Latest memories from previous sessions:`);
   for (const d of recent) {
     const date = (d.ts ?? '').slice(0, 10);
     const label =
@@ -79,14 +79,14 @@ function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: Hook
       d.assistant_text ||
       (d.prompts && d.prompts[0]) ||
       d.tool_brief ||
-      '(sans résumé)';
+      '(no summary)';
     const files = (d.files_modified ?? []).slice(0, 3).join(', ');
     lines.push(
-      `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` — fichiers: ${files}` : ''}`,
+      `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` — files: ${files}` : ''}`,
     );
   }
   lines.push('');
-  lines.push(`_Recherche : outil MCP \`memory_search\` ou \`/memory:search\`._`);
+  lines.push(`_Search: MCP tool \`memory_search\` or \`/memory:search\`._`);
 
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
@@ -235,7 +235,7 @@ async function main(): Promise<void> {
     }
   } catch (err) {
     process.stderr.write(
-      `[memory] hook ${mode} erreur: ${err instanceof Error ? err.message : String(err)}\n`,
+      `[memory] hook ${mode} error: ${err instanceof Error ? err.message : String(err)}\n`,
     );
     output = CONTINUE;
   } finally {

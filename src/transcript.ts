@@ -17,7 +17,7 @@ function fileFromInput(input: any): string | undefined {
   return input.file_path || input.notebook_path || input.path || undefined;
 }
 
-/** Extrait le chemin de fichier d'un bloc tool_use vers le bon bucket. */
+/** Extracts the file path of a tool_use block into the right bucket. */
 function classifyTool(
   name: string,
   input: any,
@@ -31,8 +31,8 @@ function classifyTool(
 }
 
 /**
- * Lit les nouvelles lignes du transcript JSONL depuis `fromLine` et agrège le dernier tour
- * (prompt utilisateur, texte assistant, outils, fichiers). Tolérant aux lignes malformées.
+ * Reads the new JSONL transcript lines from `fromLine` and aggregates the latest turn
+ * (user prompt, assistant text, tools, files). Tolerant of malformed lines.
  */
 export function readNewTurn(
   transcriptPath: string,
@@ -66,7 +66,7 @@ export function readNewTurn(
     const content = msg?.content;
 
     if (role === 'user') {
-      // Le prompt user "réel" est une string ou un bloc texte (pas un tool_result).
+      // The "real" user prompt is a string or a text block (not a tool_result).
       if (typeof content === 'string') {
         userPrompt = content;
       } else if (Array.isArray(content)) {

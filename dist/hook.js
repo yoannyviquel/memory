@@ -288,7 +288,7 @@ var MemoryStore = class {
     const r = this.db.prepare("SELECT rowid FROM memories WHERE mem_id = ?").get(memId);
     return r ? Number(r.rowid) : null;
   }
-  /** Met à jour le vecteur d'un doc (vec0 ne supporte pas OR REPLACE → DELETE+INSERT). */
+  /** Updates a doc's vector (vec0 doesn't support OR REPLACE → DELETE+INSERT). */
   upsertVector(rowid, embedding) {
     if (!this._vectorEnabled || !embedding || embedding.length !== this.dim) return;
     try {
@@ -297,7 +297,7 @@ var MemoryStore = class {
     } catch {
     }
   }
-  /** Insère ou met à jour un document (idempotent sur mem_id) + son vecteur si fourni. */
+  /** Inserts or updates a document (idempotent on mem_id) + its vector if provided. */
   upsert(id, doc, embedding) {
     this.db.prepare(this.upsertSql()).run(...this.docToParams(id, doc));
     if (embedding) {
@@ -305,13 +305,13 @@ var MemoryStore = class {
       if (rid != null) this.upsertVector(rid, embedding);
     }
   }
-  /** Affecte/Met à jour le vecteur d'un doc par rowid (utilisé par le backfill du serveur). */
+  /** Sets/updates a doc's vector by rowid (used by the server's backfill). */
   setVectorByRowid(rowid, embedding) {
     this.upsertVector(rowid, embedding);
   }
   /**
-   * Documents vectorisables (prompt/turn/session) sans vecteur, plus récents d'abord.
-   * Renvoie le rowid + le texte à plonger. Vide si index vectoriel désactivé.
+   * Vectorizable documents (prompt/turn/session) without a vector, most recent first.
+   * Returns the rowid + the text to embed. Empty if the vector index is disabled.
    */
   missingVectorDocs(limit = 32) {
     if (!this._vectorEnabled) return [];
@@ -327,7 +327,7 @@ var MemoryStore = class {
       text: [r.summary, r.user_prompt, r.assistant_text, r.prompts_text].filter((s) => typeof s === "string" && s.trim()).join("\n").slice(0, 2e3)
     }));
   }
-  /** Nombre de docs vectorisables encore sans vecteur (lag du backfill). */
+  /** Number of vectorizable docs still without a vector (backfill lag). */
   countMissingVectors() {
     if (!this._vectorEnabled) return 0;
     try {
@@ -342,7 +342,7 @@ var MemoryStore = class {
       return 0;
     }
   }
-  /** Upsert en masse dans une transaction. */
+  /** Bulk upsert within a transaction. */
   bulkUpsert(items) {
     if (items.length === 0) return { indexed: 0, errors: 0 };
     const stmt = this.db.prepare(this.upsertSql());
@@ -369,7 +369,7 @@ var MemoryStore = class {
     }
     return { indexed, errors };
   }
-  /** Rowids BM25 ordonnés par pertinence. */
+  /** BM25 rowids ordered by relevance. */
   bm25Rows(query, project, type, n = 40) {
     const ftsq = ftsQuery(query);
     if (!ftsq) return [];
@@ -389,7 +389,7 @@ var MemoryStore = class {
                  ORDER BY bm25(memories_fts, ${BM25_WEIGHTS}) LIMIT ?;`;
     return this.db.prepare(sql).all(...args).map((r) => Number(r.rowid));
   }
-  /** Rowids KNN (sémantique) ordonnés par distance, filtrés par project/type. */
+  /** KNN (semantic) rowids ordered by distance, filtered by project/type. */
   vecRows(embedding, project, type, n = 40) {
     if (!this._vectorEnabled || embedding.length !== this.dim) return [];
     const knn = this.db.prepare(
@@ -419,7 +419,7 @@ var MemoryStore = class {
     const byRowid = new Map(rows.map((r) => [Number(r.rowid), r]));
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
-  /** Recherche : BM25 seul, ou hybride (RRF de BM25 + KNN) si un embedding est fourni. */
+  /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params) {
     const limit = params.limit ?? 10;
     const cand = Math.max(limit * 4, 40);
@@ -685,7 +685,7 @@ function handleSessionStart(cfg, store, payload) {
   const project = projectFromCwd(payload.cwd);
   const recent = store.recent({ project, limit: cfg.contextLimit });
   const total = store.stats().total;
-  const header = `\u{1F9E0} mem actif \u2014 db: ${cfg.dbPath} \xB7 mod\xE8le: ${cfg.embed.model} \xB7 ${total} docs \xB7 vecteurs: ${store.vectorEnabled ? "on" : "off"}`;
+  const header = `\u{1F9E0} mem active \u2014 db: ${cfg.dbPath} \xB7 model: ${cfg.embed.model} \xB7 ${total} docs \xB7 vectors: ${store.vectorEnabled ? "on" : "off"}`;
   if (recent.length === 0) {
     return JSON.stringify({
       hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: header }
@@ -694,18 +694,18 @@ function handleSessionStart(cfg, store, payload) {
   const lines = [];
   lines.push(header);
   lines.push("");
-  lines.push(`## M\xE9moire projet \xAB ${project} \xBB`);
-  lines.push(`Derni\xE8res m\xE9moires de sessions pr\xE9c\xE9dentes :`);
+  lines.push(`## Project memory "${project}"`);
+  lines.push(`Latest memories from previous sessions:`);
   for (const d of recent) {
     const date = (d.ts ?? "").slice(0, 10);
-    const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(sans r\xE9sum\xE9)";
+    const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(no summary)";
     const files = (d.files_modified ?? []).slice(0, 3).join(", ");
     lines.push(
-      `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` \u2014 fichiers: ${files}` : ""}`
+      `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` \u2014 files: ${files}` : ""}`
     );
   }
   lines.push("");
-  lines.push(`_Recherche : outil MCP \`memory_search\` ou \`/memory:search\`._`);
+  lines.push(`_Search: MCP tool \`memory_search\` or \`/memory:search\`._`);
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: lines.join("\n") }
   });
@@ -843,7 +843,7 @@ async function main() {
     }
   } catch (err) {
     process.stderr.write(
-      `[memory] hook ${mode} erreur: ${err instanceof Error ? err.message : String(err)}
+      `[memory] hook ${mode} error: ${err instanceof Error ? err.message : String(err)}
 `
     );
     output = CONTINUE;

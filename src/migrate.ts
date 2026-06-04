@@ -55,7 +55,7 @@ function joinParts(parts: Array<[string, unknown]>, max: number): string {
     .slice(0, max);
 }
 
-/** Texte à plonger pour un doc migré. */
+/** Text to embed for a migrated doc. */
 function docEmbedText(d: MemoryDoc): string {
   return embedText([d.summary, d.user_prompt, d.assistant_text, ...(d.prompts ?? [])]);
 }
@@ -65,7 +65,7 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
 
   if (!existsSync(args.db)) {
-    console.error(`❌ Base SQLite claude-mem introuvable: ${args.db}`);
+    console.error(`❌ claude-mem SQLite database not found: ${args.db}`);
     process.exit(1);
   }
 
@@ -75,17 +75,17 @@ async function main(): Promise<void> {
     ({ DatabaseSync } = await import(sqliteModule));
   } catch {
     console.error(
-      `❌ Module 'node:sqlite' indisponible. Node ${process.version} ; requiert Node ≥ 22.5.`,
+      `❌ Module 'node:sqlite' unavailable. Node ${process.version}; requires Node ≥ 22.5.`,
     );
     process.exit(1);
   }
 
-  // Embeddings de migration (modèle local transformers.js, chargé une fois pour tout le lot).
+  // Migration embeddings (local transformers.js model, loaded once for the whole batch).
   const embedCfg: EmbedConfig = cfg.embed;
   if (args.embed && !args.dryRun) {
     if (!(await embedReady(embedCfg))) {
       console.error(
-        `❌ --embed demandé mais l'embedder local (${embedCfg.model}) n'a pas pu se charger. Migre sans --embed, ou vérifie l'accès au modèle.`,
+        `❌ --embed requested but the local embedder (${embedCfg.model}) failed to load. Migrate without --embed, or check model access.`,
       );
       process.exit(1);
     }
@@ -96,7 +96,7 @@ async function main(): Promise<void> {
     try {
       return db.prepare(sql).all();
     } catch (err) {
-      console.error(`⚠️ Lecture échouée (${sql}): ${err instanceof Error ? err.message : err}`);
+      console.error(`⚠️ Read failed (${sql}): ${err instanceof Error ? err.message : err}`);
       return [];
     }
   };
@@ -129,11 +129,11 @@ async function main(): Promise<void> {
         summary: clip(o.title, 1000) || clip(o.subtitle, 1000),
         assistant_text: joinParts(
           [
-            ['Découverte', o.title],
-            ['Détail', o.subtitle],
-            ['Récit', o.narrative],
-            ['Faits', o.facts],
-            ['Texte', o.text],
+            ['Discovery', o.title],
+            ['Detail', o.subtitle],
+            ['Narrative', o.narrative],
+            ['Facts', o.facts],
+            ['Text', o.text],
           ],
           12000,
         ),
@@ -158,11 +158,11 @@ async function main(): Promise<void> {
         summary: clip(s.request, 1000),
         assistant_text: joinParts(
           [
-            ['Demande', s.request],
-            ['Investigué', s.investigated],
-            ['Appris', s.learned],
-            ['Réalisé', s.completed],
-            ['Prochaines étapes', s.next_steps],
+            ['Request', s.request],
+            ['Investigated', s.investigated],
+            ['Learned', s.learned],
+            ['Completed', s.completed],
+            ['Next steps', s.next_steps],
             ['Notes', s.notes],
           ],
           12000,
@@ -192,18 +192,18 @@ async function main(): Promise<void> {
   db.close();
 
   console.error(
-    `📊 Lu : observations=${counts.observations}, session_summaries=${counts.session_summaries}, user_prompts=${counts.user_prompts} → ${items.length} documents.`,
+    `📊 Read: observations=${counts.observations}, session_summaries=${counts.session_summaries}, user_prompts=${counts.user_prompts} → ${items.length} documents.`,
   );
 
   if (args.dryRun) {
-    console.error(`🟡 --dry-run : aucune écriture.${args.embed ? ' (--embed serait appliqué)' : ''}`);
+    console.error(`🟡 --dry-run: no writes.${args.embed ? ' (--embed would be applied)' : ''}`);
     process.exit(0);
   }
 
   const store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model);
   await store.init();
   if (args.embed && !store.vectorEnabled) {
-    console.error('⚠️ --embed demandé mais index vectoriel indisponible (sqlite-vec) → import sans vecteurs.');
+    console.error('⚠️ --embed requested but vector index unavailable (sqlite-vec) → importing without vectors.');
   }
   const doEmbed = args.embed && store.vectorEnabled;
 
@@ -223,13 +223,13 @@ async function main(): Promise<void> {
     indexed += res.indexed;
     errors += res.errors;
     console.error(
-      `  …indexés ${indexed}/${items.length} (erreurs: ${errors}${doEmbed ? `, vecteurs: ${embedded}` : ''})`,
+      `  …indexed ${indexed}/${items.length} (errors: ${errors}${doEmbed ? `, vectors: ${embedded}` : ''})`,
     );
   }
   store.close();
 
   console.error(
-    `✅ Migration terminée : ${indexed} indexés, ${errors} erreurs${doEmbed ? `, ${embedded} vecteurs` : ''} → ${cfg.dbPath}`,
+    `✅ Migration done: ${indexed} indexed, ${errors} errors${doEmbed ? `, ${embedded} vectors` : ''} → ${cfg.dbPath}`,
   );
   process.exit(errors > 0 ? 2 : 0);
 }
