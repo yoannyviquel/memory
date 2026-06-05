@@ -47,7 +47,35 @@ embeddings are computed locally by transformers.js — nothing to run alongside.
   **sqlite-vec**. Finds by meaning (synonyms, paraphrase) even without a common word. No cloud,
   no key, no daemon. The model is downloaded once (local cache) on first use.
 - The two rankings are fused (**Reciprocal Rank Fusion**).
+- **Reranker (optional, on by default)**: a cross-encoder reorders the top candidates for precision
+  (see below).
 - **If the embedder is unavailable → BM25-only search, no error.**
+
+### Reranking (two-stage retrieval)
+
+Bigger embedders give little on a small personal base; the real precision win is a **cross-encoder
+reranker**. Search is two-stage:
+
+1. **Recall** — hybrid BM25 + vector KNN (RRF) over a **bounded** candidate set
+   `K = clamp(limit×5, 50, 100)`. This stage is cheap and index-backed, so it scales to any base size.
+2. **Rerank** — a cross-encoder scores each `(query, candidate)` pair and reorders; the top `limit`
+   are returned.
+
+K is **bounded on purpose** (not a % of the corpus): a cross-encoder costs O(candidates), so a
+percentage would get slower as the base grows. The recall stage already surfaces the right
+candidates regardless of size — the reranker just needs a fixed window to reorder.
+
+Per tier (on by default; `MEMORY_RERANK_ENABLED=0` to disable, `MEMORY_RERANK_MODEL` to override):
+
+| Tier | Reranker |
+|---|---|
+| `light` | none (recall only) |
+| `medium` | `Xenova/bge-reranker-base` |
+| `heavy` | `onnx-community/bge-reranker-v2-m3-ONNX` |
+
+The reranker is a **second model**, loaded **lazily on the leader** (only when a search actually
+reranks), reused by followers via the same loopback service. If unavailable → the RRF order is kept,
+never an error.
 
 ### Embeddings architecture (important)
 
@@ -203,7 +231,7 @@ Restart Claude Code (or `/reload-plugins`) to activate hooks + MCP server.
 
 Two mechanisms, **env takes precedence over the file**:
 - File `~/.claude-memory/config.json`, e.g. `{ "embedTier": "medium" }` (keys: `embedTier`,
-  `embedEnabled`, `digestEnabled`, `digestModel`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
+  `embedEnabled`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
 - System environment variables (overrides):
 
 | Variable | Default | Role |
@@ -215,6 +243,8 @@ Two mechanisms, **env takes precedence over the file**:
 | `MEMORY_EMBED_ENABLED` | _(enabled)_ | `0` to disable semantic search (BM25 only) |
 | `MEMORY_DIGEST_ENABLED` | _(enabled)_ | `0` to disable LLM session digests (`claude -p`) |
 | `MEMORY_DIGEST_MODEL` | `haiku` | Model for digests (`haiku` / `sonnet` / `opus` / pinned id) |
+| `MEMORY_RERANK_ENABLED` | _(enabled)_ | `0` to disable the cross-encoder reranker |
+| `MEMORY_RERANK_MODEL` | _(per tier)_ | Override the reranker model (empty = none) |
 | `MEMORY_EMBED_MODEL` | _(per tier)_ | Force a specific model (overrides the tier) |
 | `MEMORY_EMBED_DIM` | _(per tier)_ | Force the dimension (must match the model) |
 | `MEMORY_EMBED_DTYPE` | `q8` | ONNX precision: `q8` (quantized) or `fp32` (full precision) |

@@ -14,8 +14,13 @@ var DIGEST_VERSION = 1;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384, pooling: "mean" },
-  medium: { model: "Xenova/multilingual-e5-base", dim: 768, pooling: "mean" },
-  heavy: { model: "Xenova/multilingual-e5-large", dim: 1024, pooling: "mean" }
+  medium: { model: "Xenova/multilingual-e5-base", dim: 768, pooling: "mean", reranker: "Xenova/bge-reranker-base" },
+  heavy: {
+    model: "Xenova/multilingual-e5-large",
+    dim: 1024,
+    pooling: "mean",
+    reranker: "onnx-community/bge-reranker-v2-m3-ONNX"
+  }
 };
 var DEFAULT_TIER = "light";
 function readConfigFile(dataDir) {
@@ -52,17 +57,20 @@ function loadConfig() {
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
-  const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const threadFraction = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
   const digestModel = get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
+  const rerankModel = get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
+  const rerankEnabled = get("MEMORY_RERANK_ENABLED", "rerankEnabled") !== "0" && !!rerankModel;
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
-    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION }
+    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
+    rerank: { enabled: rerankEnabled, model: rerankModel }
   };
 }
 

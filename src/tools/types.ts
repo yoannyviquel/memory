@@ -15,6 +15,8 @@ export interface ToolContext {
   config: MemoryConfig;
   /** Embeds a search query — locally if leader, else via the leader's loopback service (null → BM25). */
   embedQuery: (text: string) => Promise<number[] | null>;
+  /** Reranks candidate docs for a query — scores aligned to docs, or null (→ keep RRF order). */
+  rerank: (query: string, docs: string[]) => Promise<number[] | null>;
 }
 
 export interface ToolDefinition<TArgs = Record<string, unknown>> {

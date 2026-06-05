@@ -28,8 +28,13 @@ var DIGEST_VERSION = 1;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384, pooling: "mean" },
-  medium: { model: "Xenova/multilingual-e5-base", dim: 768, pooling: "mean" },
-  heavy: { model: "Xenova/multilingual-e5-large", dim: 1024, pooling: "mean" }
+  medium: { model: "Xenova/multilingual-e5-base", dim: 768, pooling: "mean", reranker: "Xenova/bge-reranker-base" },
+  heavy: {
+    model: "Xenova/multilingual-e5-large",
+    dim: 1024,
+    pooling: "mean",
+    reranker: "onnx-community/bge-reranker-v2-m3-ONNX"
+  }
 };
 var DEFAULT_TIER = "light";
 function readConfigFile(dataDir) {
@@ -66,17 +71,20 @@ function loadConfig() {
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
-  const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const threadFraction = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
   const digestModel = get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
+  const rerankModel = get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
+  const rerankEnabled = get("MEMORY_RERANK_ENABLED", "rerankEnabled") !== "0" && !!rerankModel;
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
-    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION }
+    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
+    rerank: { enabled: rerankEnabled, model: rerankModel }
   };
 }
 
@@ -1064,26 +1072,45 @@ function refreshLeadership(dataDir, extra) {
 // src/embed-service.ts
 import { createServer, request as httpRequest } from "http";
 var TOKEN_HEADER = "x-mem-token";
-async function startEmbedServer(cfg, token) {
-  const server = createServer((req, res) => {
-    if (req.method !== "POST" || req.url !== "/embed" || req.headers[TOKEN_HEADER] !== token) {
+function readBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (c) => body += c);
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+async function startLeaderService(handlers, token) {
+  const server = createServer(async (req, res) => {
+    if (req.method !== "POST" || req.headers[TOKEN_HEADER] !== token) {
       res.writeHead(404);
       res.end();
       return;
     }
-    let body = "";
-    req.on("data", (c) => body += c);
-    req.on("end", async () => {
-      try {
-        const { text } = JSON.parse(body);
-        const vector = await embed(String(text ?? ""), cfg, true);
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ vector }));
-      } catch {
-        res.writeHead(500);
+    try {
+      const body = await readBody(req);
+      let payload;
+      if (req.url === "/embed") {
+        payload = { vector: await handlers.embed(String(body?.text ?? "")) };
+      } else if (req.url === "/rerank") {
+        const docs = Array.isArray(body?.docs) ? body.docs.map((d) => String(d)) : [];
+        payload = { scores: await handlers.rerank(String(body?.query ?? ""), docs) };
+      } else {
+        res.writeHead(404);
         res.end();
+        return;
       }
-    });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    } catch {
+      res.writeHead(500);
+      res.end();
+    }
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const addr = server.address();
@@ -1091,18 +1118,18 @@ async function startEmbedServer(cfg, token) {
   server.unref?.();
   return port;
 }
-function remoteEmbed(endpoint, text, timeoutMs = 5e3) {
+function post(endpoint, path8, body, pick, timeoutMs = 8e3) {
   return new Promise((resolve) => {
-    const body = JSON.stringify({ text });
+    const data = JSON.stringify(body);
     const req = httpRequest(
       {
         host: "127.0.0.1",
         port: endpoint.port,
         method: "POST",
-        path: "/embed",
+        path: path8,
         headers: {
           "content-type": "application/json",
-          "content-length": Buffer.byteLength(body),
+          "content-length": Buffer.byteLength(data),
           [TOKEN_HEADER]: endpoint.token
         }
       },
@@ -1111,8 +1138,7 @@ function remoteEmbed(endpoint, text, timeoutMs = 5e3) {
         res.on("data", (c) => d += c);
         res.on("end", () => {
           try {
-            const j = JSON.parse(d);
-            resolve(Array.isArray(j.vector) ? j.vector : null);
+            resolve(pick(JSON.parse(d)));
           } catch {
             resolve(null);
           }
@@ -1124,9 +1150,89 @@ function remoteEmbed(endpoint, text, timeoutMs = 5e3) {
       req.destroy();
       resolve(null);
     });
-    req.write(body);
+    req.write(data);
     req.end();
   });
+}
+function remoteEmbed(endpoint, text) {
+  return post(endpoint, "/embed", { text }, (j) => Array.isArray(j?.vector) ? j.vector : null);
+}
+function remoteRerank(endpoint, query, docs) {
+  return post(endpoint, "/rerank", { query, docs }, (j) => Array.isArray(j?.scores) ? j.scores : null);
+}
+
+// src/rerank.ts
+var _tok = null;
+var _model = null;
+var _loading2 = null;
+var _failed2 = false;
+async function getReranker(opts) {
+  if (!opts.model) return null;
+  if (_model && _tok) return { tok: _tok, model: _model };
+  if (_failed2) return null;
+  if (_loading2) return _loading2;
+  _loading2 = (async () => {
+    try {
+      const mod = "@huggingface/transformers";
+      const tf = await import(mod);
+      tf.env.cacheDir = opts.cacheDir;
+      tf.env.allowRemoteModels = true;
+      const threads = Math.max(1, opts.threads || 1);
+      try {
+        tf.env.backends.onnx.numThreads = threads;
+        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
+      } catch {
+      }
+      const dtype = opts.dtype || "q8";
+      const session_options = { intraOpNumThreads: threads, interOpNumThreads: 1 };
+      log(opts.dataDir, `[rerank] loading ${opts.model} (dtype=${dtype}, threads=${threads})`);
+      const tok = await tf.AutoTokenizer.from_pretrained(opts.model);
+      let model;
+      try {
+        model = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, {
+          dtype,
+          session_options
+        });
+      } catch (e) {
+        log(
+          opts.dataDir,
+          `[rerank] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
+        );
+        model = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, {
+          dtype: "fp32",
+          session_options
+        });
+      }
+      _tok = tok;
+      _model = model;
+      log(opts.dataDir, `[rerank] model ready (${opts.model})`);
+      return { tok, model };
+    } catch (err) {
+      _failed2 = true;
+      log(opts.dataDir, `[rerank] unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      return null;
+    } finally {
+      _loading2 = null;
+    }
+  })();
+  return _loading2;
+}
+async function rerank(query, docs, opts) {
+  if (docs.length === 0) return [];
+  const r = await getReranker(opts);
+  if (!r) return null;
+  try {
+    const inputs = r.tok(new Array(docs.length).fill(query), {
+      text_pair: docs,
+      padding: true,
+      truncation: true
+    });
+    const { logits } = await r.model(inputs);
+    const rows = logits.sigmoid().tolist();
+    return rows.map((row) => Array.isArray(row) ? Number(row[0]) : Number(row));
+  } catch {
+    return null;
+  }
 }
 
 // src/server.ts
@@ -1155,6 +1261,10 @@ function fmtDoc(d) {
   return `- **[${d.type}]** \`${proj}\` \xB7 ${date}
   ${text}${filesLine}`;
 }
+function rerankText(d) {
+  const t = d.summary || d.assistant_text || d.user_prompt || d.prompts && d.prompts.join(" ") || d.tool_brief || "";
+  return t.replace(/\s+/g, " ").trim().slice(0, 2e3);
+}
 var memorySearch = {
   name: "memory_search",
   description: "Searches the Claude Code session memories (local SQLite). Hybrid: BM25 full-text + semantic (local embeddings) if available. Useful to recall how a problem was solved, what was decided, which files were touched in previous sessions.",
@@ -1172,19 +1282,26 @@ var memorySearch = {
     required: ["query"],
     additionalProperties: false
   },
-  handler: async (args, { store, embedQuery }) => {
+  handler: async (args, { store, embedQuery, rerank: rerank2, config }) => {
     const query = String(args.query ?? "").trim();
     if (!query) return "\u274C `query` is required.";
+    const limit = args.limit ? Number(args.limit) : 10;
+    const project = args.project ? String(args.project) : void 0;
+    const type = args.type ? String(args.type) : void 0;
     const embedding = store.vectorEnabled ? await embedQuery(query) : null;
-    const docs = store.search({
-      query,
-      project: args.project ? String(args.project) : void 0,
-      type: args.type ? String(args.type) : void 0,
-      limit: args.limit ? Number(args.limit) : 10,
-      embedding
-    });
+    const rerankOn = config.rerank.enabled;
+    const candidateK = rerankOn ? Math.min(100, Math.max(50, limit * 5)) : limit;
+    let docs = store.search({ query, project, type, limit: candidateK, embedding });
     if (docs.length === 0) return `No memory for "${query}".`;
-    const mode = embedding ? "hybrid BM25+semantic" : "BM25";
+    let mode = embedding ? "hybrid BM25+semantic" : "BM25";
+    if (rerankOn && docs.length > limit) {
+      const scores = await rerank2(query, docs.map(rerankText));
+      if (scores && scores.length === docs.length) {
+        docs = docs.map((d, i) => ({ d, s: scores[i] ?? -Infinity })).sort((a, b) => b.s - a.s).map((x) => x.d);
+        mode += " + rerank";
+      }
+    }
+    docs = docs.slice(0, limit);
     return `\u{1F50E} **${docs.length} memory(ies)** for "${query}" _(${mode})_:
 
 ${docs.map(fmtDoc).join("\n")}`;
@@ -1420,7 +1537,7 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.6.1" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.7.0" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1582,7 +1699,23 @@ async function main() {
     }
     return null;
   };
-  const ctx = { store, embedCfg: config.embed, config, embedQuery };
+  const rerankOpts = {
+    model: config.rerank.model,
+    dtype: config.embed.dtype,
+    cacheDir: config.embed.cacheDir,
+    threads: config.embed.threads,
+    dataDir: config.dataDir
+  };
+  const rerankQuery = async (query, docs) => {
+    if (!config.rerank.enabled || docs.length === 0) return null;
+    if (amLeader) return rerank(query, docs, rerankOpts);
+    const lock = readLock(config.dataDir);
+    if (lock?.port && lock?.token) {
+      return remoteRerank({ port: lock.port, token: lock.token }, query, docs);
+    }
+    return null;
+  };
+  const ctx = { store, embedCfg: config.embed, config, embedQuery, rerank: rerankQuery };
   const server = new Server(
     { name: "memory", version: PKG_VERSION },
     { capabilities: { tools: {} } }
@@ -1639,9 +1772,15 @@ async function main() {
     if (amLeader && !myEmbedPort && store.vectorEnabled && config.embed.enabled) {
       myEmbedToken = randomBytes(16).toString("hex");
       try {
-        myEmbedPort = await startEmbedServer(config.embed, myEmbedToken);
+        myEmbedPort = await startLeaderService(
+          {
+            embed: (text) => embed(text, config.embed, true),
+            rerank: (query, docs) => config.rerank.enabled ? rerank(query, docs, rerankOpts) : Promise.resolve(null)
+          },
+          myEmbedToken
+        );
         refreshLeadership(config.dataDir, leaderExtra());
-        log(config.dataDir, `[server] embed service on 127.0.0.1:${myEmbedPort}`);
+        log(config.dataDir, `[server] leader service on 127.0.0.1:${myEmbedPort}`);
       } catch {
         myEmbedPort = 0;
       }

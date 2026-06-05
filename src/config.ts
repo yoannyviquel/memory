@@ -9,6 +9,14 @@ export interface MemoryConfig {
   contextLimit: number;
   embed: EmbedConfig;
   digest: DigestConfig;
+  rerank: RerankConfig;
+}
+
+export interface RerankConfig {
+  /** Whether to rerank search candidates with a cross-encoder (on by default; off if no model). */
+  enabled: boolean;
+  /** Cross-encoder model id (per tier). Empty = no reranker for this tier (e.g. light). */
+  model: string;
 }
 
 export interface DigestConfig {
@@ -43,11 +51,16 @@ export const EMBED_TEXT_VERSION = 1;
  */
 export const EMBED_TIERS: Record<
   string,
-  { model: string; dim: number; pooling: string; queryPrefix?: string }
+  { model: string; dim: number; pooling: string; queryPrefix?: string; reranker?: string }
 > = {
   light: { model: 'Xenova/multilingual-e5-small', dim: 384, pooling: 'mean' },
-  medium: { model: 'Xenova/multilingual-e5-base', dim: 768, pooling: 'mean' },
-  heavy: { model: 'Xenova/multilingual-e5-large', dim: 1024, pooling: 'mean' },
+  medium: { model: 'Xenova/multilingual-e5-base', dim: 768, pooling: 'mean', reranker: 'Xenova/bge-reranker-base' },
+  heavy: {
+    model: 'Xenova/multilingual-e5-large',
+    dim: 1024,
+    pooling: 'mean',
+    reranker: 'onnx-community/bge-reranker-v2-m3-ONNX',
+  },
 };
 const DEFAULT_TIER = 'light';
 
@@ -107,9 +120,9 @@ export function loadConfig(): MemoryConfig {
   const dtype = (get('MEMORY_EMBED_DTYPE', 'embedDtype') || 'q8').toLowerCase();
   // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
   // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
-  // medium=50%, heavy=75% of the cores. Floor of 1 so single/dual-core hosts still run.
+  // light=33%, medium=66%, heavy=100% of the cores. Floor of 1 so single/dual-core hosts still run.
   // Single source of truth: the tier (no separate override knob).
-  const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const threadFraction: Record<string, number> = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
@@ -118,11 +131,18 @@ export function loadConfig(): MemoryConfig {
   const digestEnabled = get('MEMORY_DIGEST_ENABLED', 'digestEnabled') !== '0';
   const digestModel = get('MEMORY_DIGEST_MODEL', 'digestModel') || DEFAULT_DIGEST_MODEL;
 
+  // Reranker: cross-encoder over the top-K search candidates. On by default; the model is per tier
+  // (light has none → disabled). Override the model with MEMORY_RERANK_MODEL, or turn off with
+  // MEMORY_RERANK_ENABLED=0.
+  const rerankModel = get('MEMORY_RERANK_MODEL', 'rerankModel') || picked.reranker || '';
+  const rerankEnabled = get('MEMORY_RERANK_ENABLED', 'rerankEnabled') !== '0' && !!rerankModel;
+
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
+    rerank: { enabled: rerankEnabled, model: rerankModel },
   };
 }

@@ -20,6 +20,18 @@ function fmtDoc(d: MemoryDoc): string {
   return `- **[${d.type}]** \`${proj}\` · ${date}\n  ${text}${filesLine}`;
 }
 
+/** Text handed to the cross-encoder reranker for a candidate doc. */
+function rerankText(d: MemoryDoc): string {
+  const t =
+    d.summary ||
+    d.assistant_text ||
+    d.user_prompt ||
+    (d.prompts && d.prompts.join(' ')) ||
+    d.tool_brief ||
+    '';
+  return t.replace(/\s+/g, ' ').trim().slice(0, 2000);
+}
+
 const memorySearch: ToolDefinition = {
   name: 'memory_search',
   description:
@@ -38,20 +50,36 @@ const memorySearch: ToolDefinition = {
     required: ['query'],
     additionalProperties: false,
   },
-  handler: async (args, { store, embedQuery }) => {
+  handler: async (args, { store, embedQuery, rerank, config }) => {
     const query = String(args.query ?? '').trim();
     if (!query) return '❌ `query` is required.';
+    const limit = args.limit ? Number(args.limit) : 10;
+    const project = args.project ? String(args.project) : undefined;
+    const type = args.type ? (String(args.type) as MemoryType) : undefined;
+
     // Query embedding routed via the leader (null → BM25 only). Never loads a model in this process.
     const embedding = store.vectorEnabled ? await embedQuery(query) : null;
-    const docs = store.search({
-      query,
-      project: args.project ? String(args.project) : undefined,
-      type: args.type ? (String(args.type) as MemoryType) : undefined,
-      limit: args.limit ? Number(args.limit) : 10,
-      embedding,
-    });
+
+    // Two-stage retrieval: a CHEAP hybrid recall stage over a BOUNDED candidate set, then an
+    // (optional) cross-encoder rerank. K is bounded (not a % of the corpus) so rerank latency stays
+    // constant regardless of base size — the recall stage already scales via the indexes.
+    const rerankOn = config.rerank.enabled;
+    const candidateK = rerankOn ? Math.min(100, Math.max(50, limit * 5)) : limit;
+    let docs = store.search({ query, project, type, limit: candidateK, embedding });
     if (docs.length === 0) return `No memory for "${query}".`;
-    const mode = embedding ? 'hybrid BM25+semantic' : 'BM25';
+
+    let mode = embedding ? 'hybrid BM25+semantic' : 'BM25';
+    if (rerankOn && docs.length > limit) {
+      const scores = await rerank(query, docs.map(rerankText));
+      if (scores && scores.length === docs.length) {
+        docs = docs
+          .map((d, i) => ({ d, s: scores[i] ?? -Infinity }))
+          .sort((a, b) => b.s - a.s)
+          .map((x) => x.d);
+        mode += ' + rerank';
+      }
+    }
+    docs = docs.slice(0, limit);
     return `🔎 **${docs.length} memory(ies)** for "${query}" _(${mode})_:\n\n${docs.map(fmtDoc).join('\n')}`;
   },
 };

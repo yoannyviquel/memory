@@ -20,7 +20,8 @@ import { MemoryStore, type MemoryDoc } from './store.js';
 import { embed, embedReady } from './embeddings.js';
 import { digestSession, claudeAvailable } from './digest.js';
 import { refreshLeadership, readLock, releaseLeadership } from './leader.js';
-import { startEmbedServer, remoteEmbed } from './embed-service.js';
+import { startLeaderService, remoteEmbed, remoteRerank } from './embed-service.js';
+import { rerank, type RerankOptions } from './rerank.js';
 import { randomBytes } from 'node:crypto';
 import { nowIso, uniq } from './memory.js';
 import { allTools } from './tools/index.js';
@@ -251,7 +252,27 @@ async function main(): Promise<void> {
     }
     return null;
   };
-  const ctx = { store, embedCfg: config.embed, config, embedQuery };
+
+  // Reranking shares the leader/loopback pattern: the leader runs the cross-encoder locally;
+  // followers route to it. Reranker uses the embedder's cache/dtype/threads.
+  const rerankOpts: RerankOptions = {
+    model: config.rerank.model,
+    dtype: config.embed.dtype,
+    cacheDir: config.embed.cacheDir,
+    threads: config.embed.threads,
+    dataDir: config.dataDir,
+  };
+  const rerankQuery = async (query: string, docs: string[]): Promise<number[] | null> => {
+    if (!config.rerank.enabled || docs.length === 0) return null;
+    if (amLeader) return rerank(query, docs, rerankOpts);
+    const lock = readLock(config.dataDir);
+    if (lock?.port && lock?.token) {
+      return remoteRerank({ port: lock.port, token: lock.token }, query, docs);
+    }
+    return null;
+  };
+
+  const ctx = { store, embedCfg: config.embed, config, embedQuery, rerank: rerankQuery };
 
   const server = new Server(
     { name: 'memory', version: PKG_VERSION },
@@ -318,9 +339,16 @@ async function main(): Promise<void> {
     if (amLeader && !myEmbedPort && store.vectorEnabled && config.embed.enabled) {
       myEmbedToken = randomBytes(16).toString('hex');
       try {
-        myEmbedPort = await startEmbedServer(config.embed, myEmbedToken);
+        myEmbedPort = await startLeaderService(
+          {
+            embed: (text) => embed(text, config.embed, true),
+            rerank: (query, docs) =>
+              config.rerank.enabled ? rerank(query, docs, rerankOpts) : Promise.resolve(null),
+          },
+          myEmbedToken,
+        );
         refreshLeadership(config.dataDir, leaderExtra()); // publish the endpoint
-        log(config.dataDir, `[server] embed service on 127.0.0.1:${myEmbedPort}`);
+        log(config.dataDir, `[server] leader service on 127.0.0.1:${myEmbedPort}`);
       } catch {
         myEmbedPort = 0;
       }
