@@ -14,7 +14,8 @@ import {
   readFileSync as readFileSync5,
   writeFileSync as writeFileSync3,
   readdirSync,
-  unlinkSync as unlinkSync2
+  unlinkSync as unlinkSync2,
+  watch
 } from "fs";
 import path7 from "path";
 
@@ -1414,7 +1415,7 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.4.1" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.4.2" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1666,6 +1667,17 @@ async function main() {
   process.on("SIGINT", releaseAndExit);
   process.stdin.on("end", releaseAndExit);
   process.stdin.on("close", releaseAndExit);
+  try {
+    let watchT;
+    const watcher = watch(config.dataDir, (_event, filename) => {
+      if (!amLeader && filename && String(filename).includes("worker.lock")) {
+        clearTimeout(watchT);
+        watchT = setTimeout(() => void syncLeadership(), 200);
+      }
+    });
+    watcher.unref?.();
+  } catch {
+  }
   if (store.vectorEnabled && config.embed.enabled) {
     const tick = () => {
       if (amLeader) void backfill(store, config);

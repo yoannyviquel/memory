@@ -12,6 +12,7 @@ import {
   writeFileSync,
   readdirSync,
   unlinkSync,
+  watch,
 } from 'node:fs';
 import path from 'node:path';
 import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
@@ -356,6 +357,23 @@ async function main(): Promise<void> {
   process.on('SIGINT', releaseAndExit);
   process.stdin.on('end', releaseAndExit);
   process.stdin.on('close', releaseAndExit);
+
+  // Near-instant failover: watch the lock file. When the leader releases it (or it changes), a
+  // follower re-checks leadership immediately instead of waiting for its 30s heartbeat. Only
+  // followers react (a leader ignores its own writes → no self-trigger loop). Heartbeat remains the
+  // fallback if fs.watch is unsupported or misses an event.
+  try {
+    let watchT: ReturnType<typeof setTimeout> | undefined;
+    const watcher = watch(config.dataDir, (_event, filename) => {
+      if (!amLeader && filename && String(filename).includes('worker.lock')) {
+        clearTimeout(watchT);
+        watchT = setTimeout(() => void syncLeadership(), 200);
+      }
+    });
+    watcher.unref?.();
+  } catch {
+    /* fs.watch unsupported → heartbeat covers failover */
+  }
 
   // Background vectorization (leader-only, non-blocking): at startup then periodically.
   if (store.vectorEnabled && config.embed.enabled) {
