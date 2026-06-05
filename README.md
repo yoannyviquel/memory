@@ -11,41 +11,55 @@ Capture and search are **fully local** (no cloud). The only optional cloud step 
 ## How it works
 
 ```mermaid
-flowchart LR
-    subgraph CC["Claude Code session (hooks — ephemeral, never block)"]
+flowchart TB
+    subgraph HOOKS["Claude Code hooks — every session, ephemeral, never block, no model"]
+        H1["SessionStart"]
         H2["UserPromptSubmit"]
         H3["PostToolUse"]
         H4["Stop"]
         H5["SessionEnd"]
-        H1["SessionStart"]
     end
 
-    H2 -->|"prompt"| DB[("SQLite\nmemories + FTS5 (BM25)\n+ sqlite-vec")]
+    DB[("Shared SQLite<br/>memories + FTS5 (BM25) + sqlite-vec<br/>+ worker.lock")]
+
+    H2 -->|"prompt"| DB
     H3 -->|"observation"| DB
     H4 -->|"turn"| DB
     H5 -->|"session"| DB
+    DB -->|"⭐ core + recent digests"| H1
+    H1 -->|"inject at session start"| HOOKS
 
-    subgraph SRV["Persistent MCP server (background worker)"]
-        BF["backfill loop\nlocal embeddings (transformers.js)"]
-        DG["digest loop\nclaude -p (your default model)"]
+    subgraph LEADER["MCP server — LEADER (elected via worker.lock; the only one that loads the model)"]
+        BF["backfill loop<br/>local embeddings (transformers.js)"]
+        DG["digest loop<br/>claude -p (Haiku)"]
+        ES["loopback embed service<br/>127.0.0.1 + token"]
     end
 
-    DB -->|"docs without vector"| BF
-    BF -->|"vectors"| DB
+    DB <-->|"docs without vector ↔ vectors"| BF
     DB -->|"sessions without digest"| DG
-    DG -->|"digest + insights (decision/bugfix/discovery)"| DB
+    DG -->|"digest + insights<br/>(decision/bugfix/discovery)"| DB
 
-    DB -->|"recent digests"| H1
-    H1 -->|"inject context"| CC
+    subgraph FOLLOWER["MCP server — FOLLOWER (one per extra session; no model)"]
+        FS["search & tools<br/>BM25 + KNN + RRF"]
+    end
 
-    SEARCH["memory_search / memory_recent\n(MCP tools, /memory:search)"]
-    SEARCH <-->|"BM25 + semantic (RRF)"| DB
+    FS <-->|"BM25 + KNN"| DB
+    FS -->|"query text"| ES
+    ES -->|"vector"| FS
+
+    USER["MCP tools / slash commands<br/>search · core · reindex · delete · migrate"]
+    USER -.-> FS
+    USER -.-> DB
 ```
 
-- **Hooks** capture raw memories (no model loaded → instant, BM25-searchable immediately).
-- The **MCP server** does the heavy work in the background: vectorizes pending docs (*backfill*),
-  and compresses finished sessions into LLM **digests** (*digest loop*).
-- **SessionStart** injects the project's recent digests (conclusions) into the next session.
+- **Hooks** (every session) capture raw memories with **no model loaded** → instant, BM25-searchable
+  immediately. `SessionStart` injects **core memories + recent digests** into the new session.
+- **Leader** (one across all sessions, elected via `worker.lock`): loads the model and runs the
+  **backfill** (vectorize) and **digest** (LLM compression, Haiku) loops, and exposes a **loopback
+  embedding service**.
+- **Followers** (extra sessions): no model — they run BM25 + KNN locally on the shared DB and route
+  the **query→vector** step to the leader's embedding service. One model in RAM total; sub-second
+  failover if the leader exits.
 
 ## Why SQLite (and not Elasticsearch)
 
