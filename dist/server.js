@@ -738,7 +738,7 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.5" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.6" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -780,8 +780,7 @@ async function backfill(store, cfg) {
   }
 }
 var PROCESS_NAME = "yoannyviquel-memory";
-var DISPLAY_NAME = "claude-code:yoannyviquel:memory";
-async function ensureNamedBinary() {
+function ensureNamedBinary() {
   if (process.platform !== "win32") return;
   try {
     const scriptPath = process.argv[1];
@@ -792,20 +791,6 @@ async function ensureNamedBinary() {
     if (!existsSync3(exe)) {
       mkdirSync3(path4.dirname(exe), { recursive: true });
       copyFileSync(process.execPath, exe);
-      try {
-        const rceditMod = "rcedit";
-        const rcedit = (await import(rceditMod)).default;
-        await rcedit(exe, {
-          "version-string": { FileDescription: DISPLAY_NAME, ProductName: DISPLAY_NAME }
-        });
-        process.stderr.write(`[memory] patched exe FileDescription \u2192 ${DISPLAY_NAME}
-`);
-      } catch (e) {
-        process.stderr.write(
-          `[memory] rcedit resource patch skipped: ${e instanceof Error ? e.message : String(e)}
-`
-        );
-      }
     }
     const mcpPath = path4.join(root, ".mcp.json");
     const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + PROCESS_NAME + ".exe";
@@ -822,7 +807,7 @@ async function main() {
     process.title = PROCESS_NAME;
   } catch {
   }
-  await ensureNamedBinary();
+  ensureNamedBinary();
   const config = loadConfig();
   const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
   await store.init();
