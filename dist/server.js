@@ -14,7 +14,7 @@ import {
   readFileSync as readFileSync5,
   writeFileSync as writeFileSync3,
   readdirSync,
-  unlinkSync
+  unlinkSync as unlinkSync2
 } from "fs";
 import path7 from "path";
 
@@ -1010,9 +1010,9 @@ async function digestSession(input) {
 }
 
 // src/leader.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3 } from "fs";
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, unlinkSync } from "fs";
 import path5 from "path";
-var STALE_MS = 15e4;
+var STALE_MS = 9e4;
 function lockPath(dataDir) {
   return path5.join(dataDir, "worker.lock");
 }
@@ -1029,6 +1029,13 @@ function readLock(dataDir) {
     return JSON.parse(readFileSync3(lockPath(dataDir), "utf8"));
   } catch {
     return null;
+  }
+}
+function releaseLeadership(dataDir) {
+  try {
+    const cur = readLock(dataDir);
+    if (cur && cur.pid === process.pid) unlinkSync(lockPath(dataDir));
+  } catch {
   }
 }
 function refreshLeadership(dataDir, extra) {
@@ -1407,7 +1414,7 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.4.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.4.1" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1529,7 +1536,7 @@ function ensureNamedBinary(name) {
       for (const f of readdirSync(binDir)) {
         const low = f.toLowerCase();
         if (low.startsWith("yoannyviquel_memory_") && low.endsWith(".exe") && low !== `${name}.exe` && low !== running) {
-          unlinkSync(path7.join(binDir, f));
+          unlinkSync2(path7.join(binDir, f));
         }
       }
     } catch {
@@ -1645,6 +1652,20 @@ async function main() {
   log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
   const heartbeat = setInterval(() => void syncLeadership(), HEARTBEAT_MS);
   heartbeat.unref?.();
+  let releasing = false;
+  const releaseAndExit = () => {
+    if (releasing) return;
+    releasing = true;
+    if (amLeader) {
+      releaseLeadership(config.dataDir);
+      log(config.dataDir, `[server] released leadership on exit (pid ${process.pid})`);
+    }
+    process.exit(0);
+  };
+  process.on("SIGTERM", releaseAndExit);
+  process.on("SIGINT", releaseAndExit);
+  process.stdin.on("end", releaseAndExit);
+  process.stdin.on("close", releaseAndExit);
   if (store.vectorEnabled && config.embed.enabled) {
     const tick = () => {
       if (amLeader) void backfill(store, config);

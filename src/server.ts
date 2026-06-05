@@ -18,7 +18,7 @@ import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
 import { MemoryStore, type MemoryDoc } from './store.js';
 import { embed, embedReady } from './embeddings.js';
 import { digestSession, claudeAvailable } from './digest.js';
-import { refreshLeadership, readLock } from './leader.js';
+import { refreshLeadership, readLock, releaseLeadership } from './leader.js';
 import { startEmbedServer, remoteEmbed } from './embed-service.js';
 import { randomBytes } from 'node:crypto';
 import { nowIso, uniq } from './memory.js';
@@ -338,6 +338,24 @@ async function main(): Promise<void> {
   log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
   const heartbeat = setInterval(() => void syncLeadership(), HEARTBEAT_MS);
   heartbeat.unref?.();
+
+  // Release leadership the instant this session closes so a sibling takes over on its next heartbeat
+  // (~30 s) instead of waiting out the stale timeout. Claude Code closing the window ends our stdin
+  // pipe (Windows) or sends a signal (POSIX); both paths clean up. A hard kill falls back to STALE_MS.
+  let releasing = false;
+  const releaseAndExit = () => {
+    if (releasing) return;
+    releasing = true;
+    if (amLeader) {
+      releaseLeadership(config.dataDir);
+      log(config.dataDir, `[server] released leadership on exit (pid ${process.pid})`);
+    }
+    process.exit(0);
+  };
+  process.on('SIGTERM', releaseAndExit);
+  process.on('SIGINT', releaseAndExit);
+  process.stdin.on('end', releaseAndExit);
+  process.stdin.on('close', releaseAndExit);
 
   // Background vectorization (leader-only, non-blocking): at startup then periodically.
   if (store.vectorEnabled && config.embed.enabled) {

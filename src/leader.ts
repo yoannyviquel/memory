@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 
 /**
@@ -12,8 +12,9 @@ import path from 'node:path';
  * considered free if its `ts` is stale or its `pid` is dead. No daemon, no socket — just a file.
  */
 
-// Stale threshold ≫ the heartbeat interval so a busy (but alive) leader is never usurped.
-const STALE_MS = 150_000;
+// Stale threshold ≫ the heartbeat interval so a busy (but alive) leader is never usurped, but low
+// enough that a HARD-killed leader (no clean release) is taken over reasonably fast.
+const STALE_MS = 90_000;
 
 function lockPath(dataDir: string): string {
   return path.join(dataDir, 'worker.lock');
@@ -48,6 +49,20 @@ export function readLock(dataDir: string): LockInfo | null {
     return JSON.parse(readFileSync(lockPath(dataDir), 'utf8'));
   } catch {
     return null;
+  }
+}
+
+/**
+ * Releases leadership IF this process currently holds the lock (pid match). Called on exit/session
+ * close so a sibling can take over immediately on its next heartbeat — no waiting for the stale
+ * timeout or an unreliable Windows pid-liveness probe. No-op if we're not the lock holder.
+ */
+export function releaseLeadership(dataDir: string): void {
+  try {
+    const cur = readLock(dataDir);
+    if (cur && cur.pid === process.pid) unlinkSync(lockPath(dataDir));
+  } catch {
+    /* best-effort */
   }
 }
 
