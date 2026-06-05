@@ -8,9 +8,10 @@ var DEFAULT_DIGEST_MODEL = "haiku";
 var DIGEST_VERSION = 1;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
-  light: { model: "Xenova/multilingual-e5-small", dim: 384 },
-  medium: { model: "Xenova/multilingual-e5-base", dim: 768 },
-  heavy: { model: "Xenova/multilingual-e5-large", dim: 1024 }
+  light: { model: "Xenova/multilingual-e5-small", dim: 384, pooling: "mean" },
+  medium: { model: "Xenova/multilingual-e5-base", dim: 768, pooling: "mean" },
+  heavy: { model: "Xenova/multilingual-e5-large", dim: 1024, pooling: "mean" },
+  ultra: { model: "Xenova/bge-m3", dim: 1024, pooling: "cls" }
 };
 var DEFAULT_TIER = "light";
 function readConfigFile(dataDir) {
@@ -42,10 +43,11 @@ function loadConfig() {
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
   const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
   const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
+  const pooling = (get("MEMORY_EMBED_POOLING", "embedPooling") || picked.pooling || "mean").toLowerCase();
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
-  const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75, ultra: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
@@ -54,7 +56,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION }
   };
 }

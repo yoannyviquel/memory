@@ -9,6 +9,8 @@ export interface EmbedConfig {
   cacheDir: string;
   /** ONNX precision: 'q8' (quantized, default, ~4× lighter) or 'fp32' (full precision). */
   dtype: string;
+  /** Pooling strategy: 'mean' (e5 family) or 'cls' (bge family). Must match the model. */
+  pooling: string;
   /** ONNX intra-op thread cap. Backfill embeds one doc at a time, so this alone bounds CPU. */
   threads: number;
   /** Data root (logs + status.json), to log the model loading. */
@@ -151,7 +153,8 @@ export async function embedBatch(
   const pipe = await getPipe(cfg);
   if (!pipe) return texts.map(() => null);
   try {
-    const out = await pipe(texts, { pooling: 'mean', normalize: true });
+    const pooling = cfg.pooling === 'cls' ? 'cls' : 'mean';
+    const out = await pipe(texts, { pooling, normalize: true });
     const arr: number[][] = out.tolist();
     return texts.map((_, i) => (Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null));
   } catch {

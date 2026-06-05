@@ -36,11 +36,15 @@ const DEFAULT_DIGEST_MODEL = 'haiku';
 export const DIGEST_VERSION = 1;
 export const EMBED_TEXT_VERSION = 1;
 
-/** Multilingual embedding tiers (e5 family). Each tier sets a consistent model + dimension. */
-export const EMBED_TIERS: Record<string, { model: string; dim: number }> = {
-  light: { model: 'Xenova/multilingual-e5-small', dim: 384 },
-  medium: { model: 'Xenova/multilingual-e5-base', dim: 768 },
-  heavy: { model: 'Xenova/multilingual-e5-large', dim: 1024 },
+/**
+ * Multilingual embedding tiers. Each sets a model + dimension + pooling. light/medium/heavy are the
+ * e5 family (mean pooling); ultra is bge-m3 (XLM-R based, CLS pooling) — the strongest local option.
+ */
+export const EMBED_TIERS: Record<string, { model: string; dim: number; pooling: string }> = {
+  light: { model: 'Xenova/multilingual-e5-small', dim: 384, pooling: 'mean' },
+  medium: { model: 'Xenova/multilingual-e5-base', dim: 768, pooling: 'mean' },
+  heavy: { model: 'Xenova/multilingual-e5-large', dim: 1024, pooling: 'mean' },
+  ultra: { model: 'Xenova/bge-m3', dim: 1024, pooling: 'cls' },
 };
 const DEFAULT_TIER = 'light';
 
@@ -89,15 +93,18 @@ export function loadConfig(): MemoryConfig {
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
   const model = get('MEMORY_EMBED_MODEL', 'embedModel') || picked.model;
   const dim = Number(get('MEMORY_EMBED_DIM', 'embedDim')) || picked.dim;
+  // Pooling must match the model (e5 = mean, bge = cls). Follows the tier; overridable if a custom
+  // model is forced via MEMORY_EMBED_MODEL.
+  const pooling = (get('MEMORY_EMBED_POOLING', 'embedPooling') || picked.pooling || 'mean').toLowerCase();
   const enabled = get('MEMORY_EMBED_ENABLED', 'embedEnabled') !== '0';
   const cacheDir = get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
   // Quantized by default: ~4× lighter to download, negligible quality loss in retrieval.
   const dtype = (get('MEMORY_EMBED_DTYPE', 'embedDtype') || 'q8').toLowerCase();
   // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
   // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
-  // medium=50%, heavy=75% of the cores. Floor of 1 so single/dual-core hosts still run.
+  // medium=50%, heavy=75%, ultra=100% of the cores. Floor of 1 so single/dual-core hosts still run.
   // Single source of truth: the tier (no separate override knob).
-  const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75, ultra: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
@@ -110,7 +117,7 @@ export function loadConfig(): MemoryConfig {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
   };
 }
