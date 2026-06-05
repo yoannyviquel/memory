@@ -738,7 +738,7 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.6" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.7" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -779,7 +779,7 @@ async function backfill(store, cfg) {
     });
   }
 }
-var PROCESS_NAME = "yoannyviquel-memory";
+var PROCESS_NAME = "claude-code_yoannyviquel_memory";
 function ensureNamedBinary() {
   if (process.platform !== "win32") return;
   try {

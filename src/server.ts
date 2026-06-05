@@ -65,22 +65,22 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
 }
 
 /**
- * Renames the process so monitoring tools show "yoannyviquel-memory" instead of "node".
+ * Renames the process so monitoring tools show "claude-code_yoannyviquel_memory" instead of "node".
  * On Linux/macOS process.title rewrites the cmdline (ps; top/htop/comm cap at 15 chars).
  * Windows Task Manager and macOS Activity Monitor read the *executable name* instead, so
  * those need the server to run from a renamed node copy — see ensureNamedBinary().
  */
-const PROCESS_NAME = 'yoannyviquel-memory';
+const PROCESS_NAME = 'claude-code_yoannyviquel_memory';
 
 /**
- * Windows: make the server run under a "yoannyviquel-memory.exe" image name instead of "node.exe".
+ * Windows: make the server run under a "claude-code_yoannyviquel_memory.exe" image name instead of "node.exe".
  *
  * This is done at server startup (not in postinstall) on purpose: Claude Code installs plugin deps
  * with `npm install --ignore-scripts`, so postinstall never runs at install — but the MCP server is
  * always launched, which makes startup the only reliable hook.
  *
  * The current process can't rename itself, so we self-heal for the NEXT launch: copy the running
- * node binary to <pluginRoot>/bin/yoannyviquel-memory.exe and repoint .mcp.json#command at it. After
+ * node binary to <pluginRoot>/bin/claude-code_yoannyviquel_memory.exe and repoint .mcp.json#command at it. After
  * the standard post-install `/reload-plugins`, the server relaunches from the renamed copy. Entirely
  * best-effort and cosmetic: the committed command stays "node", so a failure here never blocks start.
  */
