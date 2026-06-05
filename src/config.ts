@@ -12,11 +12,19 @@ export interface MemoryConfig {
 }
 
 export interface DigestConfig {
-  /** Master switch for LLM session digests (claude -p --bare). */
+  /** Master switch for LLM session digests (claude -p). */
   enabled: boolean;
+  /** Model used for digests. Defaults to Haiku — cheap on quota, plenty for summarization. */
+  model: string;
   /** Bump to re-generate every existing digest (selector treats older versions as stale). */
   version: number;
 }
+
+/**
+ * Digest model: the `haiku` alias (not a pinned version) so the CLI resolves whatever the current
+ * Haiku is — future-proof. Background summarization shouldn't compete with interactive Opus.
+ */
+const DEFAULT_DIGEST_MODEL = 'haiku';
 
 /**
  * Version markers persisted in the `meta` table to drive reprocessing without a manual migration:
@@ -93,14 +101,16 @@ export function loadConfig(): MemoryConfig {
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
-  // LLM session digests (claude -p --bare, user's default model). On by default; opt out via env/file.
+  // LLM session digests (claude -p). On by default; opt out via env/file. Haiku by default so the
+  // background loop doesn't compete with interactive Opus or burn the Max quota; overridable.
   const digestEnabled = get('MEMORY_DIGEST_ENABLED', 'digestEnabled') !== '0';
+  const digestModel = get('MEMORY_DIGEST_MODEL', 'digestModel') || DEFAULT_DIGEST_MODEL;
 
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
-    digest: { enabled: digestEnabled, version: DIGEST_VERSION },
+    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
   };
 }

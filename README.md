@@ -103,7 +103,7 @@ searchable via BM25 in the meantime. Advanced override: env `MEMORY_EMBED_MODEL`
   - `SessionEnd` → indexes a session summary.
 - **LLM digests** (background, opt-out): the MCP server compresses each finished session into a
   `digest` (1–3 sentence conclusion) + typed `insight` docs (`decision` / `bugfix` / `discovery` /
-  `conclusion`) via `claude -p` with your **default model and existing auth** (no API key). These
+  `conclusion`) via `claude -p` using **Haiku by default** and your **existing auth** (no API key). These
   high-signal docs are what `SessionStart` injects and what ranks best in search. Raw turns stay as
   the recall safety net. Disable with `MEMORY_DIGEST_ENABLED=0`.
 - **Search** via MCP: `memory_search` (hybrid), `memory_recent`, `memory_stats`.
@@ -112,13 +112,14 @@ searchable via BM25 in the meantime. Advanced override: env `MEMORY_EMBED_MODEL`
 
 ### LLM digests — cost & isolation
 
-- **Model & cost**: your Claude Code **default** model (no `--model` forced). It reuses your existing
-  Claude Code auth, so on a **Claude Max/Pro subscription this is no extra money** — it consumes your
-  **plan usage quota** (the 5-hour / weekly limits), in competition with your interactive coding. The
-  `total_cost_usd` shown in logs is a notional API-equivalent, not a charge. ⚠️ If your default model
-  is Opus, digests eat that quota fast — especially the first run, which digests all past sessions
-  (drip-limited to spread it). Set `MEMORY_DIGEST_ENABLED=0` to turn digests off, or switch your
-  default model to something cheaper.
+- **Model & cost**: **Haiku by default** (the `haiku` alias → the CLI resolves the current Haiku
+  version, so it's future-proof). Override with `MEMORY_DIGEST_MODEL` (env) / `digestModel` (file) —
+  e.g. `sonnet`, `opus`, or a pinned id. It reuses your existing Claude Code auth, so on a **Claude
+  Max/Pro subscription this is no extra money** — it consumes your **plan usage quota** (5-hour /
+  weekly limits), in competition with your interactive coding. `total_cost_usd` in logs is a notional
+  API-equivalent, not a charge. Haiku keeps that quota cost low; the background loop won't compete
+  with your interactive Opus. The first run digests all past sessions (drip-limited to spread it).
+  Set `MEMORY_DIGEST_ENABLED=0` to turn digests off.
 - **Isolation**: the digest runs `claude -p --setting-sources "" --strict-mcp-config
   --disable-slash-commands` so **no hooks, plugins, skills or MCP servers load** in that child — it
   can't re-trigger this plugin's own hooks. (`--bare` is *not* used: it would skip keychain reads and
@@ -159,7 +160,7 @@ Restart Claude Code (or `/reload-plugins`) to activate hooks + MCP server.
 
 Two mechanisms, **env takes precedence over the file**:
 - File `~/.claude-memory/config.json`, e.g. `{ "embedTier": "medium" }` (keys: `embedTier`,
-  `embedEnabled`, `digestEnabled`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
+  `embedEnabled`, `digestEnabled`, `digestModel`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
 - System environment variables (overrides):
 
 | Variable | Default | Role |
@@ -170,6 +171,7 @@ Two mechanisms, **env takes precedence over the file**:
 | `MEMORY_CONTEXT_LIMIT` | `10` | Memories injected at `SessionStart` |
 | `MEMORY_EMBED_ENABLED` | _(enabled)_ | `0` to disable semantic search (BM25 only) |
 | `MEMORY_DIGEST_ENABLED` | _(enabled)_ | `0` to disable LLM session digests (`claude -p`) |
+| `MEMORY_DIGEST_MODEL` | `haiku` | Model for digests (`haiku` / `sonnet` / `opus` / pinned id) |
 | `MEMORY_EMBED_MODEL` | _(per tier)_ | Force a specific model (overrides the tier) |
 | `MEMORY_EMBED_DIM` | _(per tier)_ | Force the dimension (must match the model) |
 | `MEMORY_EMBED_DTYPE` | `q8` | ONNX precision: `q8` (quantized) or `fp32` (full precision) |

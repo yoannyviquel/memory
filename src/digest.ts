@@ -22,6 +22,8 @@ export interface DigestInput {
   session_id: string;
   project?: string;
   branch?: string;
+  /** Model id for the digest call (e.g. Haiku). Omitted → CLI default model. */
+  model?: string;
   turns: Array<{
     user_prompt?: string;
     assistant_text?: string;
@@ -132,7 +134,7 @@ export function claudeAvailable(): boolean {
 }
 
 /**
- * Runs `claude -p` headless with the user's DEFAULT model (no --model). Isolation without --bare
+ * Runs `claude -p` headless with the digest model (Haiku by default, via --model). Isolation without --bare
  * (which would skip keychain reads → "Not logged in"): `--setting-sources ""` drops user/project/
  * local settings, so hooks AND plugins don't load (no re-entrance with our own hooks; the user's
  * plugin MCP servers stay down). `--strict-mcp-config` blocks any .mcp.json; `--disable-slash-commands`
@@ -140,7 +142,7 @@ export function claudeAvailable(): boolean {
  * without a shell (native exe) so the empty-string arg survives. Prompt via stdin. Returns the JSON
  * envelope, or null. Verified flags for CLI v2.1.x (no --max-turns in this version).
  */
-function runClaude(prompt: string): Promise<any | null> {
+function runClaude(prompt: string, model?: string): Promise<any | null> {
   return new Promise((resolve) => {
     const exe = resolveClaudeExe();
     if (!exe) {
@@ -156,6 +158,7 @@ function runClaude(prompt: string): Promise<any | null> {
       '--output-format',
       'json',
     ];
+    if (model) args.push('--model', model);
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(exe, args, {
@@ -209,7 +212,7 @@ function runClaude(prompt: string): Promise<any | null> {
 /** Compresses a session into a conclusion + typed insights. Best-effort: null on any failure. */
 export async function digestSession(input: DigestInput): Promise<DigestResult | null> {
   if (input.turns.length === 0) return null;
-  const envelope = await runClaude(buildPrompt(input));
+  const envelope = await runClaude(buildPrompt(input), input.model);
   if (!envelope || typeof envelope.result !== 'string') return null;
 
   const parsed = extractJsonObject(envelope.result);

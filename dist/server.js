@@ -22,6 +22,7 @@ import path6 from "path";
 import os from "os";
 import path from "path";
 import { readFileSync } from "fs";
+var DEFAULT_DIGEST_MODEL = "haiku";
 var DIGEST_VERSION = 1;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
@@ -66,12 +67,13 @@ function loadConfig() {
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
+  const digestModel = get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
-    digest: { enabled: digestEnabled, version: DIGEST_VERSION }
+    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION }
   };
 }
 
@@ -848,7 +850,7 @@ function resolveClaudeExe() {
 function claudeAvailable() {
   return resolveClaudeExe() !== null;
 }
-function runClaude(prompt) {
+function runClaude(prompt, model) {
   return new Promise((resolve) => {
     const exe = resolveClaudeExe();
     if (!exe) {
@@ -864,6 +866,7 @@ function runClaude(prompt) {
       "--output-format",
       "json"
     ];
+    if (model) args.push("--model", model);
     let child;
     try {
       child = spawn(exe, args, {
@@ -914,7 +917,7 @@ function runClaude(prompt) {
 }
 async function digestSession(input) {
   if (input.turns.length === 0) return null;
-  const envelope = await runClaude(buildPrompt(input));
+  const envelope = await runClaude(buildPrompt(input), input.model);
   if (!envelope || typeof envelope.result !== "string") return null;
   const parsed = extractJsonObject(envelope.result);
   const conclusion = parsed && typeof parsed.conclusion === "string" && parsed.conclusion.trim() || envelope.result.trim().slice(0, 1e3);
@@ -1081,7 +1084,7 @@ var reindexTools = [memoryReindex];
 var allTools = [...searchTools, ...reindexTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.2.1" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.2.2" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -1140,6 +1143,7 @@ async function digestPending(store, cfg) {
         session_id: sess.session_id,
         project: sess.project,
         branch: sess.branch,
+        model: cfg.digest.model,
         turns
       });
       if (!result) continue;

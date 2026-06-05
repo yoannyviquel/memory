@@ -9,6 +9,7 @@ import { existsSync as existsSync3 } from "fs";
 import os from "os";
 import path from "path";
 import { readFileSync } from "fs";
+var DEFAULT_DIGEST_MODEL = "haiku";
 var DIGEST_VERSION = 1;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
@@ -53,12 +54,13 @@ function loadConfig() {
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
+  const digestModel = get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
-    digest: { enabled: digestEnabled, version: DIGEST_VERSION }
+    digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION }
   };
 }
 

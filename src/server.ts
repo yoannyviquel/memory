@@ -102,6 +102,7 @@ async function digestPending(store: MemoryStore, cfg: MemoryConfig): Promise<voi
         session_id: sess.session_id,
         project: sess.project,
         branch: sess.branch,
+        model: cfg.digest.model,
         turns,
       });
       if (!result) continue;
