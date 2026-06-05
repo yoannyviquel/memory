@@ -586,7 +586,12 @@ async function getPipe(cfg) {
         } catch {
         }
       };
-      const session_options = { intraOpNumThreads: threads, interOpNumThreads: threads };
+      const session_options = {
+        intraOpNumThreads: threads,
+        interOpNumThreads: 1,
+        executionMode: "sequential",
+        graphOptimizationLevel: "all"
+      };
       let pipe;
       try {
         pipe = await tf.pipeline("feature-extraction", cfg.model, {
@@ -745,7 +750,7 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.11" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.12" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;

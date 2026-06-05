@@ -40,8 +40,9 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
       const tf: any = await import(mod);
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
-      // Cap ONNX threads so a backfill batch doesn't peg every core. Both backends covered:
-      // onnxruntime-node reads `onnx.numThreads`; wasm reads `onnx.wasm.numThreads`.
+      // Tier-derived thread budget: each embedding may use up to this many cores, no more.
+      // Both backends covered: onnxruntime-node reads `onnx.numThreads`; wasm reads
+      // `onnx.wasm.numThreads`. The per-session session_options below enforce the same budget.
       const threads = Math.max(1, cfg.threads || 1);
       try {
         tf.env.backends.onnx.numThreads = threads;
@@ -77,8 +78,19 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
         }
       };
 
-      // session_options: onnxruntime-node honors intra/inter-op thread counts per session.
-      const session_options = { intraOpNumThreads: threads, interOpNumThreads: threads };
+      // Maximize a single sequential embedding across its allowed threads:
+      //  - intraOpNumThreads = threads → fans the heavy matmuls of ONE inference over every
+      //    allowed core (this is the lever that makes embed exploit the full cap).
+      //  - interOpNumThreads = 1 + executionMode sequential → no second pool; a transformer
+      //    encoder is a serial layer stack, so inter-op parallelism adds nothing and would only
+      //    risk spinning threads beyond the cap.
+      //  - graphOptimizationLevel 'all' → fused kernels run faster on the same threads.
+      const session_options = {
+        intraOpNumThreads: threads,
+        interOpNumThreads: 1,
+        executionMode: 'sequential',
+        graphOptimizationLevel: 'all',
+      };
       let pipe: any;
       try {
         pipe = await tf.pipeline('feature-extraction', cfg.model, {

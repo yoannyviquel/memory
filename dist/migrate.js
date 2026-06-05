@@ -576,7 +576,12 @@ async function getPipe(cfg) {
         } catch {
         }
       };
-      const session_options = { intraOpNumThreads: threads, interOpNumThreads: threads };
+      const session_options = {
+        intraOpNumThreads: threads,
+        interOpNumThreads: 1,
+        executionMode: "sequential",
+        graphOptimizationLevel: "all"
+      };
       let pipe;
       try {
         pipe = await tf.pipeline("feature-extraction", cfg.model, {
