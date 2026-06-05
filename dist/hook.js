@@ -4,6 +4,8 @@
 import os from "os";
 import path from "path";
 import { readFileSync } from "fs";
+var DIGEST_VERSION = 1;
+var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384 },
   medium: { model: "Xenova/multilingual-e5-base", dim: 768 },
@@ -45,11 +47,13 @@ function loadConfig() {
   const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
+  const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
   return {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir }
+    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
+    digest: { enabled: digestEnabled, version: DIGEST_VERSION }
   };
 }
 
@@ -58,6 +62,8 @@ import { mkdirSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import path2 from "path";
+var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight"];
+var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
 var HERE = path2.dirname(fileURLToPath(import.meta.url));
 var COLS = [
   "mem_id",
@@ -157,14 +163,16 @@ function toBlob(arr) {
   return new Uint8Array(Float32Array.from(arr).buffer);
 }
 var MemoryStore = class {
-  constructor(dbPath, dim = 384, model = "") {
+  constructor(dbPath, dim = 384, model = "", embedTextVersion = 0) {
     this.dbPath = dbPath;
     this.dim = dim;
     this.model = model;
+    this.embedTextVersion = embedTextVersion;
   }
   dbPath;
   dim;
   model;
+  embedTextVersion;
   db;
   _vectorEnabled = false;
   get path() {
@@ -239,13 +247,16 @@ var MemoryStore = class {
         this.db.loadExtension(ext);
         const prevModel = this.metaGet("embed_model");
         const prevDim = this.metaGet("embed_dim");
-        const changed = this.model !== "" && (prevModel !== this.model || prevDim !== null && Number(prevDim) !== this.dim);
-        if (changed) this.db.exec("DROP TABLE IF EXISTS vec_memories;");
+        const prevTextV = this.metaGet("embed_text_version");
+        const modelChanged = this.model !== "" && (prevModel !== this.model || prevDim !== null && Number(prevDim) !== this.dim);
+        const textChanged = this.embedTextVersion > 0 && prevTextV !== null && Number(prevTextV) !== this.embedTextVersion;
+        if (modelChanged || textChanged) this.db.exec("DROP TABLE IF EXISTS vec_memories;");
         this.db.exec(
           `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`
         );
         this.metaSet("embed_model", this.model);
         this.metaSet("embed_dim", String(this.dim));
+        this.metaSet("embed_text_version", String(this.embedTextVersion));
         this._vectorEnabled = true;
       } catch {
         this._vectorEnabled = false;
@@ -328,7 +339,7 @@ var MemoryStore = class {
     const rows = this.db.prepare(
       `SELECT rowid, summary, user_prompt, assistant_text, prompts_text
          FROM memories
-         WHERE type IN ('prompt','turn','session')
+         WHERE type IN (${VECTORIZABLE_SQL})
            AND rowid NOT IN (SELECT rowid FROM vec_memories)
          ORDER BY ts_epoch DESC LIMIT ?;`
     ).all(limit);
@@ -344,7 +355,7 @@ var MemoryStore = class {
       return Number(
         this.db.prepare(
           `SELECT COUNT(*) c FROM memories
-               WHERE type IN ('prompt','turn','session')
+               WHERE type IN (${VECTORIZABLE_SQL})
                  AND rowid NOT IN (SELECT rowid FROM vec_memories);`
         ).get().c
       );
@@ -475,6 +486,99 @@ var MemoryStore = class {
       }
     }
     return { dbPath: this.dbPath, total, byType, byProject, vectorEnabled: this._vectorEnabled, vectorCount };
+  }
+  // ---- Digests (LLM session compression) -------------------------------------------------
+  /** Turns of a session, in order — the raw material fed to the digest LLM. */
+  turnsForSession(session_id) {
+    const rows = this.db.prepare(
+      `SELECT user_prompt, assistant_text, tools, files_modified
+         FROM memories WHERE type='turn' AND session_id = ?
+         ORDER BY prompt_number ASC, ts_epoch ASC;`
+    ).all(session_id);
+    return rows.map((r) => ({
+      user_prompt: r.user_prompt ?? void 0,
+      assistant_text: r.assistant_text ?? void 0,
+      tools: jsonArr(r.tools),
+      files_modified: jsonArr(r.files_modified)
+    }));
+  }
+  /**
+   * Sessions that have a `session` rollup but no digest at the current version.
+   * A digest stores its version in `source`, so bumping DIGEST_VERSION re-selects every session.
+   */
+  sessionsNeedingDigest(version, limit = 5) {
+    const rows = this.db.prepare(
+      `SELECT m.session_id, m.project, m.branch FROM memories m
+         WHERE m.type='session' AND m.session_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM memories d
+             WHERE d.type='digest' AND d.session_id = m.session_id AND d.source = ?
+           )
+         ORDER BY m.ts_epoch DESC LIMIT ?;`
+    ).all(String(version), limit);
+    return rows.map((r) => ({
+      session_id: r.session_id,
+      project: r.project ?? void 0,
+      branch: r.branch ?? void 0
+    }));
+  }
+  /** Count of sessions still awaiting a digest at the given version (for status/progress). */
+  countSessionsNeedingDigest(version) {
+    try {
+      return Number(
+        this.db.prepare(
+          `SELECT COUNT(*) c FROM memories m
+               WHERE m.type='session' AND m.session_id IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM memories d
+                   WHERE d.type='digest' AND d.session_id = m.session_id AND d.source = ?
+                 );`
+        ).get(String(version)).c
+      );
+    } catch {
+      return 0;
+    }
+  }
+  /** Replaces a session's digest + insight docs (idempotent). Vectors are filled by the backfill. */
+  writeDigest(session_id, digest, insights) {
+    this.deleteSessionDigest(session_id);
+    this.upsert(`${session_id}:digest`, digest);
+    insights.forEach((d, i) => this.upsert(`${session_id}:insight:${i}`, d));
+  }
+  /** Deletes a session's digest + insights and their vectors. */
+  deleteSessionDigest(session_id) {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE session_id = ? AND type IN ('digest','insight');`).all(session_id).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    this.db.prepare(`DELETE FROM memories WHERE session_id = ? AND type IN ('digest','insight');`).run(session_id);
+  }
+  /** Deletes every digest + insight doc (and their vectors). Used by /memory:reindex. */
+  clearDigests() {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE type IN ('digest','insight');`).all().map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE type IN ('digest','insight');`).run();
+    return Number(info?.changes ?? rids.length);
+  }
+  /** Empties the vector index so the backfill refills it from scratch. Used by /memory:reindex. */
+  resetVectors() {
+    if (!this._vectorEnabled) return;
+    try {
+      this.db.exec("DROP TABLE IF EXISTS vec_memories;");
+      this.db.exec(
+        `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`
+      );
+    } catch {
+    }
+  }
+  /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
+  deleteVectors(rowids) {
+    if (!this._vectorEnabled || rowids.length === 0) return;
+    const stmt = this.db.prepare("DELETE FROM vec_memories WHERE rowid = ?");
+    for (const rid of rowids) {
+      try {
+        stmt.run(BigInt(rid));
+      } catch {
+      }
+    }
   }
   close() {
     try {
@@ -693,7 +797,8 @@ function baseFields(payload, state) {
 }
 function handleSessionStart(cfg, store, payload) {
   const project = projectFromCwd(payload.cwd);
-  const recent = store.recent({ project, limit: cfg.contextLimit });
+  const digests = store.recent({ project, type: "digest", limit: cfg.contextLimit });
+  const recent = digests.length > 0 ? digests : store.recent({ project, limit: cfg.contextLimit });
   const total = store.stats().total;
   const header = `\u{1F9E0} mem active \u2014 db: ${cfg.dbPath} \xB7 model: ${cfg.embed.model} \xB7 ${total} docs \xB7 vectors: ${store.vectorEnabled ? "on" : "off"}`;
   if (recent.length === 0) {
@@ -818,6 +923,10 @@ function handleSessionEnd(cfg, store, payload) {
 async function main() {
   const mode = process.argv[2];
   let output = CONTINUE;
+  if (process.env.MEMORY_HOOK_DISABLE === "1") {
+    process.stdout.write(output);
+    process.exit(0);
+  }
   let store;
   try {
     const cfg = loadConfig();
@@ -830,7 +939,7 @@ async function main() {
         payload = {};
       }
     }
-    store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model);
+    store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model, EMBED_TEXT_VERSION);
     await store.init();
     switch (mode) {
       case "sessionstart":

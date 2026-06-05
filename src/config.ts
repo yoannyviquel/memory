@@ -8,7 +8,25 @@ export interface MemoryConfig {
   dataDir: string;
   contextLimit: number;
   embed: EmbedConfig;
+  digest: DigestConfig;
 }
+
+export interface DigestConfig {
+  /** Master switch for LLM session digests (claude -p --bare). */
+  enabled: boolean;
+  /** Bump to re-generate every existing digest (selector treats older versions as stale). */
+  version: number;
+}
+
+/**
+ * Version markers persisted in the `meta` table to drive reprocessing without a manual migration:
+ *  - DIGEST_VERSION: bump when the digest prompt/output format changes → sessions whose digest
+ *    carries an older version are re-digested by the background loop.
+ *  - EMBED_TEXT_VERSION: bump when the text we feed the embedder changes (e.g. we start embedding
+ *    digests) → init() clears the vector index so the backfill refills it with the new text.
+ */
+export const DIGEST_VERSION = 1;
+export const EMBED_TEXT_VERSION = 1;
 
 /** Multilingual embedding tiers (e5 family). Each tier sets a consistent model + dimension. */
 export const EMBED_TIERS: Record<string, { model: string; dim: number }> = {
@@ -75,10 +93,14 @@ export function loadConfig(): MemoryConfig {
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
+  // LLM session digests (claude -p --bare, user's default model). On by default; opt out via env/file.
+  const digestEnabled = get('MEMORY_DIGEST_ENABLED', 'digestEnabled') !== '0';
+
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
+    digest: { enabled: digestEnabled, version: DIGEST_VERSION },
   };
 }

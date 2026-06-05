@@ -2,7 +2,7 @@ import type { ToolDefinition } from './types.js';
 import type { MemoryDoc, MemoryType } from '../store.js';
 import { embed, embedReady } from '../embeddings.js';
 
-const TYPES = ['observation', 'prompt', 'turn', 'session'];
+const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
 
 function fmtDoc(d: MemoryDoc): string {
   const date = (d.ts ?? d.ended_at ?? '').slice(0, 16).replace('T', ' ');

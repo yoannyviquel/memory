@@ -1,4 +1,4 @@
-import { loadConfig, type MemoryConfig } from './config.js';
+import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
 import { MemoryStore, type MemoryDoc } from './store.js';
 import { loadState, saveState, clearState, type SessionState } from './state.js';
 import { readNewTurn } from './transcript.js';
@@ -53,7 +53,10 @@ function baseFields(payload: HookPayload, state: SessionState): Partial<MemoryDo
 
 function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): string {
   const project = projectFromCwd(payload.cwd);
-  const recent = store.recent({ project, limit: cfg.contextLimit });
+  // Prefer LLM digests (conclusions/decisions = high signal); fall back to raw memories if none yet.
+  const digests = store.recent({ project, type: 'digest', limit: cfg.contextLimit });
+  const recent =
+    digests.length > 0 ? digests : store.recent({ project, limit: cfg.contextLimit });
 
   // Presence header: reminds that the plugin is active and uses a little resource
   // (background indexing). stdio transport → no URL/port to expose.
@@ -199,6 +202,12 @@ function handleSessionEnd(cfg: MemoryConfig, store: MemoryStore, payload: HookPa
 async function main(): Promise<void> {
   const mode = process.argv[2];
   let output = CONTINUE;
+  // Re-entrance guard: the digest loop spawns `claude -p` with MEMORY_HOOK_DISABLE=1. That child
+  // session must NOT be captured (it would create a session that itself needs digesting → loop).
+  if (process.env.MEMORY_HOOK_DISABLE === '1') {
+    process.stdout.write(output);
+    process.exit(0);
+  }
   let store: MemoryStore | undefined;
   try {
     const cfg = loadConfig();
@@ -211,7 +220,7 @@ async function main(): Promise<void> {
         payload = {};
       }
     }
-    store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model);
+    store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model, EMBED_TEXT_VERSION);
     await store.init();
 
     switch (mode) {

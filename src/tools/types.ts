@@ -1,5 +1,6 @@
 import type { MemoryStore } from '../store.js';
 import type { EmbedConfig } from '../embeddings.js';
+import type { MemoryConfig } from '../config.js';
 
 export interface ToolInputSchema {
   type: 'object';
@@ -11,6 +12,7 @@ export interface ToolInputSchema {
 export interface ToolContext {
   store: MemoryStore;
   embedCfg: EmbedConfig;
+  config: MemoryConfig;
 }
 
 export interface ToolDefinition<TArgs = Record<string, unknown>> {

@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { loadConfig } from './config.js';
+import { loadConfig, EMBED_TEXT_VERSION } from './config.js';
 import { MemoryStore, type BulkItem, type MemoryDoc } from './store.js';
 import { embedBatch, embedText, embedReady, type EmbedConfig } from './embeddings.js';
 
@@ -200,7 +200,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model);
+  const store = new MemoryStore(cfg.dbPath, cfg.embed.dim, cfg.embed.model, EMBED_TEXT_VERSION);
   await store.init();
   if (args.embed && !store.vectorEnabled) {
     console.error('⚠️ --embed requested but vector index unavailable (sqlite-vec) → importing without vectors.');

@@ -31,7 +31,7 @@ export function log(dataDir: string, msg: string): void {
   }
 }
 
-export type MemState = 'idle' | 'loading' | 'downloading' | 'backfilling';
+export type MemState = 'idle' | 'loading' | 'downloading' | 'backfilling' | 'digesting';
 
 export interface MemStatus {
   state: MemState;
@@ -41,6 +41,8 @@ export interface MemStatus {
   file?: string;
   vectorized?: number;
   missing?: number;
+  /** sessions still awaiting an LLM digest (digesting state). */
+  digestPending?: number;
   updatedAt: string;
 }
 

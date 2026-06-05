@@ -8,20 +8,22 @@ import {
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import {
-  existsSync as existsSync3,
+  existsSync as existsSync4,
   copyFileSync,
   mkdirSync as mkdirSync3,
-  readFileSync as readFileSync3,
+  readFileSync as readFileSync4,
   writeFileSync as writeFileSync2,
   readdirSync,
   unlinkSync
 } from "fs";
-import path4 from "path";
+import path6 from "path";
 
 // src/config.ts
 import os from "os";
 import path from "path";
 import { readFileSync } from "fs";
+var DIGEST_VERSION = 1;
+var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384 },
   medium: { model: "Xenova/multilingual-e5-base", dim: 768 },
@@ -63,11 +65,13 @@ function loadConfig() {
   const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
+  const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
   return {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir }
+    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
+    digest: { enabled: digestEnabled, version: DIGEST_VERSION }
   };
 }
 
@@ -76,6 +80,8 @@ import { mkdirSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import path2 from "path";
+var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight"];
+var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
 var HERE = path2.dirname(fileURLToPath(import.meta.url));
 var COLS = [
   "mem_id",
@@ -175,14 +181,16 @@ function toBlob(arr) {
   return new Uint8Array(Float32Array.from(arr).buffer);
 }
 var MemoryStore = class {
-  constructor(dbPath, dim = 384, model = "") {
+  constructor(dbPath, dim = 384, model = "", embedTextVersion = 0) {
     this.dbPath = dbPath;
     this.dim = dim;
     this.model = model;
+    this.embedTextVersion = embedTextVersion;
   }
   dbPath;
   dim;
   model;
+  embedTextVersion;
   db;
   _vectorEnabled = false;
   get path() {
@@ -257,13 +265,16 @@ var MemoryStore = class {
         this.db.loadExtension(ext);
         const prevModel = this.metaGet("embed_model");
         const prevDim = this.metaGet("embed_dim");
-        const changed = this.model !== "" && (prevModel !== this.model || prevDim !== null && Number(prevDim) !== this.dim);
-        if (changed) this.db.exec("DROP TABLE IF EXISTS vec_memories;");
+        const prevTextV = this.metaGet("embed_text_version");
+        const modelChanged = this.model !== "" && (prevModel !== this.model || prevDim !== null && Number(prevDim) !== this.dim);
+        const textChanged = this.embedTextVersion > 0 && prevTextV !== null && Number(prevTextV) !== this.embedTextVersion;
+        if (modelChanged || textChanged) this.db.exec("DROP TABLE IF EXISTS vec_memories;");
         this.db.exec(
           `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`
         );
         this.metaSet("embed_model", this.model);
         this.metaSet("embed_dim", String(this.dim));
+        this.metaSet("embed_text_version", String(this.embedTextVersion));
         this._vectorEnabled = true;
       } catch {
         this._vectorEnabled = false;
@@ -346,7 +357,7 @@ var MemoryStore = class {
     const rows = this.db.prepare(
       `SELECT rowid, summary, user_prompt, assistant_text, prompts_text
          FROM memories
-         WHERE type IN ('prompt','turn','session')
+         WHERE type IN (${VECTORIZABLE_SQL})
            AND rowid NOT IN (SELECT rowid FROM vec_memories)
          ORDER BY ts_epoch DESC LIMIT ?;`
     ).all(limit);
@@ -362,7 +373,7 @@ var MemoryStore = class {
       return Number(
         this.db.prepare(
           `SELECT COUNT(*) c FROM memories
-               WHERE type IN ('prompt','turn','session')
+               WHERE type IN (${VECTORIZABLE_SQL})
                  AND rowid NOT IN (SELECT rowid FROM vec_memories);`
         ).get().c
       );
@@ -493,6 +504,99 @@ var MemoryStore = class {
       }
     }
     return { dbPath: this.dbPath, total, byType, byProject, vectorEnabled: this._vectorEnabled, vectorCount };
+  }
+  // ---- Digests (LLM session compression) -------------------------------------------------
+  /** Turns of a session, in order — the raw material fed to the digest LLM. */
+  turnsForSession(session_id) {
+    const rows = this.db.prepare(
+      `SELECT user_prompt, assistant_text, tools, files_modified
+         FROM memories WHERE type='turn' AND session_id = ?
+         ORDER BY prompt_number ASC, ts_epoch ASC;`
+    ).all(session_id);
+    return rows.map((r) => ({
+      user_prompt: r.user_prompt ?? void 0,
+      assistant_text: r.assistant_text ?? void 0,
+      tools: jsonArr(r.tools),
+      files_modified: jsonArr(r.files_modified)
+    }));
+  }
+  /**
+   * Sessions that have a `session` rollup but no digest at the current version.
+   * A digest stores its version in `source`, so bumping DIGEST_VERSION re-selects every session.
+   */
+  sessionsNeedingDigest(version, limit = 5) {
+    const rows = this.db.prepare(
+      `SELECT m.session_id, m.project, m.branch FROM memories m
+         WHERE m.type='session' AND m.session_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM memories d
+             WHERE d.type='digest' AND d.session_id = m.session_id AND d.source = ?
+           )
+         ORDER BY m.ts_epoch DESC LIMIT ?;`
+    ).all(String(version), limit);
+    return rows.map((r) => ({
+      session_id: r.session_id,
+      project: r.project ?? void 0,
+      branch: r.branch ?? void 0
+    }));
+  }
+  /** Count of sessions still awaiting a digest at the given version (for status/progress). */
+  countSessionsNeedingDigest(version) {
+    try {
+      return Number(
+        this.db.prepare(
+          `SELECT COUNT(*) c FROM memories m
+               WHERE m.type='session' AND m.session_id IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM memories d
+                   WHERE d.type='digest' AND d.session_id = m.session_id AND d.source = ?
+                 );`
+        ).get(String(version)).c
+      );
+    } catch {
+      return 0;
+    }
+  }
+  /** Replaces a session's digest + insight docs (idempotent). Vectors are filled by the backfill. */
+  writeDigest(session_id, digest, insights) {
+    this.deleteSessionDigest(session_id);
+    this.upsert(`${session_id}:digest`, digest);
+    insights.forEach((d, i) => this.upsert(`${session_id}:insight:${i}`, d));
+  }
+  /** Deletes a session's digest + insights and their vectors. */
+  deleteSessionDigest(session_id) {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE session_id = ? AND type IN ('digest','insight');`).all(session_id).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    this.db.prepare(`DELETE FROM memories WHERE session_id = ? AND type IN ('digest','insight');`).run(session_id);
+  }
+  /** Deletes every digest + insight doc (and their vectors). Used by /memory:reindex. */
+  clearDigests() {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE type IN ('digest','insight');`).all().map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE type IN ('digest','insight');`).run();
+    return Number(info?.changes ?? rids.length);
+  }
+  /** Empties the vector index so the backfill refills it from scratch. Used by /memory:reindex. */
+  resetVectors() {
+    if (!this._vectorEnabled) return;
+    try {
+      this.db.exec("DROP TABLE IF EXISTS vec_memories;");
+      this.db.exec(
+        `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`
+      );
+    } catch {
+    }
+  }
+  /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
+  deleteVectors(rowids) {
+    if (!this._vectorEnabled || rowids.length === 0) return;
+    const stmt = this.db.prepare("DELETE FROM vec_memories WHERE rowid = ?");
+    for (const rid of rowids) {
+      try {
+        stmt.run(BigInt(rid));
+      } catch {
+      }
+    }
   }
   close() {
     try {
@@ -647,8 +751,197 @@ async function embedBatch(texts, cfg) {
   }
 }
 
+// src/digest.ts
+import { spawn } from "child_process";
+import { existsSync as existsSync3 } from "fs";
+import os2 from "os";
+import path4 from "path";
+var KINDS = /* @__PURE__ */ new Set(["decision", "bugfix", "discovery", "conclusion"]);
+var INPUT_BUDGET = 48e3;
+var TIMEOUT_MS = 18e4;
+function renderSession(input) {
+  const parts = [];
+  let size = 0;
+  let truncated = false;
+  for (const t of input.turns) {
+    const u = (t.user_prompt ?? "").trim();
+    const a = (t.assistant_text ?? "").trim();
+    const files = t.files_modified.length ? `
+  files: ${t.files_modified.join(", ")}` : "";
+    const block = `> user: ${u}
+  assistant: ${a}${files}`;
+    if (size + block.length > INPUT_BUDGET) {
+      truncated = true;
+      break;
+    }
+    parts.push(block);
+    size += block.length;
+  }
+  if (truncated) parts.push("\u2026 [session truncated for length]");
+  return parts.join("\n\n");
+}
+function buildPrompt(input) {
+  return [
+    "You compress a Claude Code coding session into durable memory for future sessions.",
+    "Read the session (user prompts + assistant turns + touched files) and extract only durable, reusable facts.",
+    "",
+    "Output ONLY a JSON object \u2014 no prose, no markdown fences \u2014 with exactly this shape:",
+    "{",
+    '  "conclusion": "1-3 sentences: what was achieved and the final state",',
+    '  "insights": [',
+    '    { "kind": "decision|bugfix|discovery|conclusion", "text": "one concrete durable fact", "files": ["path"] }',
+    "  ]",
+    "}",
+    "",
+    "Rules:",
+    "- 3 to 8 insights max. Only decisions made, bugs fixed, things discovered, or conclusions. Skip chit-chat and intermediate noise.",
+    '- "files" is optional; include only files actually touched for that fact.',
+    "- Be concise and specific. Write in the language of the session.",
+    "- Do not use any tools. Just read the session text below and respond with the JSON.",
+    "",
+    `SESSION (project: ${input.project ?? "?"}, branch: ${input.branch ?? "?"}):`,
+    renderSession(input)
+  ].join("\n");
+}
+function extractJsonObject(text) {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(text.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+function resolveClaudeExe() {
+  const isWin = process.platform === "win32";
+  const name = isWin ? "claude.exe" : "claude";
+  const sep = isWin ? ";" : ":";
+  const dirs = [path4.join(os2.homedir(), ".local", "bin"), ...(process.env.PATH || "").split(sep)];
+  for (const d of dirs) {
+    if (!d) continue;
+    const p = path4.join(d, name);
+    if (existsSync3(p)) return p;
+  }
+  return null;
+}
+function claudeAvailable() {
+  return resolveClaudeExe() !== null;
+}
+function runClaude(prompt) {
+  return new Promise((resolve) => {
+    const exe = resolveClaudeExe();
+    if (!exe) {
+      resolve(null);
+      return;
+    }
+    const args = [
+      "-p",
+      "--setting-sources",
+      "",
+      "--strict-mcp-config",
+      "--disable-slash-commands",
+      "--output-format",
+      "json"
+    ];
+    let child;
+    try {
+      child = spawn(exe, args, {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, MEMORY_HOOK_DISABLE: "1" }
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = "";
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        child.kill();
+      } catch {
+      }
+      resolve(v);
+    };
+    const timer = setTimeout(() => finish(null), TIMEOUT_MS);
+    timer.unref?.();
+    child.on("error", () => finish(null));
+    child.stdout?.on("data", (d) => out += d);
+    child.on("close", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve(null);
+        return;
+      }
+      try {
+        resolve(JSON.parse(out));
+      } catch {
+        resolve(null);
+      }
+    });
+    try {
+      child.stdin?.write(prompt);
+      child.stdin?.end();
+    } catch {
+      finish(null);
+    }
+  });
+}
+async function digestSession(input) {
+  if (input.turns.length === 0) return null;
+  const envelope = await runClaude(buildPrompt(input));
+  if (!envelope || typeof envelope.result !== "string") return null;
+  const parsed = extractJsonObject(envelope.result);
+  const conclusion = parsed && typeof parsed.conclusion === "string" && parsed.conclusion.trim() || envelope.result.trim().slice(0, 1e3);
+  if (!conclusion) return null;
+  const rawInsights = parsed && Array.isArray(parsed.insights) ? parsed.insights : [];
+  const insights = rawInsights.filter((x) => x && typeof x.text === "string" && x.text.trim()).slice(0, 8).map((x) => ({
+    kind: KINDS.has(x.kind) ? x.kind : "discovery",
+    text: String(x.text).trim().slice(0, 1e3),
+    files: Array.isArray(x.files) ? x.files.filter((f) => typeof f === "string").slice(0, 10) : void 0
+  }));
+  return {
+    conclusion,
+    insights,
+    usage: envelope.usage,
+    costUsd: typeof envelope.total_cost_usd === "number" ? envelope.total_cost_usd : void 0
+  };
+}
+
+// src/memory.ts
+import { readFileSync as readFileSync3 } from "fs";
+import path5 from "path";
+function nowIso() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function uniq(arr) {
+  return [...new Set(arr.filter(Boolean))];
+}
+
 // src/tools/search.ts
-var TYPES = ["observation", "prompt", "turn", "session"];
+var TYPES = ["observation", "prompt", "turn", "session", "digest", "insight"];
 function fmtDoc(d) {
   const date = (d.ts ?? d.ended_at ?? "").slice(0, 16).replace("T", " ");
   const proj = d.project ?? "?";
@@ -746,11 +1039,46 @@ var memoryStats = {
 };
 var searchTools = [memorySearch, memoryRecent, memoryStats];
 
+// src/tools/reindex.ts
+var memoryReindex = {
+  name: "memory_reindex",
+  description: "Forces reprocessing of existing memories. `vectors` empties the vector index (backfill refills it). `digests` deletes all LLM digests/insights (the digest loop regenerates them). With no argument, does both. Background, non-blocking; BM25 stays available throughout.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      vectors: { type: "boolean", description: "Clear and rebuild the vector index. Default: true if neither given." },
+      digests: { type: "boolean", description: "Delete and regenerate LLM digests/insights. Default: true if neither given." }
+    },
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const both = args.vectors === void 0 && args.digests === void 0;
+    const doVectors = both || args.vectors === true;
+    const doDigests = both || args.digests === true;
+    const lines = ["**memory \u2014 reindex**"];
+    if (doDigests) {
+      const n = store.clearDigests();
+      lines.push(`- Digests/insights: deleted **${n}** doc(s) \u2192 will be regenerated by the digest loop.`);
+    }
+    if (doVectors) {
+      if (store.vectorEnabled) {
+        store.resetVectors();
+        lines.push("- Vectors: index emptied \u2192 will be refilled by the backfill.");
+      } else {
+        lines.push("- Vectors: index disabled (nothing to do).");
+      }
+    }
+    lines.push("_Reprocessing runs in the background (non-blocking). BM25 stays available meanwhile._");
+    return lines.join("\n");
+  }
+};
+var reindexTools = [memoryReindex];
+
 // src/tools/index.ts
-var allTools = [...searchTools];
+var allTools = [...searchTools, ...reindexTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.12" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.2.0" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -783,6 +1111,68 @@ async function backfill(store, cfg) {
     });
   }
 }
+var digesting = false;
+var DIGEST_PER_TICK = 3;
+var warnedNoClaude = false;
+async function digestPending(store, cfg) {
+  if (digesting || !cfg.digest.enabled) return;
+  if (!claudeAvailable()) {
+    if (!warnedNoClaude) {
+      warnedNoClaude = true;
+      log(cfg.dataDir, "[digest] disabled: no native `claude` binary found on PATH (~/.local/bin)");
+    }
+    return;
+  }
+  digesting = true;
+  try {
+    const sessions = store.sessionsNeedingDigest(cfg.digest.version, DIGEST_PER_TICK);
+    for (const sess of sessions) {
+      const turns = store.turnsForSession(sess.session_id);
+      if (turns.length === 0) continue;
+      writeStatus(cfg.dataDir, {
+        state: "digesting",
+        digestPending: store.countSessionsNeedingDigest(cfg.digest.version)
+      });
+      const result = await digestSession({
+        session_id: sess.session_id,
+        project: sess.project,
+        branch: sess.branch,
+        turns
+      });
+      if (!result) continue;
+      const ts = nowIso();
+      const base = { session_id: sess.session_id, project: sess.project, branch: sess.branch, ts };
+      const digestFiles = uniq(result.insights.flatMap((i) => i.files ?? []));
+      const digestDoc = {
+        type: "digest",
+        ...base,
+        summary: result.conclusion,
+        source: String(cfg.digest.version),
+        // version marker → re-digest selector
+        files_modified: digestFiles
+      };
+      const insightDocs = result.insights.map((ins) => ({
+        type: "insight",
+        ...base,
+        summary: ins.text,
+        assistant_text: ins.text,
+        source: ins.kind,
+        // decision | bugfix | discovery | conclusion
+        files_modified: ins.files ?? []
+      }));
+      store.writeDigest(sess.session_id, digestDoc, insightDocs);
+      log(
+        cfg.dataDir,
+        `[digest] ${sess.session_id} \u2192 ${result.insights.length} insights${result.costUsd != null ? ` ($${result.costUsd.toFixed(4)})` : ""}`
+      );
+    }
+  } catch {
+  } finally {
+    digesting = false;
+    const remaining = store.countSessionsNeedingDigest(cfg.digest.version);
+    if (remaining === 0) writeStatus(cfg.dataDir, { state: "idle", digestPending: 0 });
+  }
+}
 function processName(tier) {
   const safe = (tier || "light").toLowerCase().replace(/[^a-z0-9]+/g, "");
   return `yoannyviquel_memory_${safe}`;
@@ -792,27 +1182,27 @@ function ensureNamedBinary(name) {
   try {
     const scriptPath = process.argv[1];
     if (!scriptPath) return;
-    const root = path4.resolve(path4.dirname(scriptPath), "..");
-    const binDir = path4.join(root, "bin");
-    const exe = path4.join(binDir, `${name}.exe`);
-    if (path4.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
-    if (!existsSync3(exe)) {
+    const root = path6.resolve(path6.dirname(scriptPath), "..");
+    const binDir = path6.join(root, "bin");
+    const exe = path6.join(binDir, `${name}.exe`);
+    if (path6.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
+    if (!existsSync4(exe)) {
       mkdirSync3(binDir, { recursive: true });
       copyFileSync(process.execPath, exe);
     }
     try {
-      const running = path4.basename(process.execPath).toLowerCase();
+      const running = path6.basename(process.execPath).toLowerCase();
       for (const f of readdirSync(binDir)) {
         const low = f.toLowerCase();
         if (low.startsWith("yoannyviquel_memory_") && low.endsWith(".exe") && low !== `${name}.exe` && low !== running) {
-          unlinkSync(path4.join(binDir, f));
+          unlinkSync(path6.join(binDir, f));
         }
       }
     } catch {
     }
-    const mcpPath = path4.join(root, ".mcp.json");
+    const mcpPath = path6.join(root, ".mcp.json");
     const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + name + ".exe";
-    const mcp = JSON.parse(readFileSync3(mcpPath, "utf8"));
+    const mcp = JSON.parse(readFileSync4(mcpPath, "utf8"));
     if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
       mcp.mcpServers.memory.command = desired;
       writeFileSync2(mcpPath, JSON.stringify(mcp, null, 2) + "\n");
@@ -828,9 +1218,14 @@ async function main() {
   } catch {
   }
   ensureNamedBinary(name);
-  const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
+  const store = new MemoryStore(
+    config.dbPath,
+    config.embed.dim,
+    config.embed.model,
+    EMBED_TEXT_VERSION
+  );
   await store.init();
-  const ctx = { store, embedCfg: config.embed };
+  const ctx = { store, embedCfg: config.embed, config };
   const server = new Server(
     { name: "memory", version: PKG_VERSION },
     { capabilities: { tools: {} } }
@@ -871,8 +1266,8 @@ async function main() {
   );
   log(config.dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
   log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? "on" : "off"}`);
-  const modelDir = path4.join(config.embed.cacheDir, ...config.embed.model.split("/"));
-  log(config.dataDir, `[server] model cache: ${existsSync3(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);
+  const modelDir = path6.join(config.embed.cacheDir, ...config.embed.model.split("/"));
+  log(config.dataDir, `[server] model cache: ${existsSync4(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);
   writeStatus(config.dataDir, {
     state: "idle",
     model: config.embed.model,
@@ -882,6 +1277,11 @@ async function main() {
   if (store.vectorEnabled && config.embed.enabled) {
     void backfill(store, config);
     const timer = setInterval(() => void backfill(store, config), BACKFILL_INTERVAL_MS);
+    timer.unref?.();
+  }
+  if (config.digest.enabled) {
+    void digestPending(store, config);
+    const timer = setInterval(() => void digestPending(store, config), BACKFILL_INTERVAL_MS);
     timer.unref?.();
   }
 }

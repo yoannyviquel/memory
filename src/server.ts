@@ -14,9 +14,11 @@ import {
   unlinkSync,
 } from 'node:fs';
 import path from 'node:path';
-import { loadConfig, type MemoryConfig } from './config.js';
-import { MemoryStore } from './store.js';
+import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
+import { MemoryStore, type MemoryDoc } from './store.js';
 import { embed, embedReady } from './embeddings.js';
+import { digestSession, claudeAvailable } from './digest.js';
+import { nowIso, uniq } from './memory.js';
 import { allTools } from './tools/index.js';
 import { log, writeStatus } from './log.js';
 
@@ -61,6 +63,80 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
       vectorized: s.vectorCount,
       missing: store.countMissingVectors(),
     });
+  }
+}
+
+let digesting = false;
+// Drip rate: sessions digested per tick. Keeps the first-run backlog from bursting `claude -p` calls.
+const DIGEST_PER_TICK = 3;
+
+/**
+ * Background LLM compression: turns completed sessions into a typed `digest` + `insight` docs
+ * (decisions/bugfixes/discoveries/conclusions), via `claude -p --bare` (user's default model).
+ * Decoupled from the hooks through the DB — same pattern as backfill. Drip-limited and best-effort:
+ * a missing `claude` binary or a parse failure just skips the session (raw turns stay searchable).
+ */
+let warnedNoClaude = false;
+
+async function digestPending(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
+  if (digesting || !cfg.digest.enabled) return;
+  // No native `claude` binary → digests can't run. Log once; raw memory stays fully functional.
+  if (!claudeAvailable()) {
+    if (!warnedNoClaude) {
+      warnedNoClaude = true;
+      log(cfg.dataDir, '[digest] disabled: no native `claude` binary found on PATH (~/.local/bin)');
+    }
+    return;
+  }
+  digesting = true;
+  try {
+    const sessions = store.sessionsNeedingDigest(cfg.digest.version, DIGEST_PER_TICK);
+    for (const sess of sessions) {
+      const turns = store.turnsForSession(sess.session_id);
+      if (turns.length === 0) continue;
+      writeStatus(cfg.dataDir, {
+        state: 'digesting',
+        digestPending: store.countSessionsNeedingDigest(cfg.digest.version),
+      });
+      const result = await digestSession({
+        session_id: sess.session_id,
+        project: sess.project,
+        branch: sess.branch,
+        turns,
+      });
+      if (!result) continue;
+      const ts = nowIso();
+      const base = { session_id: sess.session_id, project: sess.project, branch: sess.branch, ts };
+      const digestFiles = uniq(result.insights.flatMap((i) => i.files ?? []));
+      const digestDoc: MemoryDoc = {
+        type: 'digest',
+        ...base,
+        summary: result.conclusion,
+        source: String(cfg.digest.version), // version marker → re-digest selector
+        files_modified: digestFiles,
+      };
+      const insightDocs: MemoryDoc[] = result.insights.map((ins) => ({
+        type: 'insight',
+        ...base,
+        summary: ins.text,
+        assistant_text: ins.text,
+        source: ins.kind, // decision | bugfix | discovery | conclusion
+        files_modified: ins.files ?? [],
+      }));
+      store.writeDigest(sess.session_id, digestDoc, insightDocs);
+      log(
+        cfg.dataDir,
+        `[digest] ${sess.session_id} → ${result.insights.length} insights${
+          result.costUsd != null ? ` ($${result.costUsd.toFixed(4)})` : ''
+        }`,
+      );
+    }
+  } catch {
+    /* best-effort: never block the server */
+  } finally {
+    digesting = false;
+    const remaining = store.countSessionsNeedingDigest(cfg.digest.version);
+    if (remaining === 0) writeStatus(cfg.dataDir, { state: 'idle', digestPending: 0 });
   }
 }
 
@@ -143,9 +219,14 @@ async function main(): Promise<void> {
     /* best-effort: never block startup on a cosmetic rename */
   }
   ensureNamedBinary(name);
-  const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
+  const store = new MemoryStore(
+    config.dbPath,
+    config.embed.dim,
+    config.embed.model,
+    EMBED_TEXT_VERSION,
+  );
   await store.init();
-  const ctx = { store, embedCfg: config.embed };
+  const ctx = { store, embedCfg: config.embed, config };
 
   const server = new Server(
     { name: 'memory', version: PKG_VERSION },
@@ -204,6 +285,13 @@ async function main(): Promise<void> {
   if (store.vectorEnabled && config.embed.enabled) {
     void backfill(store, config);
     const timer = setInterval(() => void backfill(store, config), BACKFILL_INTERVAL_MS);
+    timer.unref?.();
+  }
+
+  // Background LLM digests (non-blocking): at startup then periodically. Drip-limited per tick.
+  if (config.digest.enabled) {
+    void digestPending(store, config);
+    const timer = setInterval(() => void digestPending(store, config), BACKFILL_INTERVAL_MS);
     timer.unref?.();
   }
 }

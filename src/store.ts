@@ -3,7 +3,11 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
-export type MemoryType = 'observation' | 'prompt' | 'turn' | 'session';
+export type MemoryType = 'observation' | 'prompt' | 'turn' | 'session' | 'digest' | 'insight';
+
+// Doc types whose text is worth vectorizing. Observations (tool calls = identifiers) stay BM25-only.
+const VECTORIZABLE = ['prompt', 'turn', 'session', 'digest', 'insight'] as const;
+const VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(',');
 
 /** Memory document. All fields are optional depending on the type. */
 export interface MemoryDoc {
@@ -169,6 +173,7 @@ export class MemoryStore {
     private readonly dbPath: string,
     private readonly dim = 384,
     private readonly model = '',
+    private readonly embedTextVersion = 0,
   ) {}
 
   get path(): string {
@@ -253,18 +258,26 @@ export class MemoryStore {
         // comparable → we recreate the index empty; the server's backfill will re-vectorize.
         const prevModel = this.metaGet('embed_model');
         const prevDim = this.metaGet('embed_dim');
+        const prevTextV = this.metaGet('embed_text_version');
         // Known and different model (or meta absent while vectors already exist) →
         // the old vectors are no longer comparable: we start from an empty index.
-        const changed =
+        const modelChanged =
           this.model !== '' &&
           (prevModel !== this.model || (prevDim !== null && Number(prevDim) !== this.dim));
-        if (changed) this.db.exec('DROP TABLE IF EXISTS vec_memories;');
+        // The text we embed changed (e.g. we now embed digests): existing vectors are stale →
+        // recreate empty so the backfill refills them with the new embed text.
+        const textChanged =
+          this.embedTextVersion > 0 &&
+          prevTextV !== null &&
+          Number(prevTextV) !== this.embedTextVersion;
+        if (modelChanged || textChanged) this.db.exec('DROP TABLE IF EXISTS vec_memories;');
 
         this.db.exec(
           `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`,
         );
         this.metaSet('embed_model', this.model);
         this.metaSet('embed_dim', String(this.dim));
+        this.metaSet('embed_text_version', String(this.embedTextVersion));
         this._vectorEnabled = true;
       } catch {
         this._vectorEnabled = false;
@@ -361,7 +374,7 @@ export class MemoryStore {
       .prepare(
         `SELECT rowid, summary, user_prompt, assistant_text, prompts_text
          FROM memories
-         WHERE type IN ('prompt','turn','session')
+         WHERE type IN (${VECTORIZABLE_SQL})
            AND rowid NOT IN (SELECT rowid FROM vec_memories)
          ORDER BY ts_epoch DESC LIMIT ?;`,
       )
@@ -384,7 +397,7 @@ export class MemoryStore {
           this.db
             .prepare(
               `SELECT COUNT(*) c FROM memories
-               WHERE type IN ('prompt','turn','session')
+               WHERE type IN (${VECTORIZABLE_SQL})
                  AND rowid NOT IN (SELECT rowid FROM vec_memories);`,
             )
             .get() as any
@@ -544,6 +557,131 @@ export class MemoryStore {
       }
     }
     return { dbPath: this.dbPath, total, byType, byProject, vectorEnabled: this._vectorEnabled, vectorCount };
+  }
+
+  // ---- Digests (LLM session compression) -------------------------------------------------
+
+  /** Turns of a session, in order — the raw material fed to the digest LLM. */
+  turnsForSession(
+    session_id: string,
+  ): Array<{ user_prompt?: string; assistant_text?: string; tools: string[]; files_modified: string[] }> {
+    const rows = this.db
+      .prepare(
+        `SELECT user_prompt, assistant_text, tools, files_modified
+         FROM memories WHERE type='turn' AND session_id = ?
+         ORDER BY prompt_number ASC, ts_epoch ASC;`,
+      )
+      .all(session_id);
+    return rows.map((r: any) => ({
+      user_prompt: r.user_prompt ?? undefined,
+      assistant_text: r.assistant_text ?? undefined,
+      tools: jsonArr(r.tools),
+      files_modified: jsonArr(r.files_modified),
+    }));
+  }
+
+  /**
+   * Sessions that have a `session` rollup but no digest at the current version.
+   * A digest stores its version in `source`, so bumping DIGEST_VERSION re-selects every session.
+   */
+  sessionsNeedingDigest(
+    version: number,
+    limit = 5,
+  ): Array<{ session_id: string; project?: string; branch?: string }> {
+    const rows = this.db
+      .prepare(
+        `SELECT m.session_id, m.project, m.branch FROM memories m
+         WHERE m.type='session' AND m.session_id IS NOT NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM memories d
+             WHERE d.type='digest' AND d.session_id = m.session_id AND d.source = ?
+           )
+         ORDER BY m.ts_epoch DESC LIMIT ?;`,
+      )
+      .all(String(version), limit);
+    return rows.map((r: any) => ({
+      session_id: r.session_id,
+      project: r.project ?? undefined,
+      branch: r.branch ?? undefined,
+    }));
+  }
+
+  /** Count of sessions still awaiting a digest at the given version (for status/progress). */
+  countSessionsNeedingDigest(version: number): number {
+    try {
+      return Number(
+        (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) c FROM memories m
+               WHERE m.type='session' AND m.session_id IS NOT NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM memories d
+                   WHERE d.type='digest' AND d.session_id = m.session_id AND d.source = ?
+                 );`,
+            )
+            .get(String(version)) as any
+        ).c,
+      );
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Replaces a session's digest + insight docs (idempotent). Vectors are filled by the backfill. */
+  writeDigest(session_id: string, digest: MemoryDoc, insights: MemoryDoc[]): void {
+    this.deleteSessionDigest(session_id);
+    this.upsert(`${session_id}:digest`, digest);
+    insights.forEach((d, i) => this.upsert(`${session_id}:insight:${i}`, d));
+  }
+
+  /** Deletes a session's digest + insights and their vectors. */
+  deleteSessionDigest(session_id: string): void {
+    const rids = this.db
+      .prepare(`SELECT rowid FROM memories WHERE session_id = ? AND type IN ('digest','insight');`)
+      .all(session_id)
+      .map((r: any) => Number(r.rowid));
+    this.deleteVectors(rids);
+    this.db
+      .prepare(`DELETE FROM memories WHERE session_id = ? AND type IN ('digest','insight');`)
+      .run(session_id);
+  }
+
+  /** Deletes every digest + insight doc (and their vectors). Used by /memory:reindex. */
+  clearDigests(): number {
+    const rids = this.db
+      .prepare(`SELECT rowid FROM memories WHERE type IN ('digest','insight');`)
+      .all()
+      .map((r: any) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE type IN ('digest','insight');`).run();
+    return Number(info?.changes ?? rids.length);
+  }
+
+  /** Empties the vector index so the backfill refills it from scratch. Used by /memory:reindex. */
+  resetVectors(): void {
+    if (!this._vectorEnabled) return;
+    try {
+      this.db.exec('DROP TABLE IF EXISTS vec_memories;');
+      this.db.exec(
+        `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`,
+      );
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
+  private deleteVectors(rowids: number[]): void {
+    if (!this._vectorEnabled || rowids.length === 0) return;
+    const stmt = this.db.prepare('DELETE FROM vec_memories WHERE rowid = ?');
+    for (const rid of rowids) {
+      try {
+        stmt.run(BigInt(rid));
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   close(): void {
