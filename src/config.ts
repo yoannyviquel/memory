@@ -72,9 +72,13 @@ export function loadConfig(): MemoryConfig {
   // total backfill. Defaults are deliberately mild so a tier switch doesn't peg the CPU.
   const backfillBatch = Math.max(1, Number(get('MEMORY_EMBED_BACKFILL_BATCH', 'embedBackfillBatch')) || 16);
   const backfillDelayMs = Math.max(0, Number(get('MEMORY_EMBED_BACKFILL_DELAY_MS', 'embedBackfillDelayMs')) || 250);
-  // ONNX thread cap: default to 25% of the cores so a backfill batch can't peg the machine.
-  // Floor of 1 so single/dual-core hosts still run. Overridable via env/file for power users.
-  const coreCap = Math.max(1, Math.floor(os.cpus().length * 0.25));
+  // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
+  // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
+  // medium=50%, heavy=75% of the cores. Floor of 1 so single/dual-core hosts still run.
+  // Overridable via env/file (MEMORY_EMBED_THREADS / embedThreads) for power users.
+  const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const fraction = threadFraction[tier] ?? 0.25;
+  const coreCap = Math.max(1, Math.floor(os.cpus().length * fraction));
   const threads = Math.max(1, Number(get('MEMORY_EMBED_THREADS', 'embedThreads')) || coreCap);
 
   return {

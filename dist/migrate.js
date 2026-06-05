@@ -49,7 +49,9 @@ function loadConfig() {
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
   const backfillBatch = Math.max(1, Number(get("MEMORY_EMBED_BACKFILL_BATCH", "embedBackfillBatch")) || 16);
   const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
-  const coreCap = Math.max(1, Math.floor(os.cpus().length * 0.25));
+  const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
+  const fraction = threadFraction[tier] ?? 0.25;
+  const coreCap = Math.max(1, Math.floor(os.cpus().length * fraction));
   const threads = Math.max(1, Number(get("MEMORY_EMBED_THREADS", "embedThreads")) || coreCap);
   return {
     dbPath,
