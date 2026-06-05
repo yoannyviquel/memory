@@ -12,54 +12,24 @@ Capture and search are **fully local** (no cloud). The only optional cloud step 
 
 ```mermaid
 flowchart TB
-    subgraph HOOKS["Claude Code hooks — every session, ephemeral, never block, no model"]
-        H1["SessionStart"]
-        H2["UserPromptSubmit"]
-        H3["PostToolUse"]
-        H4["Stop"]
-        H5["SessionEnd"]
-    end
+    HOOKS["Claude Code hooks — every session, no model<br/>SessionStart · UserPromptSubmit · PostToolUse · Stop · SessionEnd"]
+    DB[("Shared SQLite<br/>memories + FTS5 (BM25) + sqlite-vec")]
+    WORKER["MCP server (background)<br/>backfill = local embeddings<br/>digest = claude -p (Haiku)"]
+    SEARCH["search &amp; tools<br/>BM25 + KNN + RRF"]
 
-    DB[("Shared SQLite<br/>memories + FTS5 (BM25) + sqlite-vec<br/>+ worker.lock")]
-
-    H2 -->|"prompt"| DB
-    H3 -->|"observation"| DB
-    H4 -->|"turn"| DB
-    H5 -->|"session"| DB
-    DB -->|"⭐ core + recent digests"| H1
-    H1 -->|"inject at session start"| HOOKS
-
-    subgraph LEADER["MCP server — LEADER (elected via worker.lock; the only one that loads the model)"]
-        BF["backfill loop<br/>local embeddings (transformers.js)"]
-        DG["digest loop<br/>claude -p (Haiku)"]
-        ES["loopback embed service<br/>127.0.0.1 + token"]
-    end
-
-    DB <-->|"docs without vector ↔ vectors"| BF
-    DB -->|"sessions without digest"| DG
-    DG -->|"digest + insights<br/>(decision/bugfix/discovery)"| DB
-
-    subgraph FOLLOWER["MCP server — FOLLOWER (one per extra session; no model)"]
-        FS["search & tools<br/>BM25 + KNN + RRF"]
-    end
-
-    FS <-->|"BM25 + KNN"| DB
-    FS -->|"query text"| ES
-    ES -->|"vector"| FS
-
-    USER["MCP tools / slash commands<br/>search · core · reindex · delete · migrate"]
-    USER -.-> FS
-    USER -.-> DB
+    HOOKS -->|"prompt / observation / turn / session"| DB
+    DB -->|"⭐ core + recent digests"| HOOKS
+    DB <-->|"docs without vector ↔ vectors"| WORKER
+    WORKER -->|"digest + insights"| DB
+    SEARCH <-->|"hybrid search"| DB
 ```
 
 - **Hooks** (every session) capture raw memories with **no model loaded** → instant, BM25-searchable
   immediately. `SessionStart` injects **core memories + recent digests** into the new session.
-- **Leader** (one across all sessions, elected via `worker.lock`): loads the model and runs the
-  **backfill** (vectorize) and **digest** (LLM compression, Haiku) loops, and exposes a **loopback
-  embedding service**.
-- **Followers** (extra sessions): no model — they run BM25 + KNN locally on the shared DB and route
-  the **query→vector** step to the leader's embedding service. One model in RAM total; sub-second
-  failover if the leader exits.
+- The **MCP server** does the heavy work in the background: vectorizes pending docs (*backfill*),
+  and compresses finished sessions into LLM **digests** (Haiku).
+- Across several open sessions, **one server is elected leader** (it holds the single loaded model);
+  the others route their query embedding to it. See [Leader failover](#leader-failover-shared-model).
 
 ## Why SQLite (and not Elasticsearch)
 
@@ -87,20 +57,35 @@ in the background (at startup then every 60 s), vectorizes the pending documents
 the model is loaded only once, in that process. Observations (tool calls, mostly identifiers)
 are not vectorized: BM25 is enough for them.
 
-**Multiple sessions (leader election + shared model).** Each open Claude Code session spawns its own
-MCP server process (stdio transport). To avoid N servers each loading the model (~hundreds of MB) and
-each running redundant backfill/digest loops (which would multiply the digest quota cost), the servers
-elect a single **leader** via a lock file (`<dataDir>/worker.lock`, pid + heartbeat). Only the leader
-loads the model and runs backfill/digest. The leader also exposes a tiny **loopback embedding service**
-(`127.0.0.1`, token from the lock file); non-leaders route their **query embedding** to it, so they do
-hybrid search with full semantics **without ever loading their own model**. KNN/BM25/RRF still run in
-each session against the shared DB — only the query→vector step is delegated. Net: **one model in RAM
-total**, regardless of how many sessions are open.
+### Leader failover (shared model)
 
-The leader **releases its lock when its session closes** (stdin EOF / SIGTERM), and followers
-**watch the lock file** (`fs.watch`), so when the leader exits a follower takes over in **< 1 s**
-(heartbeat is the fallback; a hard kill is recovered within `STALE_MS` ≈ 90 s). While no leader is
-reachable, search degrades to BM25-only.
+Each open Claude Code session spawns its own MCP server (stdio transport). To avoid N servers each
+loading the model (~hundreds of MB) and each running redundant backfill/digest loops (which would
+multiply the digest quota cost), the servers elect a single **leader** via a lock file
+(`<dataDir>/worker.lock`, pid + heartbeat). Only the leader loads the model, runs backfill/digest,
+and exposes a **loopback embedding service** (`127.0.0.1` + token). Followers run BM25 + KNN locally
+on the shared DB and route just the **query→vector** step to the leader → **one model in RAM total**.
+
+Handoff when the leader's session closes:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as Follower (no model)
+    participant K as worker.lock
+    participant L as Leader (has model)
+    L->>K: heartbeat — renew pid+ts (~30s)
+    F-->>L: query→vector over loopback (during search)
+    Note over L: user closes the leader window
+    L->>K: release lock (stdin EOF / SIGTERM)
+    K-->>F: fs.watch fires (lock changed)
+    F->>K: acquire leadership
+    Note over F: load model + start embed service (< 1s)
+    Note over F: now the leader
+```
+
+Heartbeat is the fallback; a **hard kill** (no clean release) is recovered within `STALE_MS` ≈ 90 s.
+While no leader is reachable, search degrades to BM25-only — never an error.
 
 ### RAM profile (model-load transient)
 
