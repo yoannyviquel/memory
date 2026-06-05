@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { existsSync } from 'node:fs';
-import { loadConfig, EMBED_TEXT_VERSION } from './config.js';
+import { loadConfig, EMBED_TEXT_VERSION, DIGEST_VERSION } from './config.js';
 import { MemoryStore, type BulkItem, type MemoryDoc } from './store.js';
 import { embedBatch, embedText, embedReady, type EmbedConfig } from './embeddings.js';
 
@@ -60,6 +60,13 @@ function docEmbedText(d: MemoryDoc): string {
   return embedText([d.summary, d.user_prompt, d.assistant_text, ...(d.prompts ?? [])]);
 }
 
+/** claude-mem already stores typed, compressed observations → map straight to our insight kinds. */
+const INSIGHT_KINDS = new Set(['decision', 'bugfix', 'discovery', 'conclusion']);
+function mapKind(t: unknown): string {
+  const s = typeof t === 'string' ? t.toLowerCase() : '';
+  return INSIGHT_KINDS.has(s) ? s : 'discovery';
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const cfg = loadConfig();
@@ -116,46 +123,51 @@ async function main(): Promise<void> {
   const items: BulkItem[] = [];
   const counts = { observations: 0, session_summaries: 0, user_prompts: 0 };
 
+  // claude-mem observations are already typed, compressed facts → map directly to our `insight`
+  // docs (no LLM needed). The kind goes in `source`, like native insights.
   for (const o of safeAll('SELECT * FROM observations')) {
     counts.observations++;
+    const text = joinParts(
+      [
+        ['Detail', o.subtitle],
+        ['Narrative', o.narrative],
+        ['Facts', o.facts],
+        ['Text', o.text],
+      ],
+      12000,
+    );
     items.push({
-      id: `migrated:obs:${o.id}`,
+      id: `migrated:insight:${o.id}`,
       doc: {
-        type: 'observation',
+        type: 'insight',
         session_id: resolveSession(o.memory_session_id),
         project: resolveProject(o.project, memToContent.get(o.memory_session_id)),
         ts: o.created_at,
         prompt_number: o.prompt_number ?? undefined,
-        summary: clip(o.title, 1000) || clip(o.subtitle, 1000),
-        assistant_text: joinParts(
-          [
-            ['Discovery', o.title],
-            ['Detail', o.subtitle],
-            ['Narrative', o.narrative],
-            ['Facts', o.facts],
-            ['Text', o.text],
-          ],
-          12000,
-        ),
-        tool_brief: clip(o.type, 100),
+        summary: clip(o.title, 1000) || clip(o.subtitle, 1000) || clip(text, 200),
+        assistant_text: text,
+        source: mapKind(o.type),
         files_read: parseJsonArray(o.files_read),
         files_modified: parseJsonArray(o.files_modified),
       },
     });
   }
 
+  // claude-mem session summaries are already a structured digest → map directly to our `digest`
+  // (conclusion from completed/learned/request). `source` carries the digest version, like native.
   for (const s of safeAll('SELECT * FROM session_summaries')) {
     counts.session_summaries++;
+    const conclusion = clip(s.completed, 1000) || clip(s.learned, 1000) || clip(s.request, 1000);
     items.push({
-      id: `migrated:session:${s.id}`,
+      id: `migrated:digest:${s.id}`,
       doc: {
-        type: 'session',
+        type: 'digest',
         session_id: resolveSession(s.memory_session_id),
         project: resolveProject(s.project, memToContent.get(s.memory_session_id)),
         ts: s.created_at,
         started_at: s.created_at,
         prompt_number: s.prompt_number ?? undefined,
-        summary: clip(s.request, 1000),
+        summary: conclusion,
         assistant_text: joinParts(
           [
             ['Request', s.request],
@@ -167,6 +179,7 @@ async function main(): Promise<void> {
           ],
           12000,
         ),
+        source: String(DIGEST_VERSION),
         files_read: parseJsonArray(s.files_read),
         files_modified: parseJsonArray(s.files_edited),
       },

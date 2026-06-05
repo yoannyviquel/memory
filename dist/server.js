@@ -578,6 +578,32 @@ var MemoryStore = class {
     const info = this.db.prepare(`DELETE FROM memories WHERE type IN ('digest','insight');`).run();
     return Number(info?.changes ?? rids.length);
   }
+  /**
+   * Deletes memories matching a filter (+ their vectors; FTS is kept in sync by the delete trigger).
+   * Requires at least one filter — never deletes everything implicitly. Returns the count removed.
+   */
+  deleteMemories(opts) {
+    const where = [];
+    const args = [];
+    if (opts.idPrefix) {
+      where.push("substr(mem_id, 1, ?) = ?");
+      args.push(opts.idPrefix.length, opts.idPrefix);
+    }
+    if (opts.project) {
+      where.push("project = ?");
+      args.push(opts.project);
+    }
+    if (opts.type) {
+      where.push("type = ?");
+      args.push(opts.type);
+    }
+    if (where.length === 0) return 0;
+    const w = where.join(" AND ");
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE ${w};`).all(...args).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE ${w};`).run(...args);
+    return Number(info?.changes ?? rids.length);
+  }
   /** Empties the vector index so the backfill refills it from scratch. Used by /memory:reindex. */
   resetVectors() {
     if (!this._vectorEnabled) return;
@@ -1080,11 +1106,46 @@ var memoryReindex = {
 };
 var reindexTools = [memoryReindex];
 
+// src/tools/delete.ts
+var TYPES2 = ["observation", "prompt", "turn", "session", "digest", "insight"];
+var memoryDelete = {
+  name: "memory_delete",
+  description: 'DESTRUCTIVE. Deletes memories matching a filter (and their vectors). Filters combine with AND; at least one is required. Use idPrefix "migrated:" to remove claude-mem imports. Always confirm with the user before calling.',
+  inputSchema: {
+    type: "object",
+    properties: {
+      idPrefix: {
+        type: "string",
+        description: 'Delete docs whose mem_id starts with this (e.g. "migrated:" for claude-mem imports).'
+      },
+      project: { type: "string", description: "Limit to a project (directory basename)." },
+      type: { type: "string", enum: TYPES2, description: "Limit to a memory type." }
+    },
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const idPrefix = args.idPrefix ? String(args.idPrefix) : void 0;
+    const project = args.project ? String(args.project) : void 0;
+    const type = args.type ? String(args.type) : void 0;
+    if (!idPrefix && !project && !type) {
+      return "\u274C Refusing to delete: provide at least one filter (idPrefix, project, or type).";
+    }
+    const n = store.deleteMemories({ idPrefix, project, type });
+    const filters = [
+      idPrefix ? `idPrefix="${idPrefix}"` : null,
+      project ? `project="${project}"` : null,
+      type ? `type="${type}"` : null
+    ].filter(Boolean).join(", ");
+    return `\u{1F5D1}\uFE0F Deleted **${n}** memory(ies) matching ${filters}. Their vectors were removed too; BM25 index stays in sync.`;
+  }
+};
+var deleteTools = [memoryDelete];
+
 // src/tools/index.ts
-var allTools = [...searchTools, ...reindexTools];
+var allTools = [...searchTools, ...reindexTools, ...deleteTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.2.2" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.3.0" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;

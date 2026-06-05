@@ -565,6 +565,32 @@ var MemoryStore = class {
     const info = this.db.prepare(`DELETE FROM memories WHERE type IN ('digest','insight');`).run();
     return Number(info?.changes ?? rids.length);
   }
+  /**
+   * Deletes memories matching a filter (+ their vectors; FTS is kept in sync by the delete trigger).
+   * Requires at least one filter — never deletes everything implicitly. Returns the count removed.
+   */
+  deleteMemories(opts) {
+    const where = [];
+    const args = [];
+    if (opts.idPrefix) {
+      where.push("substr(mem_id, 1, ?) = ?");
+      args.push(opts.idPrefix.length, opts.idPrefix);
+    }
+    if (opts.project) {
+      where.push("project = ?");
+      args.push(opts.project);
+    }
+    if (opts.type) {
+      where.push("type = ?");
+      args.push(opts.type);
+    }
+    if (where.length === 0) return 0;
+    const w = where.join(" AND ");
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE ${w};`).all(...args).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE ${w};`).run(...args);
+    return Number(info?.changes ?? rids.length);
+  }
   /** Empties the vector index so the backfill refills it from scratch. Used by /memory:reindex. */
   resetVectors() {
     if (!this._vectorEnabled) return;
@@ -777,6 +803,11 @@ function joinParts(parts, max) {
 function docEmbedText(d) {
   return embedText([d.summary, d.user_prompt, d.assistant_text, ...d.prompts ?? []]);
 }
+var INSIGHT_KINDS = /* @__PURE__ */ new Set(["decision", "bugfix", "discovery", "conclusion"]);
+function mapKind(t) {
+  const s = typeof t === "string" ? t.toLowerCase() : "";
+  return INSIGHT_KINDS.has(s) ? s : "discovery";
+}
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const cfg = loadConfig();
@@ -825,26 +856,26 @@ async function main() {
   const counts = { observations: 0, session_summaries: 0, user_prompts: 0 };
   for (const o of safeAll("SELECT * FROM observations")) {
     counts.observations++;
+    const text = joinParts(
+      [
+        ["Detail", o.subtitle],
+        ["Narrative", o.narrative],
+        ["Facts", o.facts],
+        ["Text", o.text]
+      ],
+      12e3
+    );
     items.push({
-      id: `migrated:obs:${o.id}`,
+      id: `migrated:insight:${o.id}`,
       doc: {
-        type: "observation",
+        type: "insight",
         session_id: resolveSession(o.memory_session_id),
         project: resolveProject(o.project, memToContent.get(o.memory_session_id)),
         ts: o.created_at,
         prompt_number: o.prompt_number ?? void 0,
-        summary: clip(o.title, 1e3) || clip(o.subtitle, 1e3),
-        assistant_text: joinParts(
-          [
-            ["Discovery", o.title],
-            ["Detail", o.subtitle],
-            ["Narrative", o.narrative],
-            ["Facts", o.facts],
-            ["Text", o.text]
-          ],
-          12e3
-        ),
-        tool_brief: clip(o.type, 100),
+        summary: clip(o.title, 1e3) || clip(o.subtitle, 1e3) || clip(text, 200),
+        assistant_text: text,
+        source: mapKind(o.type),
         files_read: parseJsonArray(o.files_read),
         files_modified: parseJsonArray(o.files_modified)
       }
@@ -852,16 +883,17 @@ async function main() {
   }
   for (const s of safeAll("SELECT * FROM session_summaries")) {
     counts.session_summaries++;
+    const conclusion = clip(s.completed, 1e3) || clip(s.learned, 1e3) || clip(s.request, 1e3);
     items.push({
-      id: `migrated:session:${s.id}`,
+      id: `migrated:digest:${s.id}`,
       doc: {
-        type: "session",
+        type: "digest",
         session_id: resolveSession(s.memory_session_id),
         project: resolveProject(s.project, memToContent.get(s.memory_session_id)),
         ts: s.created_at,
         started_at: s.created_at,
         prompt_number: s.prompt_number ?? void 0,
-        summary: clip(s.request, 1e3),
+        summary: conclusion,
         assistant_text: joinParts(
           [
             ["Request", s.request],
@@ -873,6 +905,7 @@ async function main() {
           ],
           12e3
         ),
+        source: String(DIGEST_VERSION),
         files_read: parseJsonArray(s.files_read),
         files_modified: parseJsonArray(s.files_edited)
       }

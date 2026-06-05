@@ -200,9 +200,16 @@ node --no-warnings dist/migrate.js --embed              # imports + vectorizes r
 
 Options: `--db <path>` (default `~/.claude-mem/claude-mem.db`), `--project <name>`, `--batch <n>`,
 `--embed`. Read-only on the claude-mem database. Migrated docs prefixed `migrated:` → re-runnable
-without duplicates. Maps `observations`, `session_summaries`, `user_prompts`.
+without duplicates.
 
-Without `--embed`, migrated docs will be vectorized progressively by the MCP server's backfill.
+**Maps straight to the digest format (no LLM, no quota)**: claude-mem already stores typed,
+compressed data, so `observations → insight` docs (kind from claude-mem's type) and
+`session_summaries → digest` docs (conclusion from completed/learned/request); `user_prompts →
+prompt`. Migrated content thus shows up like native digests (injected at SessionStart, ranks in
+search) without any `claude -p` call.
+
+To re-import cleanly after upgrading the format: `/memory:delete migrated:` then re-run the
+migration. Without `--embed`, migrated docs are vectorized progressively by the backfill.
 
 Or via the command: `/memory:migrate`.
 
@@ -212,6 +219,7 @@ Or via the command: `/memory:migrate`.
 - `/memory:status` — database + vector index + embedder state + backfill lag.
 - `/memory:config <light|medium|heavy>` — change the embedding model tier.
 - `/memory:reindex [vectors|digests|all]` — force re-vectorization and/or re-digest (background).
+- `/memory:delete <idPrefix|project=…|type=…>` — delete memories by filter (destructive, confirms first).
 - `/memory:migrate` — claude-mem migration.
 
 ## Diagnostics & status line

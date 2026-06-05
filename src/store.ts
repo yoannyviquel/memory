@@ -658,6 +658,37 @@ export class MemoryStore {
     return Number(info?.changes ?? rids.length);
   }
 
+  /**
+   * Deletes memories matching a filter (+ their vectors; FTS is kept in sync by the delete trigger).
+   * Requires at least one filter — never deletes everything implicitly. Returns the count removed.
+   */
+  deleteMemories(opts: { idPrefix?: string; project?: string; type?: MemoryType }): number {
+    const where: string[] = [];
+    const args: unknown[] = [];
+    if (opts.idPrefix) {
+      // Exact prefix match (no LIKE wildcards: '_'/'%' in an id must stay literal).
+      where.push('substr(mem_id, 1, ?) = ?');
+      args.push(opts.idPrefix.length, opts.idPrefix);
+    }
+    if (opts.project) {
+      where.push('project = ?');
+      args.push(opts.project);
+    }
+    if (opts.type) {
+      where.push('type = ?');
+      args.push(opts.type);
+    }
+    if (where.length === 0) return 0; // refuse a filter-less delete-all
+    const w = where.join(' AND ');
+    const rids = this.db
+      .prepare(`SELECT rowid FROM memories WHERE ${w};`)
+      .all(...args)
+      .map((r: any) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE ${w};`).run(...args);
+    return Number(info?.changes ?? rids.length);
+  }
+
   /** Empties the vector index so the backfill refills it from scratch. Used by /memory:reindex. */
   resetVectors(): void {
     if (!this._vectorEnabled) return;
