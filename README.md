@@ -81,8 +81,33 @@ loads the model and runs backfill/digest. The leader also exposes a tiny **loopb
 (`127.0.0.1`, token from the lock file); non-leaders route their **query embedding** to it, so they do
 hybrid search with full semantics **without ever loading their own model**. KNN/BM25/RRF still run in
 each session against the shared DB — only the query→vector step is delegated. Net: **one model in RAM
-total**, regardless of how many sessions are open. If the leader exits, a non-leader takes over within
-~150 s and starts its own service; while no leader is reachable, search degrades to BM25-only.
+total**, regardless of how many sessions are open.
+
+The leader **releases its lock when its session closes** (stdin EOF / SIGTERM), and followers
+**watch the lock file** (`fs.watch`), so when the leader exits a follower takes over in **< 1 s**
+(heartbeat is the fallback; a hard kill is recovered within `STALE_MS` ≈ 90 s). While no leader is
+reachable, search degrades to BM25-only.
+
+### RAM profile (model-load transient)
+
+Loading the embedding model briefly spikes RAM, then settles. On the **heavy** tier you'll see the
+leader jump to **~2 GB for a few seconds, then drop to ~600 MB** and stay there. This is normal —
+it's ONNX Runtime session creation, not a leak:
+
+```mermaid
+timeline
+    title Leader model load — RAM over time (heavy tier, e5-large q8)
+    Idle / follower : ~80 MB node baseline
+    Read .onnx into memory : model bytes buffered (hundreds of MB)
+    ONNX session create + graph optimization (all) : original AND optimized graph coexist : PEAK ~2 GB
+    Init done — buffers freed (GC + arena settle) : drops to ~600 MB
+    Steady — leader serving / backfilling : ~600 MB until the session exits
+```
+
+The peak comes from `graphOptimizationLevel: 'all'`: ORT builds an optimized copy of the graph while
+the original is still in memory, so peak ≈ ~2× the model. It happens **once** per model load (leader
+startup or failover), not on every search. To shrink it: use a lighter tier (smaller model → lower
+peak *and* steady), which is the only lever that affects both.
 
 ### Model tiers (multilingual)
 
