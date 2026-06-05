@@ -112,9 +112,13 @@ searchable via BM25 in the meantime. Advanced override: env `MEMORY_EMBED_MODEL`
 
 ### LLM digests — cost & isolation
 
-- **Model**: your Claude Code **default** model (no `--model` forced). ⚠️ If that's Opus, each digest
-  costs real tokens (~$0.2–2 per session depending on length). Set `MEMORY_DIGEST_ENABLED=0` to turn
-  it off, or switch your default model for cheaper digests.
+- **Model & cost**: your Claude Code **default** model (no `--model` forced). It reuses your existing
+  Claude Code auth, so on a **Claude Max/Pro subscription this is no extra money** — it consumes your
+  **plan usage quota** (the 5-hour / weekly limits), in competition with your interactive coding. The
+  `total_cost_usd` shown in logs is a notional API-equivalent, not a charge. ⚠️ If your default model
+  is Opus, digests eat that quota fast — especially the first run, which digests all past sessions
+  (drip-limited to spread it). Set `MEMORY_DIGEST_ENABLED=0` to turn digests off, or switch your
+  default model to something cheaper.
 - **Isolation**: the digest runs `claude -p --setting-sources "" --strict-mcp-config
   --disable-slash-commands` so **no hooks, plugins, skills or MCP servers load** in that child — it
   can't re-trigger this plugin's own hooks. (`--bare` is *not* used: it would skip keychain reads and
