@@ -72,6 +72,11 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
  */
 const PROCESS_NAME = 'yoannyviquel-memory';
 
+// What Task Manager's Processes tab shows: it reads the PE FileDescription, not the file name.
+// Colons are illegal in Windows file names but legal in a version string, so the .exe stays
+// "yoannyviquel-memory.exe" while this becomes the human-visible label.
+const DISPLAY_NAME = 'claude-code:yoannyviquel:memory';
+
 /**
  * Windows: make the server run under a "yoannyviquel-memory.exe" image name instead of "node.exe".
  *
@@ -84,7 +89,7 @@ const PROCESS_NAME = 'yoannyviquel-memory';
  * the standard post-install `/reload-plugins`, the server relaunches from the renamed copy. Entirely
  * best-effort and cosmetic: the committed command stays "node", so a failure here never blocks start.
  */
-function ensureNamedBinary(): void {
+async function ensureNamedBinary(): Promise<void> {
   if (process.platform !== 'win32') return; // Linux/macOS CLI is already covered by process.title
   try {
     const scriptPath = process.argv[1];
@@ -97,6 +102,24 @@ function ensureNamedBinary(): void {
     if (!existsSync(exe)) {
       mkdirSync(path.dirname(exe), { recursive: true });
       copyFileSync(process.execPath, exe); // ~85 MB, one-time (until node upgrades)
+      // The copy inherits node.exe's FileDescription ("Node.js JavaScript Runtime"), which is what
+      // Task Manager's Processes tab shows. Rewrite the PE version resource so the label is ours.
+      // Best-effort: a missing/failed rcedit must never block startup (the renamed exe still works).
+      try {
+        const rceditMod = 'rcedit';
+        const rcedit = (await import(rceditMod)).default as (
+          exePath: string,
+          opts: Record<string, unknown>,
+        ) => Promise<void>;
+        await rcedit(exe, {
+          'version-string': { FileDescription: DISPLAY_NAME, ProductName: DISPLAY_NAME },
+        });
+        process.stderr.write(`[memory] patched exe FileDescription → ${DISPLAY_NAME}\n`);
+      } catch (e) {
+        process.stderr.write(
+          `[memory] rcedit resource patch skipped: ${e instanceof Error ? e.message : String(e)}\n`,
+        );
+      }
     }
 
     const mcpPath = path.join(root, '.mcp.json');
@@ -117,7 +140,7 @@ async function main(): Promise<void> {
   } catch {
     /* best-effort: never block startup on a cosmetic rename */
   }
-  ensureNamedBinary();
+  await ensureNamedBinary();
   const config = loadConfig();
   const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
   await store.init();
