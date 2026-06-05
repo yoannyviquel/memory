@@ -117,6 +117,11 @@ searchable via BM25 in the meantime. Advanced override: env `MEMORY_EMBED_MODEL`
   `conclusion`) via `claude -p` using **Haiku by default** and your **existing auth** (no API key). These
   high-signal docs are what `SessionStart` injects and what ranks best in search. Raw turns stay as
   the recall safety net. Disable with `MEMORY_DIGEST_ENABLED=0`.
+- **Core memories**: primordial facts injected into **every** session at load (above the digests).
+  Created explicitly (the user asks to remember something), or **proposed by Claude** when a fact
+  recurs across many memories (`memory_core_suggest` surfaces signals; the user must agree before it
+  is saved). Tools: `memory_core_add` / `memory_core_list` / `memory_core_remove` / `memory_core_suggest`,
+  or `/memory:core`. Global by default, or scoped to a project.
 - **Search** via MCP: `memory_search` (hybrid), `memory_recent`, `memory_stats`.
 - **Reindex** via MCP `memory_reindex` (or `/memory:reindex`): rebuild vectors and/or regenerate digests.
 - **Migration** of claude-mem history (SQLite) → memory database.
@@ -194,10 +199,10 @@ Two mechanisms, **env takes precedence over the file**:
 
 ## Schema
 
-Table `memories` (6 `type`s: `observation`, `prompt`, `turn`, `session`, `digest`, `insight`)
+Table `memories` (7 `type`s: `observation`, `prompt`, `turn`, `session`, `digest`, `insight`, `core`)
 + FTS5 `memories_fts` (sync triggers) + `vec_memories` (sqlite-vec). Deterministic `mem_id`
-(`{session}:obs:{n}`, `…:prompt:{n}`, `…:turn:{n}`, `…:session`, `…:digest`, `…:insight:{i}`)
-→ idempotent upsert (`ON CONFLICT`). `digest`/`insight` store their kind/version in `source`.
+(`{session}:obs:{n}`, `…:prompt:{n}`, `…:turn:{n}`, `…:session`, `…:digest`, `…:insight:{i}`,
+`core:{hash}`) → idempotent upsert (`ON CONFLICT`). `digest`/`insight` store their kind/version in `source`.
 A `meta` table holds version markers (`embed_model`, `embed_dim`, `embed_text_version`,
 `digest_version`). WAL mode for concurrent hook/server access.
 
@@ -229,6 +234,7 @@ Or via the command: `/memory:migrate`.
 - `/memory:search <text>` — hybrid search.
 - `/memory:status` — database + vector index + embedder state + backfill lag.
 - `/memory:config <light|medium|heavy>` — change the embedding model tier.
+- `/memory:core [list|suggest|remove <id>|<text>]` — manage core memories (always injected at load).
 - `/memory:reindex [vectors|digests|all]` — force re-vectorization and/or re-digest (background).
 - `/memory:delete <idPrefix|project=…|type=…>` — delete memories by filter (destructive, confirms first).
 - `/memory:migrate` — claude-mem migration.

@@ -63,8 +63,9 @@ function loadConfig() {
 import { mkdirSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
+import { createHash } from "crypto";
 import path2 from "path";
-var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight"];
+var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core"];
 var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
 var HERE = path2.dirname(fileURLToPath(import.meta.url));
 var COLS = [
@@ -597,6 +598,52 @@ var MemoryStore = class {
     } catch {
     }
   }
+  // ---- Core memories (always injected at SessionStart) ------------------------------------
+  /**
+   * Adds (or updates) a core memory — a high-priority fact injected into every session's context.
+   * Global by default (project undefined) or scoped to a project. Idempotent: the id is a hash of
+   * (project, text), so the same fact isn't duplicated. Returns the mem_id.
+   */
+  addCore(text, project) {
+    const id = "core:" + createHash("sha1").update(`${project ?? ""}\0${text}`).digest("hex").slice(0, 12);
+    this.upsert(id, {
+      type: "core",
+      project,
+      summary: text.trim().slice(0, 2e3),
+      ts: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    return id;
+  }
+  /** Core memories visible for a project: its own + globals (project IS NULL). Recent first. */
+  listCore(project) {
+    const sql = project ? `SELECT * FROM memories WHERE type='core' AND (project = ? OR project IS NULL) ORDER BY ts_epoch DESC;` : `SELECT * FROM memories WHERE type='core' ORDER BY ts_epoch DESC;`;
+    const rows = project ? this.db.prepare(sql).all(project) : this.db.prepare(sql).all();
+    return rows.map((r) => ({ id: r.mem_id, doc: rowToDoc(r) }));
+  }
+  /** Removes a core memory by id (+ its vector). Returns the count removed (0 or 1). */
+  removeCore(id) {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE mem_id = ? AND type='core';`).all(id).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE mem_id = ? AND type='core';`).run(id);
+    return Number(info?.changes ?? 0);
+  }
+  /**
+   * Frequency signals to help propose core memories: files touched across the most memories
+   * (a file recurring over many sessions is likely structurally important). Best-effort (JSON1).
+   */
+  coreSignals(limit = 15) {
+    try {
+      const rows = this.db.prepare(
+        `SELECT j.value AS f, COUNT(*) AS c
+           FROM memories, json_each(memories.files_modified) j
+           WHERE memories.files_modified IS NOT NULL AND memories.files_modified != '[]'
+           GROUP BY j.value ORDER BY c DESC LIMIT ?;`
+      ).all(limit);
+      return { files: rows.map((r) => ({ file: String(r.f), count: Number(r.c) })) };
+    } catch {
+      return { files: [] };
+    }
+  }
   /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
   deleteVectors(rowids) {
     if (!this._vectorEnabled || rowids.length === 0) return;
@@ -825,30 +872,39 @@ function baseFields(payload, state) {
 }
 function handleSessionStart(cfg, store, payload) {
   const project = projectFromCwd(payload.cwd);
+  const cores = store.listCore(project).slice(0, 30);
   const digests = store.recent({ project, type: "digest", limit: cfg.contextLimit });
   const recent = digests.length > 0 ? digests : store.recent({ project, limit: cfg.contextLimit });
   const total = store.stats().total;
   const header = `\u{1F9E0} mem active \u2014 db: ${cfg.dbPath} \xB7 model: ${cfg.embed.model} \xB7 ${total} docs \xB7 vectors: ${store.vectorEnabled ? "on" : "off"}`;
-  if (recent.length === 0) {
+  if (cores.length === 0 && recent.length === 0) {
     return JSON.stringify({
       hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: header }
     });
   }
-  const lines = [];
-  lines.push(header);
-  lines.push("");
-  lines.push(`## Project memory "${project}"`);
-  lines.push(`Latest memories from previous sessions:`);
-  for (const d of recent) {
-    const date = (d.ts ?? "").slice(0, 10);
-    const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(no summary)";
-    const files = (d.files_modified ?? []).slice(0, 3).join(", ");
-    lines.push(
-      `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` \u2014 files: ${files}` : ""}`
-    );
+  const lines = [header, ""];
+  if (cores.length > 0) {
+    lines.push(`## \u2B50 Core memory (always-on)`);
+    for (const c of cores) {
+      const scope = c.doc.project ? `[${c.doc.project}]` : "[global]";
+      lines.push(`- ${scope} ${summarize(c.doc.summary ?? "", 240)}`);
+    }
+    lines.push("");
   }
-  lines.push("");
-  lines.push(`_Search: MCP tool \`memory_search\` or \`/memory:search\`._`);
+  if (recent.length > 0) {
+    lines.push(`## Project memory "${project}"`);
+    lines.push(`Latest memories from previous sessions:`);
+    for (const d of recent) {
+      const date = (d.ts ?? "").slice(0, 10);
+      const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(no summary)";
+      const files = (d.files_modified ?? []).slice(0, 3).join(", ");
+      lines.push(
+        `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` \u2014 files: ${files}` : ""}`
+      );
+    }
+    lines.push("");
+  }
+  lines.push(`_Search: \`memory_search\` \xB7 core: \`memory_core_add\` / \`/memory:core\`._`);
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: lines.join("\n") }
   });

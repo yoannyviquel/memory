@@ -81,8 +81,9 @@ function loadConfig() {
 import { mkdirSync, existsSync } from "fs";
 import { fileURLToPath } from "url";
 import { createRequire } from "module";
+import { createHash } from "crypto";
 import path2 from "path";
-var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight"];
+var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core"];
 var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
 var HERE = path2.dirname(fileURLToPath(import.meta.url));
 var COLS = [
@@ -613,6 +614,52 @@ var MemoryStore = class {
         `CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(embedding float[${this.dim}]);`
       );
     } catch {
+    }
+  }
+  // ---- Core memories (always injected at SessionStart) ------------------------------------
+  /**
+   * Adds (or updates) a core memory — a high-priority fact injected into every session's context.
+   * Global by default (project undefined) or scoped to a project. Idempotent: the id is a hash of
+   * (project, text), so the same fact isn't duplicated. Returns the mem_id.
+   */
+  addCore(text, project) {
+    const id = "core:" + createHash("sha1").update(`${project ?? ""}\0${text}`).digest("hex").slice(0, 12);
+    this.upsert(id, {
+      type: "core",
+      project,
+      summary: text.trim().slice(0, 2e3),
+      ts: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    return id;
+  }
+  /** Core memories visible for a project: its own + globals (project IS NULL). Recent first. */
+  listCore(project) {
+    const sql = project ? `SELECT * FROM memories WHERE type='core' AND (project = ? OR project IS NULL) ORDER BY ts_epoch DESC;` : `SELECT * FROM memories WHERE type='core' ORDER BY ts_epoch DESC;`;
+    const rows = project ? this.db.prepare(sql).all(project) : this.db.prepare(sql).all();
+    return rows.map((r) => ({ id: r.mem_id, doc: rowToDoc(r) }));
+  }
+  /** Removes a core memory by id (+ its vector). Returns the count removed (0 or 1). */
+  removeCore(id) {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE mem_id = ? AND type='core';`).all(id).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE mem_id = ? AND type='core';`).run(id);
+    return Number(info?.changes ?? 0);
+  }
+  /**
+   * Frequency signals to help propose core memories: files touched across the most memories
+   * (a file recurring over many sessions is likely structurally important). Best-effort (JSON1).
+   */
+  coreSignals(limit = 15) {
+    try {
+      const rows = this.db.prepare(
+        `SELECT j.value AS f, COUNT(*) AS c
+           FROM memories, json_each(memories.files_modified) j
+           WHERE memories.files_modified IS NOT NULL AND memories.files_modified != '[]'
+           GROUP BY j.value ORDER BY c DESC LIMIT ?;`
+      ).all(limit);
+      return { files: rows.map((r) => ({ file: String(r.f), count: Number(r.c) })) };
+    } catch {
+      return { files: [] };
     }
   }
   /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
@@ -1251,11 +1298,116 @@ var memoryDelete = {
 };
 var deleteTools = [memoryDelete];
 
+// src/tools/core.ts
+function line(d) {
+  const date = (d.ts ?? "").slice(0, 10);
+  const proj = d.project ?? "global";
+  return `\`${proj}\`${date ? ` \xB7 ${date}` : ""} \u2014 ${(d.summary ?? "").replace(/\s+/g, " ").trim().slice(0, 200)}`;
+}
+var coreAdd = {
+  name: "memory_core_add",
+  description: "Saves a CORE memory: a primordial fact injected into every session at load time. Use when the user explicitly asks to remember something important, or \u2014 after confirming with the user \u2014 for a recurring fact you detected. Keep it one concise, durable sentence. Omit `project` for a global core (shown everywhere); pass a project name to scope it.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      text: { type: "string", description: "The core fact (one concise, durable sentence)." },
+      project: { type: "string", description: "Scope to a project (directory basename). Omit for global." }
+    },
+    required: ["text"],
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const text = String(args.text ?? "").trim();
+    if (!text) return "\u274C `text` is required.";
+    const project = args.project ? String(args.project) : void 0;
+    const id = store.addCore(text, project);
+    return `\u{1F9E0}\u2B50 Core memory saved (${project ? `project \`${project}\`` : "global"}): "${text}"
+_id: ${id}_ \u2014 it will be injected at the start of every${project ? " matching" : ""} session.`;
+  }
+};
+var coreList = {
+  name: "memory_core_list",
+  description: "Lists core memories (the always-injected facts). Optionally scoped to a project (also shows globals).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      project: { type: "string", description: "Limit to a project (also includes globals). Optional." }
+    },
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const project = args.project ? String(args.project) : void 0;
+    const cores = store.listCore(project);
+    if (cores.length === 0) return "No core memory yet.";
+    return `\u{1F9E0}\u2B50 **${cores.length} core memory(ies)**:
+
+${cores.map((c) => `- ${line(c.doc)}
+  _id: ${c.id}_`).join("\n")}`;
+  }
+};
+var coreRemove = {
+  name: "memory_core_remove",
+  description: "Removes a core memory by its id (get ids from memory_core_list). Confirm with the user first.",
+  inputSchema: {
+    type: "object",
+    properties: { id: { type: "string", description: 'The core memory id (e.g. "core:ab12cd34ef56").' } },
+    required: ["id"],
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const id = String(args.id ?? "").trim();
+    if (!id) return "\u274C `id` is required.";
+    const n = store.removeCore(id);
+    return n > 0 ? `\u{1F5D1}\uFE0F Core memory \`${id}\` removed.` : `No core memory with id \`${id}\`.`;
+  }
+};
+var coreSuggest = {
+  name: "memory_core_suggest",
+  description: "Surfaces signals to help propose a core memory: files touched across many memories, and recent conclusions. Review them; if a durable, important fact recurs, PROPOSE it to the user and, on agreement, call memory_core_add. Do not create a core without the user agreeing.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      project: { type: "string", description: "Bias toward a project. Optional." }
+    },
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const project = args.project ? String(args.project) : void 0;
+    const { files } = store.coreSignals(15);
+    const digests = store.recent({ project, type: "digest", limit: 8 });
+    const existing = store.listCore(project);
+    const lines = ["**Core-memory signals** \u2014 review, then propose to the user if warranted."];
+    if (files.length) {
+      lines.push("\nFiles recurring across many memories:");
+      for (const f of files) lines.push(`- ${f.file} (${f.count})`);
+    }
+    if (digests.length) {
+      lines.push("\nRecent conclusions:");
+      for (const d of digests) lines.push(`- ${line(d)}`);
+    }
+    if (existing.length) {
+      lines.push(`
+Already core (${existing.length}) \u2014 do not duplicate:`);
+      for (const c of existing) lines.push(`- ${line(c.doc)}`);
+    }
+    lines.push(
+      "\nIf a durable, repeatedly-relevant fact stands out (a convention, a key path, a deploy step, a decision that keeps mattering), propose it as a core memory and, once the user agrees, call `memory_core_add`."
+    );
+    return lines.join("\n");
+  }
+};
+var coreTools = [coreAdd, coreList, coreRemove, coreSuggest];
+
 // src/tools/index.ts
-var allTools = [...searchTools, ...reindexTools, ...deleteTools];
+var allTools = [
+  ...searchTools,
+  ...reindexTools,
+  ...deleteTools,
+  ...coreTools
+];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.3.3" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.4.0" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;

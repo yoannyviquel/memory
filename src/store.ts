@@ -1,12 +1,20 @@
 import { mkdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 
-export type MemoryType = 'observation' | 'prompt' | 'turn' | 'session' | 'digest' | 'insight';
+export type MemoryType =
+  | 'observation'
+  | 'prompt'
+  | 'turn'
+  | 'session'
+  | 'digest'
+  | 'insight'
+  | 'core';
 
 // Doc types whose text is worth vectorizing. Observations (tool calls = identifiers) stay BM25-only.
-const VECTORIZABLE = ['prompt', 'turn', 'session', 'digest', 'insight'] as const;
+const VECTORIZABLE = ['prompt', 'turn', 'session', 'digest', 'insight', 'core'] as const;
 const VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(',');
 
 /** Memory document. All fields are optional depending on the type. */
@@ -699,6 +707,65 @@ export class MemoryStore {
       );
     } catch {
       /* best-effort */
+    }
+  }
+
+  // ---- Core memories (always injected at SessionStart) ------------------------------------
+
+  /**
+   * Adds (or updates) a core memory — a high-priority fact injected into every session's context.
+   * Global by default (project undefined) or scoped to a project. Idempotent: the id is a hash of
+   * (project, text), so the same fact isn't duplicated. Returns the mem_id.
+   */
+  addCore(text: string, project?: string): string {
+    const id =
+      'core:' + createHash('sha1').update(`${project ?? ''} ${text}`).digest('hex').slice(0, 12);
+    this.upsert(id, {
+      type: 'core',
+      project,
+      summary: text.trim().slice(0, 2000),
+      ts: new Date().toISOString(),
+    });
+    return id;
+  }
+
+  /** Core memories visible for a project: its own + globals (project IS NULL). Recent first. */
+  listCore(project?: string): Array<{ id: string; doc: MemoryDoc }> {
+    const sql = project
+      ? `SELECT * FROM memories WHERE type='core' AND (project = ? OR project IS NULL) ORDER BY ts_epoch DESC;`
+      : `SELECT * FROM memories WHERE type='core' ORDER BY ts_epoch DESC;`;
+    const rows = project ? this.db.prepare(sql).all(project) : this.db.prepare(sql).all();
+    return rows.map((r: any) => ({ id: r.mem_id, doc: rowToDoc(r) }));
+  }
+
+  /** Removes a core memory by id (+ its vector). Returns the count removed (0 or 1). */
+  removeCore(id: string): number {
+    const rids = this.db
+      .prepare(`SELECT rowid FROM memories WHERE mem_id = ? AND type='core';`)
+      .all(id)
+      .map((r: any) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE mem_id = ? AND type='core';`).run(id);
+    return Number(info?.changes ?? 0);
+  }
+
+  /**
+   * Frequency signals to help propose core memories: files touched across the most memories
+   * (a file recurring over many sessions is likely structurally important). Best-effort (JSON1).
+   */
+  coreSignals(limit = 15): { files: Array<{ file: string; count: number }> } {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT j.value AS f, COUNT(*) AS c
+           FROM memories, json_each(memories.files_modified) j
+           WHERE memories.files_modified IS NOT NULL AND memories.files_modified != '[]'
+           GROUP BY j.value ORDER BY c DESC LIMIT ?;`,
+        )
+        .all(limit);
+      return { files: rows.map((r: any) => ({ file: String(r.f), count: Number(r.c) })) };
+    } catch {
+      return { files: [] };
     }
   }
 

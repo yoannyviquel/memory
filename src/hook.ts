@@ -53,6 +53,8 @@ function baseFields(payload: HookPayload, state: SessionState): Partial<MemoryDo
 
 function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): string {
   const project = projectFromCwd(payload.cwd);
+  // Core memories: primordial facts the user (or Claude) marked → always injected, on top.
+  const cores = store.listCore(project).slice(0, 30);
   // Prefer LLM digests (conclusions/decisions = high signal); fall back to raw memories if none yet.
   const digests = store.recent({ project, type: 'digest', limit: cfg.contextLimit });
   const recent =
@@ -63,33 +65,45 @@ function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: Hook
   const total = store.stats().total;
   const header = `🧠 mem active — db: ${cfg.dbPath} · model: ${cfg.embed.model} · ${total} docs · vectors: ${store.vectorEnabled ? 'on' : 'off'}`;
 
-  if (recent.length === 0) {
+  if (cores.length === 0 && recent.length === 0) {
     return JSON.stringify({
       hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: header },
     });
   }
 
-  const lines: string[] = [];
-  lines.push(header);
-  lines.push('');
-  lines.push(`## Project memory "${project}"`);
-  lines.push(`Latest memories from previous sessions:`);
-  for (const d of recent) {
-    const date = (d.ts ?? '').slice(0, 10);
-    const label =
-      d.summary ||
-      d.user_prompt ||
-      d.assistant_text ||
-      (d.prompts && d.prompts[0]) ||
-      d.tool_brief ||
-      '(no summary)';
-    const files = (d.files_modified ?? []).slice(0, 3).join(', ');
-    lines.push(
-      `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` — files: ${files}` : ''}`,
-    );
+  const lines: string[] = [header, ''];
+
+  // Core memories first — these must be in context from the start.
+  if (cores.length > 0) {
+    lines.push(`## ⭐ Core memory (always-on)`);
+    for (const c of cores) {
+      const scope = c.doc.project ? `[${c.doc.project}]` : '[global]';
+      lines.push(`- ${scope} ${summarize(c.doc.summary ?? '', 240)}`);
+    }
+    lines.push('');
   }
-  lines.push('');
-  lines.push(`_Search: MCP tool \`memory_search\` or \`/memory:search\`._`);
+
+  if (recent.length > 0) {
+    lines.push(`## Project memory "${project}"`);
+    lines.push(`Latest memories from previous sessions:`);
+    for (const d of recent) {
+      const date = (d.ts ?? '').slice(0, 10);
+      const label =
+        d.summary ||
+        d.user_prompt ||
+        d.assistant_text ||
+        (d.prompts && d.prompts[0]) ||
+        d.tool_brief ||
+        '(no summary)';
+      const files = (d.files_modified ?? []).slice(0, 3).join(', ');
+      lines.push(
+        `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` — files: ${files}` : ''}`,
+      );
+    }
+    lines.push('');
+  }
+
+  lines.push(`_Search: \`memory_search\` · core: \`memory_core_add\` / \`/memory:core\`._`);
 
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
