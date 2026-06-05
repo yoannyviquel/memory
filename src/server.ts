@@ -4,44 +4,13 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { loadConfig, type MemoryConfig } from './config.js';
 import { MemoryStore } from './store.js';
 import { embedBatch, embedReady } from './embeddings.js';
 import { allTools } from './tools/index.js';
 import { log, writeStatus } from './log.js';
-
-/**
- * statusLine snippet (opt-in): reads status.json and shows a discreet presence reminder
- * "🧠 mem" (+ ⚙ during a backfill, ⏳x% during a download). Written to a stable path
- * in dataDir so the settings.json config doesn't depend on the plugin version.
- */
-function statusLineScript(dataDir: string): string {
-  const status = JSON.stringify(path.join(dataDir, 'status.json'));
-  return `import { readFileSync } from 'node:fs';
-try {
-  const s = JSON.parse(readFileSync(${status}, 'utf8'));
-  let glyph = '';
-  if (s.state === 'downloading') glyph = ' \\u23F3' + (s.progress ?? '') + '%';
-  else if (s.state === 'backfilling') glyph = ' \\u2699';
-  else if (s.state === 'loading') glyph = ' \\u2026';
-  process.stdout.write('\\uD83E\\uDDE0 mem' + glyph);
-} catch {
-  process.stdout.write('\\uD83E\\uDDE0 mem');
-}
-`;
-}
-
-function ensureStatusLineScript(dataDir: string): void {
-  try {
-    const file = path.join(dataDir, 'statusline.mjs');
-    const content = statusLineScript(dataDir);
-    if (!existsSync(file)) writeFileSync(file, content);
-  } catch {
-    /* best-effort */
-  }
-}
 
 declare const __PKG_VERSION__: string;
 const PKG_VERSION = typeof __PKG_VERSION__ !== 'undefined' ? __PKG_VERSION__ : '0.0.0-dev';
@@ -50,7 +19,6 @@ const PKG_VERSION = typeof __PKG_VERSION__ !== 'undefined' ? __PKG_VERSION__ : '
 // model download via console → redirected to stderr so as not to corrupt the protocol).
 console.log = (...args: unknown[]) => console.error('[stdout-redirected]', ...args);
 
-const BACKFILL_BATCH = 32;
 const BACKFILL_INTERVAL_MS = 60_000;
 let backfilling = false;
 
@@ -59,9 +27,13 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!(await embedReady(cfg.embed))) return;
   backfilling = true;
+  // Cadence (configurable): small batch + idle pause keeps CPU low so a tier switch doesn't peg
+  // the machine. Trade-off is a longer total backfill; docs stay searchable via BM25 throughout.
+  const batch = cfg.embed.backfillBatch;
+  const delayMs = cfg.embed.backfillDelayMs;
   try {
     for (;;) {
-      const docs = store.missingVectorDocs(BACKFILL_BATCH);
+      const docs = store.missingVectorDocs(batch);
       if (docs.length === 0) break;
       const s = store.stats();
       writeStatus(cfg.dataDir, {
@@ -77,7 +49,7 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
       for (let i = 0; i < docs.length; i++) {
         if (vectors[i]) store.setVectorByRowid(docs[i].rowid, vectors[i] as number[]);
       }
-      await new Promise((r) => setTimeout(r, 10));
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     }
   } catch {
     /* best-effort */
@@ -92,7 +64,60 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
   }
 }
 
+/**
+ * Renames the process so monitoring tools show "yoannyviquel-memory" instead of "node".
+ * On Linux/macOS process.title rewrites the cmdline (ps; top/htop/comm cap at 15 chars).
+ * Windows Task Manager and macOS Activity Monitor read the *executable name* instead, so
+ * those need the server to run from a renamed node copy — see ensureNamedBinary().
+ */
+const PROCESS_NAME = 'yoannyviquel-memory';
+
+/**
+ * Windows: make the server run under a "yoannyviquel-memory.exe" image name instead of "node.exe".
+ *
+ * This is done at server startup (not in postinstall) on purpose: Claude Code installs plugin deps
+ * with `npm install --ignore-scripts`, so postinstall never runs at install — but the MCP server is
+ * always launched, which makes startup the only reliable hook.
+ *
+ * The current process can't rename itself, so we self-heal for the NEXT launch: copy the running
+ * node binary to <pluginRoot>/bin/yoannyviquel-memory.exe and repoint .mcp.json#command at it. After
+ * the standard post-install `/reload-plugins`, the server relaunches from the renamed copy. Entirely
+ * best-effort and cosmetic: the committed command stays "node", so a failure here never blocks start.
+ */
+function ensureNamedBinary(): void {
+  if (process.platform !== 'win32') return; // Linux/macOS CLI is already covered by process.title
+  try {
+    const scriptPath = process.argv[1];
+    if (!scriptPath) return;
+    const root = path.resolve(path.dirname(scriptPath), '..'); // <root>/dist/server.js → <root>
+    const exe = path.join(root, 'bin', `${PROCESS_NAME}.exe`);
+
+    if (path.basename(process.execPath).toLowerCase() === `${PROCESS_NAME}.exe`) return; // already named
+
+    if (!existsSync(exe)) {
+      mkdirSync(path.dirname(exe), { recursive: true });
+      copyFileSync(process.execPath, exe); // ~85 MB, one-time (until node upgrades)
+    }
+
+    const mcpPath = path.join(root, '.mcp.json');
+    const desired = '${CLAUDE_PLUGIN_ROOT}/bin/' + PROCESS_NAME + '.exe';
+    const mcp = JSON.parse(readFileSync(mcpPath, 'utf8'));
+    if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
+      mcp.mcpServers.memory.command = desired;
+      writeFileSync(mcpPath, JSON.stringify(mcp, null, 2) + '\n');
+    }
+  } catch {
+    /* best-effort: cosmetic rename must never block startup */
+  }
+}
+
 async function main(): Promise<void> {
+  try {
+    process.title = PROCESS_NAME;
+  } catch {
+    /* best-effort: never block startup on a cosmetic rename */
+  }
+  ensureNamedBinary();
   const config = loadConfig();
   const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
   await store.init();
@@ -140,7 +165,6 @@ async function main(): Promise<void> {
   );
 
   // First-startup diagnostics (also captures slow model downloads).
-  ensureStatusLineScript(config.dataDir);
   log(config.dataDir, `[server] memory v${PKG_VERSION} — node ${process.version} ${process.platform}/${process.arch}`);
   log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? 'on' : 'off'}`);
   const modelDir = path.join(config.embed.cacheDir, ...config.embed.model.split('/'));

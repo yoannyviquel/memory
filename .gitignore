@@ -1,3 +1,6 @@
+# Renamed node copy created by scripts/postinstall.mjs (per-platform, ~100 MB)
+bin/
+
 # Logs
 logs
 *.log

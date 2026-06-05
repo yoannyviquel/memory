@@ -7,7 +7,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { existsSync as existsSync3, writeFileSync as writeFileSync2 } from "fs";
+import { existsSync as existsSync3, copyFileSync, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
 import path4 from "path";
 
 // src/config.ts
@@ -36,20 +36,31 @@ function loadConfig() {
     const f = file[fileKey];
     return f === void 0 || f === null ? void 0 : String(f);
   };
+  const getFileFirst = (fileKey, envKey) => {
+    const f = file[fileKey];
+    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
+    const e = process.env[envKey];
+    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
+    return void 0;
+  };
   const dbPath = get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
   const contextLimit = Number(get("MEMORY_CONTEXT_LIMIT", "contextLimit")) || 10;
-  const tier = (get("MEMORY_EMBED_TIER", "embedTier") || DEFAULT_TIER).toLowerCase();
+  const tier = (getFileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
   const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
   const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
+  const backfillBatch = Math.max(1, Number(get("MEMORY_EMBED_BACKFILL_BATCH", "embedBackfillBatch")) || 16);
+  const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
+  const coreCap = Math.max(1, Math.floor(os.cpus().length * 0.25));
+  const threads = Math.max(1, Number(get("MEMORY_EMBED_THREADS", "embedThreads")) || coreCap);
   return {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, model, dim, cacheDir, dtype, dataDir }
+    embed: { enabled, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
   };
 }
 
@@ -539,6 +550,13 @@ async function getPipe(cfg) {
       const tf = await import(mod);
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
+      const threads = Math.max(1, cfg.threads || 1);
+      try {
+        tf.env.backends.onnx.numThreads = threads;
+        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
+      } catch {
+      }
+      log(cfg.dataDir, `[embed] onnx threads capped at ${threads}`);
       const dtype = cfg.dtype || "q8";
       log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
       writeStatus(cfg.dataDir, { state: "loading", model: cfg.model, progress: void 0, file: void 0 });
@@ -561,15 +579,24 @@ async function getPipe(cfg) {
         } catch {
         }
       };
+      const session_options = { intraOpNumThreads: threads, interOpNumThreads: threads };
       let pipe;
       try {
-        pipe = await tf.pipeline("feature-extraction", cfg.model, { dtype, progress_callback });
+        pipe = await tf.pipeline("feature-extraction", cfg.model, {
+          dtype,
+          progress_callback,
+          session_options
+        });
       } catch (e) {
         log(
           cfg.dataDir,
           `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
         );
-        pipe = await tf.pipeline("feature-extraction", cfg.model, { dtype: "fp32", progress_callback });
+        pipe = await tf.pipeline("feature-extraction", cfg.model, {
+          dtype: "fp32",
+          progress_callback,
+          session_options
+        });
       }
       _pipe = pipe;
       writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
@@ -711,41 +738,19 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-function statusLineScript(dataDir) {
-  const status = JSON.stringify(path4.join(dataDir, "status.json"));
-  return `import { readFileSync } from 'node:fs';
-try {
-  const s = JSON.parse(readFileSync(${status}, 'utf8'));
-  let glyph = '';
-  if (s.state === 'downloading') glyph = ' \\u23F3' + (s.progress ?? '') + '%';
-  else if (s.state === 'backfilling') glyph = ' \\u2699';
-  else if (s.state === 'loading') glyph = ' \\u2026';
-  process.stdout.write('\\uD83E\\uDDE0 mem' + glyph);
-} catch {
-  process.stdout.write('\\uD83E\\uDDE0 mem');
-}
-`;
-}
-function ensureStatusLineScript(dataDir) {
-  try {
-    const file = path4.join(dataDir, "statusline.mjs");
-    const content = statusLineScript(dataDir);
-    if (!existsSync3(file)) writeFileSync2(file, content);
-  } catch {
-  }
-}
 var PKG_VERSION = true ? "0.1.3" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
-var BACKFILL_BATCH = 32;
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
 async function backfill(store, cfg) {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!await embedReady(cfg.embed)) return;
   backfilling = true;
+  const batch = cfg.embed.backfillBatch;
+  const delayMs = cfg.embed.backfillDelayMs;
   try {
     for (; ; ) {
-      const docs = store.missingVectorDocs(BACKFILL_BATCH);
+      const docs = store.missingVectorDocs(batch);
       if (docs.length === 0) break;
       const s = store.stats();
       writeStatus(cfg.dataDir, {
@@ -761,7 +766,7 @@ async function backfill(store, cfg) {
       for (let i = 0; i < docs.length; i++) {
         if (vectors[i]) store.setVectorByRowid(docs[i].rowid, vectors[i]);
       }
-      await new Promise((r) => setTimeout(r, 10));
+      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
     }
   } catch {
   } finally {
@@ -774,7 +779,35 @@ async function backfill(store, cfg) {
     });
   }
 }
+var PROCESS_NAME = "yoannyviquel-memory";
+function ensureNamedBinary() {
+  if (process.platform !== "win32") return;
+  try {
+    const scriptPath = process.argv[1];
+    if (!scriptPath) return;
+    const root = path4.resolve(path4.dirname(scriptPath), "..");
+    const exe = path4.join(root, "bin", `${PROCESS_NAME}.exe`);
+    if (path4.basename(process.execPath).toLowerCase() === `${PROCESS_NAME}.exe`) return;
+    if (!existsSync3(exe)) {
+      mkdirSync3(path4.dirname(exe), { recursive: true });
+      copyFileSync(process.execPath, exe);
+    }
+    const mcpPath = path4.join(root, ".mcp.json");
+    const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + PROCESS_NAME + ".exe";
+    const mcp = JSON.parse(readFileSync3(mcpPath, "utf8"));
+    if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
+      mcp.mcpServers.memory.command = desired;
+      writeFileSync2(mcpPath, JSON.stringify(mcp, null, 2) + "\n");
+    }
+  } catch {
+  }
+}
 async function main() {
+  try {
+    process.title = PROCESS_NAME;
+  } catch {
+  }
+  ensureNamedBinary();
   const config = loadConfig();
   const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
   await store.init();
@@ -817,7 +850,6 @@ async function main() {
     `memory v${PKG_VERSION} ready (stdio) \u2192 ${config.dbPath} | vectors: ${store.vectorEnabled ? "on" : "off"}
 `
   );
-  ensureStatusLineScript(config.dataDir);
   log(config.dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
   log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? "on" : "off"}`);
   const modelDir = path4.join(config.embed.cacheDir, ...config.embed.model.split("/"));

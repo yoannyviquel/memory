@@ -31,20 +31,31 @@ function loadConfig() {
     const f = file[fileKey];
     return f === void 0 || f === null ? void 0 : String(f);
   };
+  const getFileFirst = (fileKey, envKey) => {
+    const f = file[fileKey];
+    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
+    const e = process.env[envKey];
+    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
+    return void 0;
+  };
   const dbPath = get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
   const contextLimit = Number(get("MEMORY_CONTEXT_LIMIT", "contextLimit")) || 10;
-  const tier = (get("MEMORY_EMBED_TIER", "embedTier") || DEFAULT_TIER).toLowerCase();
+  const tier = (getFileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
   const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
   const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
+  const backfillBatch = Math.max(1, Number(get("MEMORY_EMBED_BACKFILL_BATCH", "embedBackfillBatch")) || 16);
+  const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
+  const coreCap = Math.max(1, Math.floor(os.cpus().length * 0.25));
+  const threads = Math.max(1, Number(get("MEMORY_EMBED_THREADS", "embedThreads")) || coreCap);
   return {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, model, dim, cacheDir, dtype, dataDir }
+    embed: { enabled, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
   };
 }
 
@@ -537,6 +548,13 @@ async function getPipe(cfg) {
       const tf = await import(mod);
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
+      const threads = Math.max(1, cfg.threads || 1);
+      try {
+        tf.env.backends.onnx.numThreads = threads;
+        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
+      } catch {
+      }
+      log(cfg.dataDir, `[embed] onnx threads capped at ${threads}`);
       const dtype = cfg.dtype || "q8";
       log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
       writeStatus(cfg.dataDir, { state: "loading", model: cfg.model, progress: void 0, file: void 0 });
@@ -559,15 +577,24 @@ async function getPipe(cfg) {
         } catch {
         }
       };
+      const session_options = { intraOpNumThreads: threads, interOpNumThreads: threads };
       let pipe;
       try {
-        pipe = await tf.pipeline("feature-extraction", cfg.model, { dtype, progress_callback });
+        pipe = await tf.pipeline("feature-extraction", cfg.model, {
+          dtype,
+          progress_callback,
+          session_options
+        });
       } catch (e) {
         log(
           cfg.dataDir,
           `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
         );
-        pipe = await tf.pipeline("feature-extraction", cfg.model, { dtype: "fp32", progress_callback });
+        pipe = await tf.pipeline("feature-extraction", cfg.model, {
+          dtype: "fp32",
+          progress_callback,
+          session_options
+        });
       }
       _pipe = pipe;
       writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });

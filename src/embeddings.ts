@@ -7,6 +7,12 @@ export interface EmbedConfig {
   cacheDir: string;
   /** ONNX precision: 'q8' (quantized, default, ~4× lighter) or 'fp32' (full precision). */
   dtype: string;
+  /** Background re-vectorization cadence — docs embedded per batch (smaller = lower CPU peaks). */
+  backfillBatch: number;
+  /** Background re-vectorization cadence — idle pause between batches in ms (larger = lower avg CPU). */
+  backfillDelayMs: number;
+  /** ONNX intra-op thread cap (larger = faster but higher CPU peak). Caps the per-batch burst. */
+  threads: number;
   /** Data root (logs + status.json), to log the model loading. */
   dataDir: string;
 }
@@ -36,6 +42,16 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
       const tf: any = await import(mod);
       tf.env.cacheDir = cfg.cacheDir;
       tf.env.allowRemoteModels = true;
+      // Cap ONNX threads so a backfill batch doesn't peg every core. Both backends covered:
+      // onnxruntime-node reads `onnx.numThreads`; wasm reads `onnx.wasm.numThreads`.
+      const threads = Math.max(1, cfg.threads || 1);
+      try {
+        tf.env.backends.onnx.numThreads = threads;
+        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
+      } catch {
+        /* best-effort: older builds may not expose the backend tree */
+      }
+      log(cfg.dataDir, `[embed] onnx threads capped at ${threads}`);
 
       const dtype = cfg.dtype || 'q8';
       log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
@@ -63,16 +79,26 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
         }
       };
 
+      // session_options: onnxruntime-node honors intra/inter-op thread counts per session.
+      const session_options = { intraOpNumThreads: threads, interOpNumThreads: threads };
       let pipe: any;
       try {
-        pipe = await tf.pipeline('feature-extraction', cfg.model, { dtype, progress_callback });
+        pipe = await tf.pipeline('feature-extraction', cfg.model, {
+          dtype,
+          progress_callback,
+          session_options,
+        });
       } catch (e) {
         // The tier doesn't necessarily expose the quantized variant → fall back to full precision.
         log(
           cfg.dataDir,
           `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`,
         );
-        pipe = await tf.pipeline('feature-extraction', cfg.model, { dtype: 'fp32', progress_callback });
+        pipe = await tf.pipeline('feature-extraction', cfg.model, {
+          dtype: 'fp32',
+          progress_callback,
+          session_options,
+        });
       }
       _pipe = pipe;
       writeStatus(cfg.dataDir, { state: 'idle', progress: undefined, file: undefined });

@@ -30,9 +30,8 @@ Steps:
      cleared and **re-vectorized in the background** (documents stay searchable via BM25 in the meantime);
    - the new model is downloaded once, in q8 (~120 to 560 MB depending on the tier). The
      download happens **in the background** by the MCP server (non-blocking); its progress
-     is traced in `~/.claude-memory/logs/memory.log` and reflected in `status.json`
-     (visible via the status line `🧠 mem ⏳x%`).
+     is traced in `~/.claude-memory/logs/memory.log` and reflected in `~/.claude-memory/status.json`.
 
-Advanced override: system environment variables `MEMORY_EMBED_TIER`, or `MEMORY_EMBED_MODEL` +
-`MEMORY_EMBED_DIM` (take precedence over the file).
+Note: the tier from `config.json` (written by this command) takes precedence over the install-time
+`${user_config.embedTier}` env. Hard override: `MEMORY_EMBED_MODEL` + `MEMORY_EMBED_DIM`.
 </content>

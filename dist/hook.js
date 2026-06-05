@@ -26,20 +26,31 @@ function loadConfig() {
     const f = file[fileKey];
     return f === void 0 || f === null ? void 0 : String(f);
   };
+  const getFileFirst = (fileKey, envKey) => {
+    const f = file[fileKey];
+    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
+    const e = process.env[envKey];
+    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
+    return void 0;
+  };
   const dbPath = get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
   const contextLimit = Number(get("MEMORY_CONTEXT_LIMIT", "contextLimit")) || 10;
-  const tier = (get("MEMORY_EMBED_TIER", "embedTier") || DEFAULT_TIER).toLowerCase();
+  const tier = (getFileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
   const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
   const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
+  const backfillBatch = Math.max(1, Number(get("MEMORY_EMBED_BACKFILL_BATCH", "embedBackfillBatch")) || 16);
+  const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
+  const coreCap = Math.max(1, Math.floor(os.cpus().length * 0.25));
+  const threads = Math.max(1, Number(get("MEMORY_EMBED_THREADS", "embedThreads")) || coreCap);
   return {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, model, dim, cacheDir, dtype, dataDir }
+    embed: { enabled, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
   };
 }
 
