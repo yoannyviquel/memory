@@ -110,20 +110,17 @@ peak *and* steady), which is the only lever that affects both.
 
 ### Model tiers (multilingual)
 
-Five multilingual tiers (e5 family + bge-m3 + Qwen3), via `/memory:config <tier>` or the
+Three multilingual tiers (e5 family), via `/memory:config <tier>` or the
 `~/.claude-memory/config.json` file (`{"embedTier":"medium"}`):
 
 | Tier | Model | Dim | Pooling | Size (q8) | Use |
 |---|---|---|---|---|---|
-| `light` (default) | `Xenova/multilingual-e5-small` | 384 | mean | ~120 MB | fast |
-| `medium` | `Xenova/multilingual-e5-base` | 768 | mean | ~280 MB | best trade-off |
+| `light` (default) | `Xenova/multilingual-e5-small` | 384 | mean | ~120 MB | fast, low resource |
+| `medium` | `Xenova/multilingual-e5-base` | 768 | mean | ~280 MB | best trade-off (recommended) |
 | `heavy` | `Xenova/multilingual-e5-large` | 1024 | mean | ~560 MB | high quality |
-| `ultra` | `Xenova/bge-m3` (XLM-R) | 1024 | cls | ~600 MB | strongest, stable |
-| `xultra` | `onnx-community/Qwen3-Embedding-0.6B-ONNX` | 1024 | last_token | ~600 MB+ | top quality, experimental |
 
-`ultra`/`xultra` are heavier (higher RAM + load spike). `xultra` (Qwen3) uses last-token pooling and
-a **query-side instruction prefix** (documents embedded raw) — applied automatically; it's newer and
-marked experimental (fall back to `ultra` if it misbehaves).
+For a personal, hybrid-with-BM25 memory base, **medium** is the sweet spot — a heavier bi-encoder
+brings little on a small corpus. Precision is better gained with a **reranker** than a bigger embedder.
 
 Models are loaded in **q8 (quantized)** by default: ~4× lighter to download than fp32, for a
 negligible quality loss in semantic search. Force full precision:

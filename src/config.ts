@@ -37,11 +37,10 @@ export const DIGEST_VERSION = 1;
 export const EMBED_TEXT_VERSION = 1;
 
 /**
- * Multilingual embedding tiers. Each sets model + dimension + pooling (+ optional query prefix for
- * instruction-tuned models). light/medium/heavy = e5 family (mean pooling); ultra = bge-m3 (XLM-R,
- * CLS pooling); xultra = Qwen3-Embedding-0.6B (last-token pooling + a query-side instruction prefix).
+ * Multilingual embedding tiers (e5 family, mean pooling). For a personal, hybrid-with-BM25 memory
+ * base, e5 is the sweet spot — bigger bi-encoders are overkill; precision is better gained with a
+ * reranker than a heavier embedder. (`pooling`/`queryPrefix` stay generic in case a future model needs them.)
  */
-const QWEN_QUERY_PREFIX = 'Instruct: Given a search query, retrieve relevant past memories.\nQuery:';
 export const EMBED_TIERS: Record<
   string,
   { model: string; dim: number; pooling: string; queryPrefix?: string }
@@ -49,13 +48,6 @@ export const EMBED_TIERS: Record<
   light: { model: 'Xenova/multilingual-e5-small', dim: 384, pooling: 'mean' },
   medium: { model: 'Xenova/multilingual-e5-base', dim: 768, pooling: 'mean' },
   heavy: { model: 'Xenova/multilingual-e5-large', dim: 1024, pooling: 'mean' },
-  ultra: { model: 'Xenova/bge-m3', dim: 1024, pooling: 'cls' },
-  xultra: {
-    model: 'onnx-community/Qwen3-Embedding-0.6B-ONNX',
-    dim: 1024,
-    pooling: 'last_token',
-    queryPrefix: QWEN_QUERY_PREFIX,
-  },
 };
 const DEFAULT_TIER = 'light';
 
@@ -115,15 +107,9 @@ export function loadConfig(): MemoryConfig {
   const dtype = (get('MEMORY_EMBED_DTYPE', 'embedDtype') || 'q8').toLowerCase();
   // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
   // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
-  // medium=50%, heavy=75%, ultra=100% of the cores. Floor of 1 so single/dual-core hosts still run.
+  // medium=50%, heavy=75% of the cores. Floor of 1 so single/dual-core hosts still run.
   // Single source of truth: the tier (no separate override knob).
-  const threadFraction: Record<string, number> = {
-    light: 0.25,
-    medium: 0.5,
-    heavy: 0.75,
-    ultra: 1,
-    xultra: 1,
-  };
+  const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
