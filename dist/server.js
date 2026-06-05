@@ -10,13 +10,13 @@ import {
 import {
   existsSync as existsSync4,
   copyFileSync,
-  mkdirSync as mkdirSync3,
-  readFileSync as readFileSync4,
-  writeFileSync as writeFileSync2,
+  mkdirSync as mkdirSync4,
+  readFileSync as readFileSync5,
+  writeFileSync as writeFileSync3,
   readdirSync,
   unlinkSync
 } from "fs";
-import path6 from "path";
+import path7 from "path";
 
 // src/config.ts
 import os from "os";
@@ -962,9 +962,45 @@ async function digestSession(input) {
   };
 }
 
-// src/memory.ts
-import { readFileSync as readFileSync3 } from "fs";
+// src/leader.ts
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3 } from "fs";
 import path5 from "path";
+var STALE_MS = 15e4;
+function lockPath(dataDir) {
+  return path5.join(dataDir, "worker.lock");
+}
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
+  }
+}
+function refreshLeadership(dataDir) {
+  const file = lockPath(dataDir);
+  const now = Date.now();
+  let cur = null;
+  try {
+    cur = JSON.parse(readFileSync3(file, "utf8"));
+  } catch {
+  }
+  if (cur && cur.pid !== process.pid) {
+    const fresh = typeof cur.ts === "number" && now - cur.ts < STALE_MS;
+    if (fresh && typeof cur.pid === "number" && pidAlive(cur.pid)) return false;
+  }
+  try {
+    mkdirSync3(path5.dirname(file), { recursive: true });
+    writeFileSync2(file, JSON.stringify({ pid: process.pid, ts: now }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/memory.ts
+import { readFileSync as readFileSync4 } from "fs";
+import path6 from "path";
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
@@ -1145,10 +1181,12 @@ var deleteTools = [memoryDelete];
 var allTools = [...searchTools, ...reindexTools, ...deleteTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.3.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.3.1" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
+var HEARTBEAT_MS = 3e4;
 var backfilling = false;
+var amLeader = false;
 async function backfill(store, cfg) {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!await embedReady(cfg.embed)) return;
@@ -1250,30 +1288,30 @@ function ensureNamedBinary(name) {
   try {
     const scriptPath = process.argv[1];
     if (!scriptPath) return;
-    const root = path6.resolve(path6.dirname(scriptPath), "..");
-    const binDir = path6.join(root, "bin");
-    const exe = path6.join(binDir, `${name}.exe`);
-    if (path6.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
+    const root = path7.resolve(path7.dirname(scriptPath), "..");
+    const binDir = path7.join(root, "bin");
+    const exe = path7.join(binDir, `${name}.exe`);
+    if (path7.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
     if (!existsSync4(exe)) {
-      mkdirSync3(binDir, { recursive: true });
+      mkdirSync4(binDir, { recursive: true });
       copyFileSync(process.execPath, exe);
     }
     try {
-      const running = path6.basename(process.execPath).toLowerCase();
+      const running = path7.basename(process.execPath).toLowerCase();
       for (const f of readdirSync(binDir)) {
         const low = f.toLowerCase();
         if (low.startsWith("yoannyviquel_memory_") && low.endsWith(".exe") && low !== `${name}.exe` && low !== running) {
-          unlinkSync(path6.join(binDir, f));
+          unlinkSync(path7.join(binDir, f));
         }
       }
     } catch {
     }
-    const mcpPath = path6.join(root, ".mcp.json");
+    const mcpPath = path7.join(root, ".mcp.json");
     const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + name + ".exe";
-    const mcp = JSON.parse(readFileSync4(mcpPath, "utf8"));
+    const mcp = JSON.parse(readFileSync5(mcpPath, "utf8"));
     if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
       mcp.mcpServers.memory.command = desired;
-      writeFileSync2(mcpPath, JSON.stringify(mcp, null, 2) + "\n");
+      writeFileSync3(mcpPath, JSON.stringify(mcp, null, 2) + "\n");
     }
   } catch {
   }
@@ -1335,7 +1373,7 @@ async function main() {
   log(config.dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
   log(config.dataDir, `[server] exec=${process.execPath}`);
   log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? "on" : "off"}`);
-  const modelDir = path6.join(config.embed.cacheDir, ...config.embed.model.split("/"));
+  const modelDir = path7.join(config.embed.cacheDir, ...config.embed.model.split("/"));
   log(config.dataDir, `[server] model cache: ${existsSync4(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);
   writeStatus(config.dataDir, {
     state: "idle",
@@ -1343,14 +1381,28 @@ async function main() {
     vectorized: store.stats().vectorCount,
     missing: store.countMissingVectors()
   });
+  amLeader = refreshLeadership(config.dataDir);
+  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
+  const heartbeat = setInterval(() => {
+    const was = amLeader;
+    amLeader = refreshLeadership(config.dataDir);
+    if (amLeader !== was) log(config.dataDir, `[server] leadership \u2192 ${amLeader}`);
+  }, HEARTBEAT_MS);
+  heartbeat.unref?.();
   if (store.vectorEnabled && config.embed.enabled) {
-    void backfill(store, config);
-    const timer = setInterval(() => void backfill(store, config), BACKFILL_INTERVAL_MS);
+    const tick = () => {
+      if (amLeader) void backfill(store, config);
+    };
+    tick();
+    const timer = setInterval(tick, BACKFILL_INTERVAL_MS);
     timer.unref?.();
   }
   if (config.digest.enabled) {
-    void digestPending(store, config);
-    const timer = setInterval(() => void digestPending(store, config), BACKFILL_INTERVAL_MS);
+    const tick = () => {
+      if (amLeader) void digestPending(store, config);
+    };
+    tick();
+    const timer = setInterval(tick, BACKFILL_INTERVAL_MS);
     timer.unref?.();
   }
 }

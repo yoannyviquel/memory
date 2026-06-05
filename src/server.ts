@@ -18,6 +18,7 @@ import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
 import { MemoryStore, type MemoryDoc } from './store.js';
 import { embed, embedReady } from './embeddings.js';
 import { digestSession, claudeAvailable } from './digest.js';
+import { refreshLeadership } from './leader.js';
 import { nowIso, uniq } from './memory.js';
 import { allTools } from './tools/index.js';
 import { log, writeStatus } from './log.js';
@@ -30,7 +31,10 @@ const PKG_VERSION = typeof __PKG_VERSION__ !== 'undefined' ? __PKG_VERSION__ : '
 console.log = (...args: unknown[]) => console.error('[stdout-redirected]', ...args);
 
 const BACKFILL_INTERVAL_MS = 60_000;
+const HEARTBEAT_MS = 30_000;
 let backfilling = false;
+// Only the elected leader runs the heavy background work; updated by the heartbeat below.
+let amLeader = false;
 
 /** Vectorizes in the background the docs captured by the hooks (which don't bundle the model). */
 async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
@@ -283,17 +287,35 @@ async function main(): Promise<void> {
     missing: store.countMissingVectors(),
   });
 
-  // Background vectorization (non-blocking): at startup then periodically.
+  // Leader election: one server instance (across all open sessions) owns the heavy background work,
+  // so N sessions don't each load the model nor each run redundant digests. Heartbeat renews the
+  // lease; a non-leader takes over within ~STALE_MS if the leader dies.
+  amLeader = refreshLeadership(config.dataDir);
+  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
+  const heartbeat = setInterval(() => {
+    const was = amLeader;
+    amLeader = refreshLeadership(config.dataDir);
+    if (amLeader !== was) log(config.dataDir, `[server] leadership → ${amLeader}`);
+  }, HEARTBEAT_MS);
+  heartbeat.unref?.();
+
+  // Background vectorization (leader-only, non-blocking): at startup then periodically.
   if (store.vectorEnabled && config.embed.enabled) {
-    void backfill(store, config);
-    const timer = setInterval(() => void backfill(store, config), BACKFILL_INTERVAL_MS);
+    const tick = () => {
+      if (amLeader) void backfill(store, config);
+    };
+    tick();
+    const timer = setInterval(tick, BACKFILL_INTERVAL_MS);
     timer.unref?.();
   }
 
-  // Background LLM digests (non-blocking): at startup then periodically. Drip-limited per tick.
+  // Background LLM digests (leader-only, non-blocking): at startup then periodically. Drip-limited.
   if (config.digest.enabled) {
-    void digestPending(store, config);
-    const timer = setInterval(() => void digestPending(store, config), BACKFILL_INTERVAL_MS);
+    const tick = () => {
+      if (amLeader) void digestPending(store, config);
+    };
+    tick();
+    const timer = setInterval(tick, BACKFILL_INTERVAL_MS);
     timer.unref?.();
   }
 }

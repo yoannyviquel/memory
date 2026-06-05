@@ -73,6 +73,14 @@ in the background (at startup then every 60 s), vectorizes the pending documents
 the model is loaded only once, in that process. Observations (tool calls, mostly identifiers)
 are not vectorized: BM25 is enough for them.
 
+**Multiple sessions (leader election).** Each open Claude Code session spawns its own MCP server
+process (stdio transport). To avoid N servers each loading the model (~hundreds of MB) and each
+running redundant backfill/digest loops (which would multiply the digest quota cost), the servers
+elect a single **leader** via a lock file (`<dataDir>/worker.lock`, pid + heartbeat). Only the
+leader runs the model load + backfill + digest loops. Non-leaders stay light and load the model
+**lazily** — only if you actually run a semantic search in that session. If the leader exits, a
+non-leader takes over within ~150 s.
+
 ### Model tiers (multilingual)
 
 Three tiers, **e5** family (multilingual, good in French), via `/memory:config <tier>` or the
