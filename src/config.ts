@@ -75,11 +75,10 @@ export function loadConfig(): MemoryConfig {
   // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
   // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
   // medium=50%, heavy=75% of the cores. Floor of 1 so single/dual-core hosts still run.
-  // Overridable via env/file (MEMORY_EMBED_THREADS / embedThreads) for power users.
+  // Single source of truth: the tier (no separate override knob).
   const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
-  const coreCap = Math.max(1, Math.floor(os.cpus().length * fraction));
-  const threads = Math.max(1, Number(get('MEMORY_EMBED_THREADS', 'embedThreads')) || coreCap);
+  const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
   return {
     dbPath,

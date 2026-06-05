@@ -64,8 +64,7 @@ function loadConfig() {
   const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
   const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
-  const coreCap = Math.max(1, Math.floor(os.cpus().length * fraction));
-  const threads = Math.max(1, Number(get("MEMORY_EMBED_THREADS", "embedThreads")) || coreCap);
+  const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   return {
     dbPath,
     dataDir,
@@ -748,7 +747,7 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.9" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.10" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;

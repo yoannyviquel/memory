@@ -51,8 +51,7 @@ function loadConfig() {
   const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
   const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
-  const coreCap = Math.max(1, Math.floor(os.cpus().length * fraction));
-  const threads = Math.max(1, Number(get("MEMORY_EMBED_THREADS", "embedThreads")) || coreCap);
+  const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   return {
     dbPath,
     dataDir,
