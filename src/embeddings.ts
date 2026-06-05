@@ -132,6 +132,11 @@ export async function embedReady(cfg: EmbedConfig): Promise<boolean> {
   return !!(await getPipe(cfg));
 }
 
+/** True if the model is ALREADY loaded — never triggers a (blocking) load. For status reporting. */
+export function embedLoaded(): boolean {
+  return _pipe !== null;
+}
+
 export async function embed(text: string, cfg: EmbedConfig): Promise<number[] | null> {
   const r = await embedBatch([text], cfg);
   return r[0] ?? null;

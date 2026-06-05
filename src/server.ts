@@ -271,6 +271,7 @@ async function main(): Promise<void> {
 
   // First-startup diagnostics (also captures slow model downloads).
   log(config.dataDir, `[server] memory v${PKG_VERSION} — node ${process.version} ${process.platform}/${process.arch}`);
+  log(config.dataDir, `[server] exec=${process.execPath}`); // reveals whether we run as node or the renamed exe
   log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? 'on' : 'off'}`);
   const modelDir = path.join(config.embed.cacheDir, ...config.embed.model.split('/'));
   log(config.dataDir, `[server] model cache: ${existsSync(modelDir) ? 'present' : 'absent → download on first use'} (${modelDir})`);

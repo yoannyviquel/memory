@@ -734,6 +734,9 @@ async function getPipe(cfg) {
 async function embedReady(cfg) {
   return !!await getPipe(cfg);
 }
+function embedLoaded() {
+  return _pipe !== null;
+}
 async function embed(text, cfg) {
   const r = await embedBatch([text], cfg);
   return r[0] ?? null;
@@ -1019,7 +1022,7 @@ var memoryStats = {
   handler: async (_args, { store, embedCfg }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
-    const embedderUp = embedCfg.enabled && s.vectorEnabled ? await embedReady(embedCfg) : false;
+    const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedLoaded() : false;
     const lines = [];
     lines.push(`**memory \u2014 state**`);
     lines.push(`- SQLite database: \`${s.dbPath}\``);
@@ -1078,7 +1081,7 @@ var reindexTools = [memoryReindex];
 var allTools = [...searchTools, ...reindexTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.2.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.2.1" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -1265,6 +1268,7 @@ async function main() {
 `
   );
   log(config.dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
+  log(config.dataDir, `[server] exec=${process.execPath}`);
   log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? "on" : "off"}`);
   const modelDir = path6.join(config.embed.cacheDir, ...config.embed.model.split("/"));
   log(config.dataDir, `[server] model cache: ${existsSync4(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);

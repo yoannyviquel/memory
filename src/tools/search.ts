@@ -1,6 +1,6 @@
 import type { ToolDefinition } from './types.js';
 import type { MemoryDoc, MemoryType } from '../store.js';
-import { embed, embedReady } from '../embeddings.js';
+import { embed, embedLoaded } from '../embeddings.js';
 
 const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
 
@@ -88,7 +88,9 @@ const memoryStats: ToolDefinition = {
   handler: async (_args, { store, embedCfg }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
-    const embedderUp = embedCfg.enabled && s.vectorEnabled ? await embedReady(embedCfg) : false;
+    // Report state WITHOUT forcing a model load — embedReady() would block on a heavy-tier load
+    // and make /memory:status unresponsive exactly while the model is initializing.
+    const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedLoaded() : false;
     const lines: string[] = [];
     lines.push(`**memory — state**`);
     lines.push(`- SQLite database: \`${s.dbPath}\``);
