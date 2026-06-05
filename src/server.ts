@@ -16,7 +16,7 @@ import {
 import path from 'node:path';
 import { loadConfig, type MemoryConfig } from './config.js';
 import { MemoryStore } from './store.js';
-import { embedBatch, embedReady } from './embeddings.js';
+import { embed, embedReady } from './embeddings.js';
 import { allTools } from './tools/index.js';
 import { log, writeStatus } from './log.js';
 
@@ -35,29 +35,21 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!(await embedReady(cfg.embed))) return;
   backfilling = true;
-  // Cadence (configurable): small batch + idle pause keeps CPU low so a tier switch doesn't peg
-  // the machine. Trade-off is a longer total backfill; docs stay searchable via BM25 throughout.
-  const batch = cfg.embed.backfillBatch;
-  const delayMs = cfg.embed.backfillDelayMs;
+  // One doc at a time, no inter-doc delay: CPU is bounded solely by the tier's ONNX thread cap.
+  // Docs stay searchable via BM25 while their vectors are still being filled in.
   try {
     for (;;) {
-      const docs = store.missingVectorDocs(batch);
+      const docs = store.missingVectorDocs(1);
       if (docs.length === 0) break;
-      const s = store.stats();
+      const doc = docs[0];
       writeStatus(cfg.dataDir, {
         state: 'backfilling',
         model: cfg.embed.model,
-        vectorized: s.vectorCount,
+        vectorized: store.stats().vectorCount,
         missing: store.countMissingVectors(),
       });
-      const vectors = await embedBatch(
-        docs.map((d) => d.text),
-        cfg.embed,
-      );
-      for (let i = 0; i < docs.length; i++) {
-        if (vectors[i]) store.setVectorByRowid(docs[i].rowid, vectors[i] as number[]);
-      }
-      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      const vector = await embed(doc.text, cfg.embed);
+      if (vector) store.setVectorByRowid(doc.rowid, vector);
     }
   } catch {
     /* best-effort */

@@ -9,11 +9,7 @@ export interface EmbedConfig {
   cacheDir: string;
   /** ONNX precision: 'q8' (quantized, default, ~4× lighter) or 'fp32' (full precision). */
   dtype: string;
-  /** Background re-vectorization cadence — docs embedded per batch (smaller = lower CPU peaks). */
-  backfillBatch: number;
-  /** Background re-vectorization cadence — idle pause between batches in ms (larger = lower avg CPU). */
-  backfillDelayMs: number;
-  /** ONNX intra-op thread cap (larger = faster but higher CPU peak). Caps the per-batch burst. */
+  /** ONNX intra-op thread cap. Backfill embeds one doc at a time, so this alone bounds CPU. */
   threads: number;
   /** Data root (logs + status.json), to log the model loading. */
   dataDir: string;

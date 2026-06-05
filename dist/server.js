@@ -60,8 +60,6 @@ function loadConfig() {
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
-  const backfillBatch = Math.max(1, Number(get("MEMORY_EMBED_BACKFILL_BATCH", "embedBackfillBatch")) || 16);
-  const backfillDelayMs = Math.max(0, Number(get("MEMORY_EMBED_BACKFILL_DELAY_MS", "embedBackfillDelayMs")) || 250);
   const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
@@ -69,7 +67,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
+    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir }
   };
 }
 
@@ -747,7 +745,7 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.10" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.11" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -755,27 +753,19 @@ async function backfill(store, cfg) {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!await embedReady(cfg.embed)) return;
   backfilling = true;
-  const batch = cfg.embed.backfillBatch;
-  const delayMs = cfg.embed.backfillDelayMs;
   try {
     for (; ; ) {
-      const docs = store.missingVectorDocs(batch);
+      const docs = store.missingVectorDocs(1);
       if (docs.length === 0) break;
-      const s = store.stats();
+      const doc = docs[0];
       writeStatus(cfg.dataDir, {
         state: "backfilling",
         model: cfg.embed.model,
-        vectorized: s.vectorCount,
+        vectorized: store.stats().vectorCount,
         missing: store.countMissingVectors()
       });
-      const vectors = await embedBatch(
-        docs.map((d) => d.text),
-        cfg.embed
-      );
-      for (let i = 0; i < docs.length; i++) {
-        if (vectors[i]) store.setVectorByRowid(docs[i].rowid, vectors[i]);
-      }
-      if (delayMs > 0) await new Promise((r) => setTimeout(r, delayMs));
+      const vector = await embed(doc.text, cfg.embed);
+      if (vector) store.setVectorByRowid(doc.rowid, vector);
     }
   } catch {
   } finally {

@@ -67,11 +67,6 @@ export function loadConfig(): MemoryConfig {
   const cacheDir = get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
   // Quantized by default: ~4× lighter to download, negligible quality loss in retrieval.
   const dtype = (get('MEMORY_EMBED_DTYPE', 'embedDtype') || 'q8').toLowerCase();
-  // Backfill cadence: throttles the background re-vectorization that runs after a tier switch.
-  // Smaller batch + larger delay → lower CPU (gentler on the machine), at the cost of a longer
-  // total backfill. Defaults are deliberately mild so a tier switch doesn't peg the CPU.
-  const backfillBatch = Math.max(1, Number(get('MEMORY_EMBED_BACKFILL_BATCH', 'embedBackfillBatch')) || 16);
-  const backfillDelayMs = Math.max(0, Number(get('MEMORY_EMBED_BACKFILL_DELAY_MS', 'embedBackfillDelayMs')) || 250);
   // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
   // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
   // medium=50%, heavy=75% of the cores. Floor of 1 so single/dual-core hosts still run.
@@ -84,6 +79,6 @@ export function loadConfig(): MemoryConfig {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, threads, dataDir },
   };
 }
