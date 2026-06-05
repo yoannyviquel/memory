@@ -734,7 +734,7 @@ function ensureStatusLineScript(dataDir) {
   } catch {
   }
 }
-var PKG_VERSION = true ? "0.1.2" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.3" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_BATCH = 32;
 var BACKFILL_INTERVAL_MS = 6e4;
