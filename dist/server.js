@@ -7,7 +7,15 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
-import { existsSync as existsSync3, copyFileSync, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
+import {
+  existsSync as existsSync3,
+  copyFileSync,
+  mkdirSync as mkdirSync3,
+  readFileSync as readFileSync3,
+  writeFileSync as writeFileSync2,
+  readdirSync,
+  unlinkSync
+} from "fs";
 import path4 from "path";
 
 // src/config.ts
@@ -60,7 +68,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
+    embed: { enabled, tier, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
   };
 }
 
@@ -738,7 +746,7 @@ var searchTools = [memorySearch, memoryRecent, memoryStats];
 var allTools = [...searchTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.1.7" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.1.8" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var backfilling = false;
@@ -779,21 +787,35 @@ async function backfill(store, cfg) {
     });
   }
 }
-var PROCESS_NAME = "claude-code_yoannyviquel_memory";
-function ensureNamedBinary() {
+function processName(tier) {
+  const safe = (tier || "light").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return `yoannyviquel_memory_${safe}`;
+}
+function ensureNamedBinary(name) {
   if (process.platform !== "win32") return;
   try {
     const scriptPath = process.argv[1];
     if (!scriptPath) return;
     const root = path4.resolve(path4.dirname(scriptPath), "..");
-    const exe = path4.join(root, "bin", `${PROCESS_NAME}.exe`);
-    if (path4.basename(process.execPath).toLowerCase() === `${PROCESS_NAME}.exe`) return;
+    const binDir = path4.join(root, "bin");
+    const exe = path4.join(binDir, `${name}.exe`);
+    if (path4.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
     if (!existsSync3(exe)) {
-      mkdirSync3(path4.dirname(exe), { recursive: true });
+      mkdirSync3(binDir, { recursive: true });
       copyFileSync(process.execPath, exe);
     }
+    try {
+      const running = path4.basename(process.execPath).toLowerCase();
+      for (const f of readdirSync(binDir)) {
+        const low = f.toLowerCase();
+        if (low.startsWith("yoannyviquel_memory_") && low.endsWith(".exe") && low !== `${name}.exe` && low !== running) {
+          unlinkSync(path4.join(binDir, f));
+        }
+      }
+    } catch {
+    }
     const mcpPath = path4.join(root, ".mcp.json");
-    const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + PROCESS_NAME + ".exe";
+    const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + name + ".exe";
     const mcp = JSON.parse(readFileSync3(mcpPath, "utf8"));
     if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
       mcp.mcpServers.memory.command = desired;
@@ -803,12 +825,13 @@ function ensureNamedBinary() {
   }
 }
 async function main() {
+  const config = loadConfig();
+  const name = processName(config.embed.tier);
   try {
-    process.title = PROCESS_NAME;
+    process.title = name;
   } catch {
   }
-  ensureNamedBinary();
-  const config = loadConfig();
+  ensureNamedBinary(name);
   const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model);
   await store.init();
   const ctx = { store, embedCfg: config.embed };
@@ -817,8 +840,8 @@ async function main() {
     { capabilities: { tools: {} } }
   );
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: allTools.map(({ name, description, inputSchema }) => ({
-      name,
+    tools: allTools.map(({ name: name2, description, inputSchema }) => ({
+      name: name2,
       description,
       inputSchema
     }))

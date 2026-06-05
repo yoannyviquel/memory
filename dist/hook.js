@@ -50,7 +50,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
+    embed: { enabled, tier, model, dim, cacheDir, dtype, backfillBatch, backfillDelayMs, threads, dataDir }
   };
 }
 

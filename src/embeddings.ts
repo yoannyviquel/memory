@@ -2,6 +2,8 @@ import { log, writeStatus } from './log.js';
 
 export interface EmbedConfig {
   enabled: boolean;
+  /** Tier label (light | medium | heavy) — drives the process name suffix. */
+  tier: string;
   model: string;
   dim: number;
   cacheDir: string;
