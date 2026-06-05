@@ -1255,7 +1255,7 @@ var deleteTools = [memoryDelete];
 var allTools = [...searchTools, ...reindexTools, ...deleteTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.3.2" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.3.3" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1481,7 +1481,13 @@ async function main() {
         myEmbedPort = 0;
       }
     }
-    if (amLeader !== was) log(config.dataDir, `[server] leadership \u2192 ${amLeader}`);
+    if (amLeader !== was) {
+      log(config.dataDir, `[server] leadership \u2192 ${amLeader}`);
+      if (amLeader) {
+        if (store.vectorEnabled && config.embed.enabled) void backfill(store, config);
+        if (config.digest.enabled) void digestPending(store, config);
+      }
+    }
   };
   await syncLeadership();
   log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);

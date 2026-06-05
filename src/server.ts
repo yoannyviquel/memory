@@ -324,7 +324,15 @@ async function main(): Promise<void> {
         myEmbedPort = 0;
       }
     }
-    if (amLeader !== was) log(config.dataDir, `[server] leadership → ${amLeader}`);
+    if (amLeader !== was) {
+      log(config.dataDir, `[server] leadership → ${amLeader}`);
+      if (amLeader) {
+        // Just took leadership (startup or failover) → warm the model and drain now, instead of
+        // waiting up to a full interval. Keeps the embed service ready for the other sessions.
+        if (store.vectorEnabled && config.embed.enabled) void backfill(store, config);
+        if (config.digest.enabled) void digestPending(store, config);
+      }
+    }
   };
   await syncLeadership();
   log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
