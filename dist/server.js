@@ -26,11 +26,18 @@ import { readFileSync } from "fs";
 var DEFAULT_DIGEST_MODEL = "haiku";
 var DIGEST_VERSION = 1;
 var EMBED_TEXT_VERSION = 1;
+var QWEN_QUERY_PREFIX = "Instruct: Given a search query, retrieve relevant past memories.\nQuery:";
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384, pooling: "mean" },
   medium: { model: "Xenova/multilingual-e5-base", dim: 768, pooling: "mean" },
   heavy: { model: "Xenova/multilingual-e5-large", dim: 1024, pooling: "mean" },
-  ultra: { model: "Xenova/bge-m3", dim: 1024, pooling: "cls" }
+  ultra: { model: "Xenova/bge-m3", dim: 1024, pooling: "cls" },
+  xultra: {
+    model: "onnx-community/Qwen3-Embedding-0.6B-ONNX",
+    dim: 1024,
+    pooling: "last_token",
+    queryPrefix: QWEN_QUERY_PREFIX
+  }
 };
 var DEFAULT_TIER = "light";
 function readConfigFile(dataDir) {
@@ -63,10 +70,17 @@ function loadConfig() {
   const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
   const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
   const pooling = (get("MEMORY_EMBED_POOLING", "embedPooling") || picked.pooling || "mean").toLowerCase();
+  const queryPrefix = get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
   const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
-  const threadFraction = { light: 0.25, medium: 0.5, heavy: 0.75, ultra: 1 };
+  const threadFraction = {
+    light: 0.25,
+    medium: 0.5,
+    heavy: 0.75,
+    ultra: 1,
+    xultra: 1
+  };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
   const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
@@ -75,7 +89,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION }
   };
 }
@@ -815,17 +829,19 @@ async function embedReady(cfg) {
 function embedLoaded() {
   return _pipe !== null;
 }
-async function embed(text, cfg) {
-  const r = await embedBatch([text], cfg);
+var POOLINGS = /* @__PURE__ */ new Set(["mean", "cls", "last_token"]);
+async function embed(text, cfg, isQuery = false) {
+  const r = await embedBatch([text], cfg, isQuery);
   return r[0] ?? null;
 }
-async function embedBatch(texts, cfg) {
+async function embedBatch(texts, cfg, isQuery = false) {
   if (!cfg.enabled || texts.length === 0) return texts.map(() => null);
   const pipe = await getPipe(cfg);
   if (!pipe) return texts.map(() => null);
   try {
-    const pooling = cfg.pooling === "cls" ? "cls" : "mean";
-    const out = await pipe(texts, { pooling, normalize: true });
+    const inputs = isQuery && cfg.queryPrefix ? texts.map((t) => `${cfg.queryPrefix}${t}`) : texts;
+    const pooling = POOLINGS.has(cfg.pooling) ? cfg.pooling : "mean";
+    const out = await pipe(inputs, { pooling, normalize: true });
     const arr = out.tolist();
     return texts.map((_, i) => Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null);
   } catch {
@@ -1074,7 +1090,7 @@ async function startEmbedServer(cfg, token) {
     req.on("end", async () => {
       try {
         const { text } = JSON.parse(body);
-        const vector = await embed(String(text ?? ""), cfg);
+        const vector = await embed(String(text ?? ""), cfg, true);
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ vector }));
       } catch {
@@ -1418,7 +1434,7 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.5.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.6.0" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1572,7 +1588,7 @@ async function main() {
   await store.init();
   const embedQuery = async (text) => {
     if (!config.embed.enabled || !store.vectorEnabled) return null;
-    if (amLeader) return embed(text, config.embed);
+    if (amLeader) return embed(text, config.embed, true);
     const lock = readLock(config.dataDir);
     if (lock?.port && lock?.token) {
       const v = await remoteEmbed({ port: lock.port, token: lock.token }, text);

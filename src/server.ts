@@ -243,7 +243,7 @@ async function main(): Promise<void> {
   // unreachable (e.g. mid-failover) → null → the search degrades to BM25-only.
   const embedQuery = async (text: string): Promise<number[] | null> => {
     if (!config.embed.enabled || !store.vectorEnabled) return null;
-    if (amLeader) return embed(text, config.embed);
+    if (amLeader) return embed(text, config.embed, true); // true = query (prefix for instruct models)
     const lock = readLock(config.dataDir);
     if (lock?.port && lock?.token) {
       const v = await remoteEmbed({ port: lock.port, token: lock.token }, text);

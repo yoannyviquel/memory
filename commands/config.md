@@ -5,24 +5,25 @@ description: Configure the embedding model tier (light / medium / heavy)
 
 # Config memory — embedding tier
 
-Selects the semantic embedding model. Four multilingual tiers:
+Selects the semantic embedding model. Five multilingual tiers:
 
 | Tier | Model | Dim | Size (q8) | Use |
 |---|---|---|---|---|
 | `light` | multilingual-e5-small | 384 | ~120 MB | default, fast |
 | `medium` | multilingual-e5-base | 768 | ~280 MB | best FR trade-off |
 | `heavy` | multilingual-e5-large | 1024 | ~560 MB | high quality |
-| `ultra` | bge-m3 (XLM-R, CLS pooling) | 1024 | ~600 MB | strongest, heaviest |
+| `ultra` | bge-m3 (XLM-R, CLS pooling) | 1024 | ~600 MB | strongest, stable |
+| `xultra` | Qwen3-Embedding-0.6B (last-token + query prefix) | 1024 | ~600 MB+ | top quality, experimental |
 
 > Models are loaded in **q8 (quantized)** by default: ~4× lighter to download
 > than fp32, for a negligible quality loss in semantic search. Force full
 > precision: `MEMORY_EMBED_DTYPE=fp32` (or `embedDtype` in `config.json`).
 
-User argument: `$ARGUMENTS` (expected: `light`, `medium`, `heavy`, `ultra`, or empty to show the state).
+User argument: `$ARGUMENTS` (expected: `light`, `medium`, `heavy`, `ultra`, `xultra`, or empty to show the state).
 
 Steps:
 1. If `$ARGUMENTS` is empty: call `memory_stats` and report the current model/tier + the 3 options.
-2. If `$ARGUMENTS` ∈ {light, medium, heavy, ultra}: write/merge the file `~/.claude-memory/config.json`
+2. If `$ARGUMENTS` ∈ {light, medium, heavy, ultra, xultra}: write/merge the file `~/.claude-memory/config.json`
    (real path: `$USERPROFILE/.claude-memory/config.json`) with `{"embedTier":"<value>"}` —
    preserving any other keys.
 3. Warn the user:

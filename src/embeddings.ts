@@ -9,8 +9,10 @@ export interface EmbedConfig {
   cacheDir: string;
   /** ONNX precision: 'q8' (quantized, default, ~4× lighter) or 'fp32' (full precision). */
   dtype: string;
-  /** Pooling strategy: 'mean' (e5 family) or 'cls' (bge family). Must match the model. */
+  /** Pooling strategy: 'mean' (e5), 'cls' (bge), or 'last_token' (Qwen3-Embedding). Must match the model. */
   pooling: string;
+  /** Instruction prefix prepended to QUERIES only (instruction-tuned models like Qwen3). '' = none. */
+  queryPrefix: string;
   /** ONNX intra-op thread cap. Backfill embeds one doc at a time, so this alone bounds CPU. */
   threads: number;
   /** Data root (logs + status.json), to log the model loading. */
@@ -139,22 +141,36 @@ export function embedLoaded(): boolean {
   return _pipe !== null;
 }
 
-export async function embed(text: string, cfg: EmbedConfig): Promise<number[] | null> {
-  const r = await embedBatch([text], cfg);
+const POOLINGS = new Set(['mean', 'cls', 'last_token']);
+
+/**
+ * Embeds one text. `isQuery` matters for instruction-tuned models (e.g. Qwen3-Embedding) that want
+ * a query-side prefix; documents are embedded raw. No-op for models without a queryPrefix.
+ */
+export async function embed(
+  text: string,
+  cfg: EmbedConfig,
+  isQuery = false,
+): Promise<number[] | null> {
+  const r = await embedBatch([text], cfg, isQuery);
   return r[0] ?? null;
 }
 
-/** Batch embeddings (mean pooling + L2 normalization). null per entry on failure. */
+/** Batch embeddings (pooling per model + L2 normalization). null per entry on failure. */
 export async function embedBatch(
   texts: string[],
   cfg: EmbedConfig,
+  isQuery = false,
 ): Promise<Array<number[] | null>> {
   if (!cfg.enabled || texts.length === 0) return texts.map(() => null);
   const pipe = await getPipe(cfg);
   if (!pipe) return texts.map(() => null);
   try {
-    const pooling = cfg.pooling === 'cls' ? 'cls' : 'mean';
-    const out = await pipe(texts, { pooling, normalize: true });
+    // Instruction-tuned models: prefix queries only (documents stay raw).
+    const inputs =
+      isQuery && cfg.queryPrefix ? texts.map((t) => `${cfg.queryPrefix}${t}`) : texts;
+    const pooling = POOLINGS.has(cfg.pooling) ? cfg.pooling : 'mean';
+    const out = await pipe(inputs, { pooling, normalize: true });
     const arr: number[][] = out.tolist();
     return texts.map((_, i) => (Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null));
   } catch {

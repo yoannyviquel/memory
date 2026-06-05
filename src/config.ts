@@ -37,14 +37,25 @@ export const DIGEST_VERSION = 1;
 export const EMBED_TEXT_VERSION = 1;
 
 /**
- * Multilingual embedding tiers. Each sets a model + dimension + pooling. light/medium/heavy are the
- * e5 family (mean pooling); ultra is bge-m3 (XLM-R based, CLS pooling) — the strongest local option.
+ * Multilingual embedding tiers. Each sets model + dimension + pooling (+ optional query prefix for
+ * instruction-tuned models). light/medium/heavy = e5 family (mean pooling); ultra = bge-m3 (XLM-R,
+ * CLS pooling); xultra = Qwen3-Embedding-0.6B (last-token pooling + a query-side instruction prefix).
  */
-export const EMBED_TIERS: Record<string, { model: string; dim: number; pooling: string }> = {
+const QWEN_QUERY_PREFIX = 'Instruct: Given a search query, retrieve relevant past memories.\nQuery:';
+export const EMBED_TIERS: Record<
+  string,
+  { model: string; dim: number; pooling: string; queryPrefix?: string }
+> = {
   light: { model: 'Xenova/multilingual-e5-small', dim: 384, pooling: 'mean' },
   medium: { model: 'Xenova/multilingual-e5-base', dim: 768, pooling: 'mean' },
   heavy: { model: 'Xenova/multilingual-e5-large', dim: 1024, pooling: 'mean' },
   ultra: { model: 'Xenova/bge-m3', dim: 1024, pooling: 'cls' },
+  xultra: {
+    model: 'onnx-community/Qwen3-Embedding-0.6B-ONNX',
+    dim: 1024,
+    pooling: 'last_token',
+    queryPrefix: QWEN_QUERY_PREFIX,
+  },
 };
 const DEFAULT_TIER = 'light';
 
@@ -96,6 +107,8 @@ export function loadConfig(): MemoryConfig {
   // Pooling must match the model (e5 = mean, bge = cls). Follows the tier; overridable if a custom
   // model is forced via MEMORY_EMBED_MODEL.
   const pooling = (get('MEMORY_EMBED_POOLING', 'embedPooling') || picked.pooling || 'mean').toLowerCase();
+  // Query-side instruction prefix (instruction-tuned models, e.g. Qwen3). Applied to queries only.
+  const queryPrefix = get('MEMORY_EMBED_QUERY_PREFIX', 'embedQueryPrefix') ?? picked.queryPrefix ?? '';
   const enabled = get('MEMORY_EMBED_ENABLED', 'embedEnabled') !== '0';
   const cacheDir = get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
   // Quantized by default: ~4× lighter to download, negligible quality loss in retrieval.
@@ -104,7 +117,13 @@ export function loadConfig(): MemoryConfig {
   // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
   // medium=50%, heavy=75%, ultra=100% of the cores. Floor of 1 so single/dual-core hosts still run.
   // Single source of truth: the tier (no separate override knob).
-  const threadFraction: Record<string, number> = { light: 0.25, medium: 0.5, heavy: 0.75, ultra: 1 };
+  const threadFraction: Record<string, number> = {
+    light: 0.25,
+    medium: 0.5,
+    heavy: 0.75,
+    ultra: 1,
+    xultra: 1,
+  };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
 
@@ -117,7 +136,7 @@ export function loadConfig(): MemoryConfig {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
   };
 }

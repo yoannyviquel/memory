@@ -23,7 +23,8 @@ export async function startEmbedServer(cfg: EmbedConfig, token: string): Promise
     req.on('end', async () => {
       try {
         const { text } = JSON.parse(body);
-        const vector = await embed(String(text ?? ''), cfg);
+        // The loopback service only ever embeds QUERIES (followers' searches) → isQuery = true.
+        const vector = await embed(String(text ?? ''), cfg, true);
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ vector }));
       } catch {
