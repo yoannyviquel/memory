@@ -977,26 +977,100 @@ function pidAlive(pid) {
     return e?.code === "EPERM";
   }
 }
-function refreshLeadership(dataDir) {
+function readLock(dataDir) {
+  try {
+    return JSON.parse(readFileSync3(lockPath(dataDir), "utf8"));
+  } catch {
+    return null;
+  }
+}
+function refreshLeadership(dataDir, extra) {
   const file = lockPath(dataDir);
   const now = Date.now();
-  let cur = null;
-  try {
-    cur = JSON.parse(readFileSync3(file, "utf8"));
-  } catch {
-  }
+  const cur = readLock(dataDir);
   if (cur && cur.pid !== process.pid) {
     const fresh = typeof cur.ts === "number" && now - cur.ts < STALE_MS;
     if (fresh && typeof cur.pid === "number" && pidAlive(cur.pid)) return false;
   }
   try {
     mkdirSync3(path5.dirname(file), { recursive: true });
-    writeFileSync2(file, JSON.stringify({ pid: process.pid, ts: now }));
+    writeFileSync2(file, JSON.stringify({ pid: process.pid, ts: now, ...extra ?? {} }));
     return true;
   } catch {
     return false;
   }
 }
+
+// src/embed-service.ts
+import { createServer, request as httpRequest } from "http";
+var TOKEN_HEADER = "x-mem-token";
+async function startEmbedServer(cfg, token) {
+  const server = createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/embed" || req.headers[TOKEN_HEADER] !== token) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    let body = "";
+    req.on("data", (c) => body += c);
+    req.on("end", async () => {
+      try {
+        const { text } = JSON.parse(body);
+        const vector = await embed(String(text ?? ""), cfg);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ vector }));
+      } catch {
+        res.writeHead(500);
+        res.end();
+      }
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+  server.unref?.();
+  return port;
+}
+function remoteEmbed(endpoint, text, timeoutMs = 5e3) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ text });
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port: endpoint.port,
+        method: "POST",
+        path: "/embed",
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(body),
+          [TOKEN_HEADER]: endpoint.token
+        }
+      },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => d += c);
+        res.on("end", () => {
+          try {
+            const j = JSON.parse(d);
+            resolve(Array.isArray(j.vector) ? j.vector : null);
+          } catch {
+            resolve(null);
+          }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+// src/server.ts
+import { randomBytes } from "crypto";
 
 // src/memory.ts
 import { readFileSync as readFileSync4 } from "fs";
@@ -1038,10 +1112,10 @@ var memorySearch = {
     required: ["query"],
     additionalProperties: false
   },
-  handler: async (args, { store, embedCfg }) => {
+  handler: async (args, { store, embedQuery }) => {
     const query = String(args.query ?? "").trim();
     if (!query) return "\u274C `query` is required.";
-    const embedding = store.vectorEnabled ? await embed(query, embedCfg) : null;
+    const embedding = store.vectorEnabled ? await embedQuery(query) : null;
     const docs = store.search({
       query,
       project: args.project ? String(args.project) : void 0,
@@ -1181,12 +1255,14 @@ var deleteTools = [memoryDelete];
 var allTools = [...searchTools, ...reindexTools, ...deleteTools];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.3.1" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.3.2" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
 var backfilling = false;
 var amLeader = false;
+var myEmbedPort = 0;
+var myEmbedToken = "";
 async function backfill(store, cfg) {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!await embedReady(cfg.embed)) return;
@@ -1331,7 +1407,17 @@ async function main() {
     EMBED_TEXT_VERSION
   );
   await store.init();
-  const ctx = { store, embedCfg: config.embed, config };
+  const embedQuery = async (text) => {
+    if (!config.embed.enabled || !store.vectorEnabled) return null;
+    if (amLeader) return embed(text, config.embed);
+    const lock = readLock(config.dataDir);
+    if (lock?.port && lock?.token) {
+      const v = await remoteEmbed({ port: lock.port, token: lock.token }, text);
+      if (v) return v;
+    }
+    return null;
+  };
+  const ctx = { store, embedCfg: config.embed, config, embedQuery };
   const server = new Server(
     { name: "memory", version: PKG_VERSION },
     { capabilities: { tools: {} } }
@@ -1381,13 +1467,25 @@ async function main() {
     vectorized: store.stats().vectorCount,
     missing: store.countMissingVectors()
   });
-  amLeader = refreshLeadership(config.dataDir);
-  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
-  const heartbeat = setInterval(() => {
+  const leaderExtra = () => myEmbedPort ? { port: myEmbedPort, token: myEmbedToken } : {};
+  const syncLeadership = async () => {
     const was = amLeader;
-    amLeader = refreshLeadership(config.dataDir);
+    amLeader = refreshLeadership(config.dataDir, leaderExtra());
+    if (amLeader && !myEmbedPort && store.vectorEnabled && config.embed.enabled) {
+      myEmbedToken = randomBytes(16).toString("hex");
+      try {
+        myEmbedPort = await startEmbedServer(config.embed, myEmbedToken);
+        refreshLeadership(config.dataDir, leaderExtra());
+        log(config.dataDir, `[server] embed service on 127.0.0.1:${myEmbedPort}`);
+      } catch {
+        myEmbedPort = 0;
+      }
+    }
     if (amLeader !== was) log(config.dataDir, `[server] leadership \u2192 ${amLeader}`);
-  }, HEARTBEAT_MS);
+  };
+  await syncLeadership();
+  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
+  const heartbeat = setInterval(() => void syncLeadership(), HEARTBEAT_MS);
   heartbeat.unref?.();
   if (store.vectorEnabled && config.embed.enabled) {
     const tick = () => {

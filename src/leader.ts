@@ -34,22 +34,34 @@ function pidAlive(pid: number): boolean {
  * Safe to call repeatedly (heartbeat). A tiny race (two leaders for one cycle) is harmless:
  * digest/backfill writes are idempotent on mem_id.
  */
-export function refreshLeadership(dataDir: string): boolean {
+export interface LockInfo {
+  pid?: number;
+  ts?: number;
+  /** Leader's loopback embedding endpoint (published so non-leaders can route query embeddings). */
+  port?: number;
+  token?: string;
+}
+
+/** Reads the current lock (for non-leaders to find the leader's embedding endpoint). */
+export function readLock(dataDir: string): LockInfo | null {
+  try {
+    return JSON.parse(readFileSync(lockPath(dataDir), 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function refreshLeadership(dataDir: string, extra?: Record<string, unknown>): boolean {
   const file = lockPath(dataDir);
   const now = Date.now();
-  let cur: { pid?: number; ts?: number } | null = null;
-  try {
-    cur = JSON.parse(readFileSync(file, 'utf8'));
-  } catch {
-    /* absent / unreadable → free to take */
-  }
+  const cur = readLock(dataDir);
   if (cur && cur.pid !== process.pid) {
     const fresh = typeof cur.ts === 'number' && now - cur.ts < STALE_MS;
     if (fresh && typeof cur.pid === 'number' && pidAlive(cur.pid)) return false; // someone else leads
   }
   try {
     mkdirSync(path.dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify({ pid: process.pid, ts: now }));
+    writeFileSync(file, JSON.stringify({ pid: process.pid, ts: now, ...(extra ?? {}) }));
     return true;
   } catch {
     return false;

@@ -13,6 +13,8 @@ export interface ToolContext {
   store: MemoryStore;
   embedCfg: EmbedConfig;
   config: MemoryConfig;
+  /** Embeds a search query — locally if leader, else via the leader's loopback service (null → BM25). */
+  embedQuery: (text: string) => Promise<number[] | null>;
 }
 
 export interface ToolDefinition<TArgs = Record<string, unknown>> {

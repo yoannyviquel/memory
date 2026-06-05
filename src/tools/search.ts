@@ -1,6 +1,6 @@
 import type { ToolDefinition } from './types.js';
 import type { MemoryDoc, MemoryType } from '../store.js';
-import { embed, embedLoaded } from '../embeddings.js';
+import { embedLoaded } from '../embeddings.js';
 
 const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
 
@@ -38,11 +38,11 @@ const memorySearch: ToolDefinition = {
     required: ['query'],
     additionalProperties: false,
   },
-  handler: async (args, { store, embedCfg }) => {
+  handler: async (args, { store, embedQuery }) => {
     const query = String(args.query ?? '').trim();
     if (!query) return '❌ `query` is required.';
-    // Query embedding (null if model unavailable → BM25 only).
-    const embedding = store.vectorEnabled ? await embed(query, embedCfg) : null;
+    // Query embedding routed via the leader (null → BM25 only). Never loads a model in this process.
+    const embedding = store.vectorEnabled ? await embedQuery(query) : null;
     const docs = store.search({
       query,
       project: args.project ? String(args.project) : undefined,

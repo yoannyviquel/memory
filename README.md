@@ -73,13 +73,16 @@ in the background (at startup then every 60 s), vectorizes the pending documents
 the model is loaded only once, in that process. Observations (tool calls, mostly identifiers)
 are not vectorized: BM25 is enough for them.
 
-**Multiple sessions (leader election).** Each open Claude Code session spawns its own MCP server
-process (stdio transport). To avoid N servers each loading the model (~hundreds of MB) and each
-running redundant backfill/digest loops (which would multiply the digest quota cost), the servers
-elect a single **leader** via a lock file (`<dataDir>/worker.lock`, pid + heartbeat). Only the
-leader runs the model load + backfill + digest loops. Non-leaders stay light and load the model
-**lazily** — only if you actually run a semantic search in that session. If the leader exits, a
-non-leader takes over within ~150 s.
+**Multiple sessions (leader election + shared model).** Each open Claude Code session spawns its own
+MCP server process (stdio transport). To avoid N servers each loading the model (~hundreds of MB) and
+each running redundant backfill/digest loops (which would multiply the digest quota cost), the servers
+elect a single **leader** via a lock file (`<dataDir>/worker.lock`, pid + heartbeat). Only the leader
+loads the model and runs backfill/digest. The leader also exposes a tiny **loopback embedding service**
+(`127.0.0.1`, token from the lock file); non-leaders route their **query embedding** to it, so they do
+hybrid search with full semantics **without ever loading their own model**. KNN/BM25/RRF still run in
+each session against the shared DB — only the query→vector step is delegated. Net: **one model in RAM
+total**, regardless of how many sessions are open. If the leader exits, a non-leader takes over within
+~150 s and starts its own service; while no leader is reachable, search degrades to BM25-only.
 
 ### Model tiers (multilingual)
 

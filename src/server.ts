@@ -18,7 +18,9 @@ import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
 import { MemoryStore, type MemoryDoc } from './store.js';
 import { embed, embedReady } from './embeddings.js';
 import { digestSession, claudeAvailable } from './digest.js';
-import { refreshLeadership } from './leader.js';
+import { refreshLeadership, readLock } from './leader.js';
+import { startEmbedServer, remoteEmbed } from './embed-service.js';
+import { randomBytes } from 'node:crypto';
 import { nowIso, uniq } from './memory.js';
 import { allTools } from './tools/index.js';
 import { log, writeStatus } from './log.js';
@@ -35,6 +37,9 @@ const HEARTBEAT_MS = 30_000;
 let backfilling = false;
 // Only the elected leader runs the heavy background work; updated by the heartbeat below.
 let amLeader = false;
+// Leader's loopback embedding endpoint (set once we become leader and start the service).
+let myEmbedPort = 0;
+let myEmbedToken = '';
 
 /** Vectorizes in the background the docs captured by the hooks (which don't bundle the model). */
 async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
@@ -231,7 +236,21 @@ async function main(): Promise<void> {
     EMBED_TEXT_VERSION,
   );
   await store.init();
-  const ctx = { store, embedCfg: config.embed, config };
+
+  // Query embedding for search: the leader embeds locally (it holds the model); a non-leader routes
+  // to the leader's loopback service so it never loads its own copy of the model. If the leader is
+  // unreachable (e.g. mid-failover) → null → the search degrades to BM25-only.
+  const embedQuery = async (text: string): Promise<number[] | null> => {
+    if (!config.embed.enabled || !store.vectorEnabled) return null;
+    if (amLeader) return embed(text, config.embed);
+    const lock = readLock(config.dataDir);
+    if (lock?.port && lock?.token) {
+      const v = await remoteEmbed({ port: lock.port, token: lock.token }, text);
+      if (v) return v;
+    }
+    return null;
+  };
+  const ctx = { store, embedCfg: config.embed, config, embedQuery };
 
   const server = new Server(
     { name: 'memory', version: PKG_VERSION },
@@ -287,16 +306,29 @@ async function main(): Promise<void> {
     missing: store.countMissingVectors(),
   });
 
-  // Leader election: one server instance (across all open sessions) owns the heavy background work,
-  // so N sessions don't each load the model nor each run redundant digests. Heartbeat renews the
-  // lease; a non-leader takes over within ~STALE_MS if the leader dies.
-  amLeader = refreshLeadership(config.dataDir);
-  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
-  const heartbeat = setInterval(() => {
+  // Leader election: one server instance (across all open sessions) owns the heavy background work
+  // AND the single loaded model, exposed to the others via a loopback embedding service. Heartbeat
+  // renews the lease + republishes the endpoint; a non-leader takes over within ~STALE_MS if the
+  // leader dies (and then starts its own service).
+  const leaderExtra = () => (myEmbedPort ? { port: myEmbedPort, token: myEmbedToken } : {});
+  const syncLeadership = async (): Promise<void> => {
     const was = amLeader;
-    amLeader = refreshLeadership(config.dataDir);
+    amLeader = refreshLeadership(config.dataDir, leaderExtra());
+    if (amLeader && !myEmbedPort && store.vectorEnabled && config.embed.enabled) {
+      myEmbedToken = randomBytes(16).toString('hex');
+      try {
+        myEmbedPort = await startEmbedServer(config.embed, myEmbedToken);
+        refreshLeadership(config.dataDir, leaderExtra()); // publish the endpoint
+        log(config.dataDir, `[server] embed service on 127.0.0.1:${myEmbedPort}`);
+      } catch {
+        myEmbedPort = 0;
+      }
+    }
     if (amLeader !== was) log(config.dataDir, `[server] leadership → ${amLeader}`);
-  }, HEARTBEAT_MS);
+  };
+  await syncLeadership();
+  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
+  const heartbeat = setInterval(() => void syncLeadership(), HEARTBEAT_MS);
   heartbeat.unref?.();
 
   // Background vectorization (leader-only, non-blocking): at startup then periodically.
