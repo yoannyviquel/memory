@@ -256,3 +256,54 @@ test('2.3 claude-mem migration', { timeout: 240_000 }, async () => {
     cleanup(dataDir);
   }
 });
+
+// 2.4 — Auto-recall: the UserPromptSubmit hook injects the relevant memory into the prompt context.
+// The recall query is a paraphrase with NO shared token, so a hit can only come from the hybrid path
+// (hook embeds the query via the leader's loopback service) — proving lever B end-to-end.
+test('2.4 auto-recall injects relevant memory into the prompt', { timeout: 240_000 }, async () => {
+  const dataDir = freshDataDir();
+  const env = baseEnv(dataDir); // auto-recall is ON by default; embed enabled (light)
+  const cwd = path.join(dataDir, 'proj24');
+  let srv;
+  try {
+    await runHook(
+      'prompt',
+      {
+        session_id: 't24a',
+        prompt: 'Le déploiement en production utilise la pipeline Azure DevOps tous les vendredis',
+        cwd,
+      },
+      env,
+    );
+    srv = await startServer(env); // leader: vectorizes the doc + serves the loopback embed
+
+    // Wait until the doc is vectorized (leader semantic search returns it).
+    await pollUntil(
+      async () => {
+        const r = await call(srv.client, 'memory_search', { query: 'publier le logiciel en ligne' });
+        return /DevOps|production|vendredis/.test(r) ? r : null;
+      },
+      { timeoutMs: VECTO_TIMEOUT, stepMs: 1000, label: 'doc vectorized' },
+    );
+
+    // A NEW session sends a paraphrase prompt → the prompt hook must inject the memory via auto-recall
+    // (BM25 can't match — no shared token — so success proves the hook→leader hybrid embed path).
+    const ctx = await pollUntil(
+      async () => {
+        const o = await runHook(
+          'prompt',
+          { session_id: 't24b', prompt: 'comment publier le logiciel en ligne chaque fin de semaine ?', cwd },
+          env,
+        );
+        const c = o?.hookSpecificOutput?.additionalContext ?? '';
+        return /DevOps|production|vendredis/.test(c) ? c : null;
+      },
+      { timeoutMs: 30_000, stepMs: 1500, label: 'auto-recall injects the memory' },
+    );
+    assert.match(ctx, /DevOps|production|vendredis/, 'auto-recall injected the relevant memory into the prompt');
+    assert.match(ctx, /Related memories/, 'injection carries the auto-recall header');
+  } finally {
+    await srv?.close();
+    cleanup(dataDir);
+  }
+});

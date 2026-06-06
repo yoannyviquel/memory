@@ -96,13 +96,16 @@ function loadConfig() {
   const digestModel = src.get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
   const rerankModel = src.get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
   const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
+  const autoRecallEnabled = src.flag("MEMORY_AUTO_RECALL", "autoRecall");
+  const autoRecallLimit = src.num("MEMORY_AUTO_RECALL_LIMIT", "autoRecallLimit", 3);
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
-    rerank: { enabled: rerankEnabled, model: rerankModel }
+    rerank: { enabled: rerankEnabled, model: rerankModel },
+    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit }
   };
 }
 
@@ -186,6 +189,7 @@ function jsonArr(v) {
 }
 function rowToDoc(r) {
   return {
+    id: r.mem_id ?? void 0,
     type: r.type,
     session_id: r.session_id ?? void 0,
     project: r.project ?? void 0,

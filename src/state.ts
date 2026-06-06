@@ -16,6 +16,8 @@ export interface SessionState {
   branch?: string;
   cwd?: string;
   startedAt: string;
+  /** mem_ids already injected into this session's context (SessionStart + auto-recall) → dedup. */
+  injected: string[];
 }
 
 function defaultState(): SessionState {
@@ -29,6 +31,7 @@ function defaultState(): SessionState {
     filesRead: [],
     tools: [],
     startedAt: new Date().toISOString(),
+    injected: [],
   };
 }
 

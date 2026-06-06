@@ -20,6 +20,12 @@ Selects the semantic embedding model. Three multilingual tiers (e5 family):
 > **GPU (opt-in)**: `MEMORY_EMBED_DEVICE` / `embedDevice` runs the embedder + reranker on the GPU —
 > `dml` (Windows), `coreml` (macOS M), `cuda` (Linux NVIDIA), or `auto`. Default CPU; falls back to
 > CPU automatically if the device can't run. See the README "GPU acceleration" section.
+>
+> **Auto-recall (on by default)**: on every prompt the `UserPromptSubmit` hook injects the top
+> relevant memories into context so recall is systematic (not left to the model calling
+> `memory_search`). Bounded + deduped per session to avoid context bloat. Tune with
+> `MEMORY_AUTO_RECALL=0` (off) and `MEMORY_AUTO_RECALL_LIMIT` (max injected per prompt, default 3),
+> or the `autoRecall` / `autoRecallLimit` keys in `config.json`.
 
 User argument: `$ARGUMENTS` (expected: `light`, `medium`, `heavy`, or empty to show the state).
 

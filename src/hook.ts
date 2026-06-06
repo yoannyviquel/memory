@@ -11,6 +11,8 @@ import {
   nowIso,
   uniq,
 } from './memory.js';
+import { readLock } from './leader.js';
+import { remoteEmbed } from './embed-service.js';
 
 interface HookPayload {
   session_id?: string;
@@ -47,9 +49,39 @@ function baseFields(payload: HookPayload, state: SessionState): Partial<MemoryDo
   };
 }
 
-// The hooks are ephemeral processes → NO embedding here (loading a model on every hook
-// would be too slow). Capture is BM25-only; vectorization is done in the background by
-// the persistent MCP server (backfill).
+// The hooks are ephemeral processes → NO local embedding here (loading a model on every hook would
+// be too slow). Capture is BM25-only; vectorization is done in the background by the persistent MCP
+// server (backfill). Auto-recall (handlePrompt) embeds the QUERY via the leader's loopback service.
+
+// Standing instruction (lever A): injected every session so the model treats memory recall as a
+// first step, not an afterthought. The auto-injected memories below (and per-prompt) cover the
+// passive case; this nudges the model to dig deeper with the tool when it matters.
+const RECALL_DIRECTIVE =
+  '> 💡 This project has persistent memory. Before answering about past work, decisions, bugs, or files here, consider `memory_search`. Relevant memories are auto-injected below and on each prompt.';
+
+/** One compact line for an injected memory (SessionStart + auto-recall share this format). */
+function memoryLine(d: MemoryDoc): string {
+  const date = (d.ts ?? '').slice(0, 10);
+  const label =
+    d.summary ||
+    d.user_prompt ||
+    d.assistant_text ||
+    (d.prompts && d.prompts[0]) ||
+    d.tool_brief ||
+    '(no summary)';
+  const files = (d.files_modified ?? []).slice(0, 3).join(', ');
+  return `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` — files: ${files}` : ''}`;
+}
+
+/** Best-effort query embedding via the leader's loopback service (short timeout; null → BM25-only). */
+async function leaderEmbed(cfg: MemoryConfig, text: string): Promise<number[] | null> {
+  if (!cfg.embed.enabled) return null;
+  const lock = readLock(cfg.dataDir);
+  if (lock?.port && lock?.token) {
+    return remoteEmbed({ port: lock.port, token: lock.token }, text, 1500);
+  }
+  return null;
+}
 
 function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): string {
   const project = projectFromCwd(payload.cwd);
@@ -60,57 +92,46 @@ function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: Hook
   const recent =
     digests.length > 0 ? digests : store.recent({ project, limit: cfg.contextLimit });
 
+  // Seed the per-session dedup set with what we inject now, so auto-recall never repeats it.
+  if (payload.session_id) {
+    const st = loadState(cfg, payload.session_id);
+    st.injected = uniq([
+      ...st.injected,
+      ...cores.map((c) => c.id),
+      ...recent.map((d) => d.id).filter((x): x is string => !!x),
+    ]);
+    saveState(cfg, payload.session_id, st);
+  }
+
   // Presence header: reminds that the plugin is active and uses a little resource
   // (background indexing). stdio transport → no URL/port to expose.
   const total = store.stats().total;
   const header = `🧠 mem active — db: ${cfg.dbPath} · model: ${cfg.embed.model} · ${total} docs · vectors: ${store.vectorEnabled ? 'on' : 'off'}`;
 
-  if (cores.length === 0 && recent.length === 0) {
-    return JSON.stringify({
-      hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: header },
-    });
-  }
-
-  const lines: string[] = [header, ''];
+  const lines: string[] = [header, '', RECALL_DIRECTIVE];
 
   // Core memories first — these must be in context from the start.
   if (cores.length > 0) {
-    lines.push(`## ⭐ Core memory (always-on)`);
+    lines.push('', `## ⭐ Core memory (always-on)`);
     for (const c of cores) {
       const scope = c.doc.project ? `[${c.doc.project}]` : '[global]';
       lines.push(`- ${scope} ${summarize(c.doc.summary ?? '', 240)}`);
     }
-    lines.push('');
   }
 
   if (recent.length > 0) {
-    lines.push(`## Project memory "${project}"`);
-    lines.push(`Latest memories from previous sessions:`);
-    for (const d of recent) {
-      const date = (d.ts ?? '').slice(0, 10);
-      const label =
-        d.summary ||
-        d.user_prompt ||
-        d.assistant_text ||
-        (d.prompts && d.prompts[0]) ||
-        d.tool_brief ||
-        '(no summary)';
-      const files = (d.files_modified ?? []).slice(0, 3).join(', ');
-      lines.push(
-        `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` — files: ${files}` : ''}`,
-      );
-    }
-    lines.push('');
+    lines.push('', `## Project memory "${project}"`, `Latest memories from previous sessions:`);
+    for (const d of recent) lines.push(memoryLine(d));
   }
 
-  lines.push(`_Search: \`memory_search\` · core: \`memory_core_add\` / \`/memory:core\`._`);
+  lines.push('', `_Search: \`memory_search\` · core: \`memory_core_add\` / \`/memory:core\`._`);
 
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n') },
   });
 }
 
-function handlePrompt(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): string {
+async function handlePrompt(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): Promise<string> {
   if (!payload.session_id || !payload.prompt) return CONTINUE;
   const state = loadState(cfg, payload.session_id);
   state.project = projectFromCwd(payload.cwd);
@@ -119,6 +140,7 @@ function handlePrompt(cfg: MemoryConfig, store: MemoryStore, payload: HookPayloa
   state.promptNumber += 1;
   state.prompts.push(payload.prompt.slice(0, 4000));
 
+  const promptId = `${payload.session_id}:prompt:${state.promptNumber}`;
   const doc: MemoryDoc = {
     type: 'prompt',
     ...baseFields(payload, state),
@@ -126,9 +148,60 @@ function handlePrompt(cfg: MemoryConfig, store: MemoryStore, payload: HookPayloa
     user_prompt: payload.prompt.slice(0, 4000),
     summary: summarize(payload.prompt),
   };
-  store.upsert(`${payload.session_id}:prompt:${state.promptNumber}`, doc);
+  store.upsert(promptId, doc);
+
+  // Lever B — auto-recall: inject the top relevant memories into THIS prompt so recall is systematic.
+  // Anti-bloat: gate trivial prompts, dedup against everything already injected this session, cap the
+  // count. Hybrid (query embedded via the leader's loopback) with a BM25 fallback; entirely best-effort.
+  const recall = await buildRecall(cfg, store, payload.prompt, state, promptId);
   saveState(cfg, payload.session_id, state);
-  return CONTINUE;
+
+  if (!recall) return CONTINUE;
+  return JSON.stringify({
+    continue: true,
+    suppressOutput: true,
+    hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: recall },
+  });
+}
+
+/**
+ * Builds the auto-recall context block (or null). Mutates `state.injected` with the ids it returns so
+ * the same memory is never injected twice in one session. Best-effort: any failure → null (capture is
+ * already done; recall is a bonus).
+ */
+async function buildRecall(
+  cfg: MemoryConfig,
+  store: MemoryStore,
+  prompt: string,
+  state: SessionState,
+  promptId: string,
+): Promise<string | null> {
+  if (!cfg.autoRecall.enabled) return null;
+  const q = prompt.trim();
+  if (q.length < 24) return null; // skip trivial prompts ("ok", "oui", "continue"…)
+  try {
+    const seen = new Set(state.injected);
+    const embedding = store.vectorEnabled ? await leaderEmbed(cfg, q) : null;
+    // Over-fetch, then drop dups + the just-captured prompt itself, then cap.
+    const cand = store.search({
+      query: q,
+      project: state.project,
+      limit: cfg.autoRecall.limit + seen.size + 5,
+      embedding,
+    });
+    const fresh = cand
+      .filter((d) => d.id && d.id !== promptId && !seen.has(d.id))
+      .slice(0, cfg.autoRecall.limit);
+    if (fresh.length === 0) return null;
+    state.injected = [...state.injected, ...fresh.map((d) => d.id as string)];
+    return [
+      `## 🧠 Related memories (auto-recall)`,
+      ...fresh.map(memoryLine),
+      `_(\`memory_search\` / \`memory_recent\` for more)_`,
+    ].join('\n');
+  } catch {
+    return null;
+  }
 }
 
 function handleObserve(cfg: MemoryConfig, store: MemoryStore, payload: HookPayload): string {
@@ -242,7 +315,7 @@ async function main(): Promise<void> {
         output = handleSessionStart(cfg, store, payload);
         break;
       case 'prompt':
-        output = handlePrompt(cfg, store, payload);
+        output = await handlePrompt(cfg, store, payload);
         break;
       case 'observe':
         output = handleObserve(cfg, store, payload);

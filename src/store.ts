@@ -19,6 +19,8 @@ const VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(',');
 
 /** Memory document. All fields are optional depending on the type. */
 export interface MemoryDoc {
+  /** Stable mem_id (set on docs read back from the store; absent on docs being written). */
+  id?: string;
   type: MemoryType;
   session_id?: string;
   project?: string;
@@ -141,6 +143,7 @@ function jsonArr(v: unknown): string[] {
 
 function rowToDoc(r: any): MemoryDoc {
   return {
+    id: r.mem_id ?? undefined,
     type: r.type,
     session_id: r.session_id ?? undefined,
     project: r.project ?? undefined,
