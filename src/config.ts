@@ -84,57 +84,84 @@ function readConfigFile(dataDir: string): Record<string, unknown> {
 }
 
 /**
- * Loads the configuration. Priority: environment variable > file
- * `<dataDir>/config.json` > default. The file allows configuring without relying on the
- * plugins' `${}` mechanism (unreliable when a field is left empty).
+ * Resolves a single setting from the environment and `<dataDir>/config.json`. Centralizes the
+ * env-vs-file precedence so loadConfig() reads as a flat list of `src.*(...)` calls instead of
+ * repeating the resolution boilerplate per field.
  *
- * Exception — the embedding tier resolves file > env > default (see getFileFirst): the
- * install-time `${user_config.embedTier}` env is only a seed, so /memory:config and the
- * /memory:*-load commands (which write config.json) can switch tier without a reinstall.
+ * Default precedence (`get`): environment variable > file > default. An env value is ignored if it
+ * is empty or an unresolved `${...}` placeholder (the plugin's `${}` injection is unreliable when a
+ * field is left blank), so the file/default still applies.
+ */
+class ConfigSource {
+  constructor(private readonly file: Record<string, unknown>) {}
+
+  private envValue(envKey: string): string | undefined {
+    const e = process.env[envKey];
+    return e !== undefined && e !== '' && !e.startsWith('${') ? e : undefined;
+  }
+
+  /** env > file > undefined. */
+  get(envKey: string, fileKey: string): string | undefined {
+    const e = this.envValue(envKey);
+    if (e !== undefined) return e;
+    const f = this.file[fileKey];
+    return f === undefined || f === null ? undefined : String(f);
+  }
+
+  /**
+   * file > env > undefined. Used for the embedding tier so the runtime config.json (written by
+   * /memory:config and the /memory:*-load commands) overrides the install-time
+   * `${user_config.embedTier}` env injected by .mcp.json — otherwise the install choice would pin
+   * the tier forever and /memory:config would be a silent no-op.
+   */
+  fileFirst(fileKey: string, envKey: string): string | undefined {
+    const f = this.file[fileKey];
+    if (f !== undefined && f !== null && String(f) !== '') return String(f);
+    return this.envValue(envKey);
+  }
+
+  /** Numeric setting (env > file), falling back to `def` when unset or unparseable. */
+  num(envKey: string, fileKey: string, def: number): number {
+    return Number(this.get(envKey, fileKey)) || def;
+  }
+
+  /** Boolean flag: true unless explicitly set to '0'. */
+  flag(envKey: string, fileKey: string): boolean {
+    return this.get(envKey, fileKey) !== '0';
+  }
+}
+
+/**
+ * Loads the configuration. Priority: environment variable > file
+ * `<dataDir>/config.json` > default (the embedding tier is the documented exception — see
+ * {@link ConfigSource.fileFirst}).
  */
 export function loadConfig(): MemoryConfig {
   const dataDir = process.env.MEMORY_DATA_DIR || path.join(os.homedir(), '.claude-memory');
-  const file = readConfigFile(dataDir);
-  const get = (envKey: string, fileKey: string): string | undefined => {
-    const e = process.env[envKey];
-    if (e !== undefined && e !== '' && !e.startsWith('${')) return e;
-    const f = file[fileKey];
-    return f === undefined || f === null ? undefined : String(f);
-  };
-  // Like get(), but the file wins over the env. Used for the embedding tier so that the
-  // runtime config.json (written by /memory:config and the /memory:*-load commands) overrides
-  // the install-time `${user_config.embedTier}` env injected by .mcp.json. Without this the
-  // install choice would pin the tier forever and /memory:config would be a silent no-op.
-  const getFileFirst = (fileKey: string, envKey: string): string | undefined => {
-    const f = file[fileKey];
-    if (f !== undefined && f !== null && String(f) !== '') return String(f);
-    const e = process.env[envKey];
-    if (e !== undefined && e !== '' && !e.startsWith('${')) return e;
-    return undefined;
-  };
+  const src = new ConfigSource(readConfigFile(dataDir));
 
-  const dbPath = get('MEMORY_DB_PATH', 'dbPath') || path.join(dataDir, 'memories.db');
-  const contextLimit = Number(get('MEMORY_CONTEXT_LIMIT', 'contextLimit')) || 10;
+  const dbPath = src.get('MEMORY_DB_PATH', 'dbPath') || path.join(dataDir, 'memories.db');
+  const contextLimit = src.num('MEMORY_CONTEXT_LIMIT', 'contextLimit', 10);
 
-  const tier = (getFileFirst('embedTier', 'MEMORY_EMBED_TIER') || DEFAULT_TIER).toLowerCase();
+  const tier = (src.fileFirst('embedTier', 'MEMORY_EMBED_TIER') || DEFAULT_TIER).toLowerCase();
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
-  const model = get('MEMORY_EMBED_MODEL', 'embedModel') || picked.model;
-  const dim = Number(get('MEMORY_EMBED_DIM', 'embedDim')) || picked.dim;
+  const model = src.get('MEMORY_EMBED_MODEL', 'embedModel') || picked.model;
+  const dim = src.num('MEMORY_EMBED_DIM', 'embedDim', picked.dim);
   // Pooling must match the model (e5 = mean, bge = cls). Follows the tier; overridable if a custom
   // model is forced via MEMORY_EMBED_MODEL.
-  const pooling = (get('MEMORY_EMBED_POOLING', 'embedPooling') || picked.pooling || 'mean').toLowerCase();
+  const pooling = (src.get('MEMORY_EMBED_POOLING', 'embedPooling') || picked.pooling || 'mean').toLowerCase();
   // Query-side instruction prefix (instruction-tuned models, e.g. Qwen3). Applied to queries only.
-  const queryPrefix = get('MEMORY_EMBED_QUERY_PREFIX', 'embedQueryPrefix') ?? picked.queryPrefix ?? '';
-  const enabled = get('MEMORY_EMBED_ENABLED', 'embedEnabled') !== '0';
-  const cacheDir = get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
+  const queryPrefix = src.get('MEMORY_EMBED_QUERY_PREFIX', 'embedQueryPrefix') ?? picked.queryPrefix ?? '';
+  const enabled = src.flag('MEMORY_EMBED_ENABLED', 'embedEnabled');
+  const cacheDir = src.get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
   // ONNX execution device (opt-in GPU). Empty = CPU (default → not passed to the pipeline).
   //  - explicit: cpu | dml (Windows) | coreml (macOS) | cuda (Linux+NVIDIA) | webgpu (experimental)
   //  - 'auto': pick the platform's GPU EP (win32→dml, darwin→coreml; else CPU since CUDA needs NVIDIA).
   // EPs are bundled in onnxruntime-node; loads fall back to CPU at warmup if the device can't run.
-  const device = resolveDevice((get('MEMORY_EMBED_DEVICE', 'embedDevice') || '').toLowerCase());
+  const device = resolveDevice((src.get('MEMORY_EMBED_DEVICE', 'embedDevice') || '').toLowerCase());
   // Precision. Quantized (q8) by default on CPU (~4× lighter); GPU EPs handle int8 poorly, so default
   // to fp32 there. An explicit MEMORY_EMBED_DTYPE always wins.
-  const dtypeOverride = get('MEMORY_EMBED_DTYPE', 'embedDtype');
+  const dtypeOverride = src.get('MEMORY_EMBED_DTYPE', 'embedDtype');
   const onGpu = device !== '' && device !== 'cpu';
   const dtype = (dtypeOverride || (onGpu ? 'fp32' : 'q8')).toLowerCase();
   // ONNX thread cap scales with the tier (CPU only; ignored by GPU EPs). light=33%, medium=66%,
@@ -146,14 +173,14 @@ export function loadConfig(): MemoryConfig {
 
   // LLM session digests (claude -p). On by default; opt out via env/file. Haiku by default so the
   // background loop doesn't compete with interactive Opus or burn the Max quota; overridable.
-  const digestEnabled = get('MEMORY_DIGEST_ENABLED', 'digestEnabled') !== '0';
-  const digestModel = get('MEMORY_DIGEST_MODEL', 'digestModel') || DEFAULT_DIGEST_MODEL;
+  const digestEnabled = src.flag('MEMORY_DIGEST_ENABLED', 'digestEnabled');
+  const digestModel = src.get('MEMORY_DIGEST_MODEL', 'digestModel') || DEFAULT_DIGEST_MODEL;
 
   // Reranker: cross-encoder over the top-K search candidates. On by default; the model is per tier
   // (light has none → disabled). Override the model with MEMORY_RERANK_MODEL, or turn off with
   // MEMORY_RERANK_ENABLED=0.
-  const rerankModel = get('MEMORY_RERANK_MODEL', 'rerankModel') || picked.reranker || '';
-  const rerankEnabled = get('MEMORY_RERANK_ENABLED', 'rerankEnabled') !== '0' && !!rerankModel;
+  const rerankModel = src.get('MEMORY_RERANK_MODEL', 'rerankModel') || picked.reranker || '';
+  const rerankEnabled = src.flag('MEMORY_RERANK_ENABLED', 'rerankEnabled') && !!rerankModel;
 
   return {
     dbPath,

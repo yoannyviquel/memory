@@ -36,43 +36,66 @@ function readConfigFile(dataDir) {
     return {};
   }
 }
+var ConfigSource = class {
+  constructor(file) {
+    this.file = file;
+  }
+  file;
+  envValue(envKey) {
+    const e = process.env[envKey];
+    return e !== void 0 && e !== "" && !e.startsWith("${") ? e : void 0;
+  }
+  /** env > file > undefined. */
+  get(envKey, fileKey) {
+    const e = this.envValue(envKey);
+    if (e !== void 0) return e;
+    const f = this.file[fileKey];
+    return f === void 0 || f === null ? void 0 : String(f);
+  }
+  /**
+   * file > env > undefined. Used for the embedding tier so the runtime config.json (written by
+   * /memory:config and the /memory:*-load commands) overrides the install-time
+   * `${user_config.embedTier}` env injected by .mcp.json — otherwise the install choice would pin
+   * the tier forever and /memory:config would be a silent no-op.
+   */
+  fileFirst(fileKey, envKey) {
+    const f = this.file[fileKey];
+    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
+    return this.envValue(envKey);
+  }
+  /** Numeric setting (env > file), falling back to `def` when unset or unparseable. */
+  num(envKey, fileKey, def) {
+    return Number(this.get(envKey, fileKey)) || def;
+  }
+  /** Boolean flag: true unless explicitly set to '0'. */
+  flag(envKey, fileKey) {
+    return this.get(envKey, fileKey) !== "0";
+  }
+};
 function loadConfig() {
   const dataDir = process.env.MEMORY_DATA_DIR || path.join(os.homedir(), ".claude-memory");
-  const file = readConfigFile(dataDir);
-  const get = (envKey, fileKey) => {
-    const e = process.env[envKey];
-    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
-    const f = file[fileKey];
-    return f === void 0 || f === null ? void 0 : String(f);
-  };
-  const getFileFirst = (fileKey, envKey) => {
-    const f = file[fileKey];
-    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
-    const e = process.env[envKey];
-    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
-    return void 0;
-  };
-  const dbPath = get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
-  const contextLimit = Number(get("MEMORY_CONTEXT_LIMIT", "contextLimit")) || 10;
-  const tier = (getFileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
+  const src = new ConfigSource(readConfigFile(dataDir));
+  const dbPath = src.get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
+  const contextLimit = src.num("MEMORY_CONTEXT_LIMIT", "contextLimit", 10);
+  const tier = (src.fileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
-  const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
-  const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
-  const pooling = (get("MEMORY_EMBED_POOLING", "embedPooling") || picked.pooling || "mean").toLowerCase();
-  const queryPrefix = get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
-  const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
-  const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
-  const device = resolveDevice((get("MEMORY_EMBED_DEVICE", "embedDevice") || "").toLowerCase());
-  const dtypeOverride = get("MEMORY_EMBED_DTYPE", "embedDtype");
+  const model = src.get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
+  const dim = src.num("MEMORY_EMBED_DIM", "embedDim", picked.dim);
+  const pooling = (src.get("MEMORY_EMBED_POOLING", "embedPooling") || picked.pooling || "mean").toLowerCase();
+  const queryPrefix = src.get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
+  const enabled = src.flag("MEMORY_EMBED_ENABLED", "embedEnabled");
+  const cacheDir = src.get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
+  const device = resolveDevice((src.get("MEMORY_EMBED_DEVICE", "embedDevice") || "").toLowerCase());
+  const dtypeOverride = src.get("MEMORY_EMBED_DTYPE", "embedDtype");
   const onGpu = device !== "" && device !== "cpu";
   const dtype = (dtypeOverride || (onGpu ? "fp32" : "q8")).toLowerCase();
   const threadFraction = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
-  const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
-  const digestModel = get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
-  const rerankModel = get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
-  const rerankEnabled = get("MEMORY_RERANK_ENABLED", "rerankEnabled") !== "0" && !!rerankModel;
+  const digestEnabled = src.flag("MEMORY_DIGEST_ENABLED", "digestEnabled");
+  const digestModel = src.get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
+  const rerankModel = src.get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
+  const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
   return {
     dbPath,
     dataDir,
@@ -741,116 +764,199 @@ function writeStatus(dataDir, patch) {
   }
 }
 
+// src/model-host.ts
+var ModelHost = class {
+  constructor(cacheDir, device, dtype, threads, dataDir, tag) {
+    this.cacheDir = cacheDir;
+    this.device = device;
+    this.dtype = dtype;
+    this.threads = threads;
+    this.dataDir = dataDir;
+    this.tag = tag;
+  }
+  cacheDir;
+  device;
+  dtype;
+  threads;
+  dataDir;
+  tag;
+  model = null;
+  loading = null;
+  failed = false;
+  /** Effective device after load ('cpu' or a GPU EP); '' until loaded. For status reporting. */
+  effectiveDevice = "";
+  /** True if the model is ALREADY loaded — never triggers a (blocking) load. For status reporting. */
+  loaded() {
+    return this.model !== null;
+  }
+  /** Effective device after load ('cpu' or a GPU EP); '' if not loaded yet. */
+  deviceUsed() {
+    return this.effectiveDevice;
+  }
+  /** Loads the model once (shared promise) and returns it, or null if unavailable. */
+  async load() {
+    if (this.model) return this.model;
+    if (this.failed) return null;
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
+      try {
+        const mod = "@huggingface/transformers";
+        const tf = await import(mod);
+        tf.env.cacheDir = this.cacheDir;
+        tf.env.allowRemoteModels = true;
+        const threads = Math.max(1, this.threads || 1);
+        try {
+          tf.env.backends.onnx.numThreads = threads;
+          if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
+        } catch {
+        }
+        const session_options = this.sessionOptions(threads);
+        const dtype = this.dtype || "q8";
+        await this.beforeAttempts(tf, threads, dtype);
+        const attempt = async (device, dt) => {
+          const m2 = await this.build(tf, device, dt, session_options);
+          await this.warmup(m2);
+          return m2;
+        };
+        let m;
+        try {
+          m = await attempt(this.device, dtype);
+          this.effectiveDevice = this.device && this.device !== "cpu" ? this.device : "cpu";
+        } catch (e) {
+          log(
+            this.dataDir,
+            `[${this.tag}] device=${this.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
+          );
+          m = await attempt("cpu", "fp32");
+          this.effectiveDevice = "cpu";
+        }
+        this.model = m;
+        await this.afterLoad();
+        return m;
+      } catch (err) {
+        this.failed = true;
+        const message = err instanceof Error ? err.message : String(err);
+        await this.onLoadError(message);
+        return null;
+      } finally {
+        this.loading = null;
+      }
+    })();
+    return this.loading;
+  }
+  // --- Varying steps (defaults are no-ops; subclasses override what they need) ---
+  /** ONNX session tuning. Default: single-pool sequential. */
+  sessionOptions(threads) {
+    return { intraOpNumThreads: threads, interOpNumThreads: 1 };
+  }
+  /** One-time pre-load step (logging, status writes, tokenizer load). */
+  async beforeAttempts(_tf, _threads, _dtype) {
+  }
+  /** Success side-effects (final logging, status idle). */
+  async afterLoad() {
+  }
+  /** Failure side-effects (logging, status idle, stderr). */
+  async onLoadError(_message) {
+  }
+};
+
 // src/embeddings.ts
 function embedText(parts, max = 2e3) {
   return parts.filter((p) => !!p && p.trim().length > 0).join("\n").slice(0, max);
 }
-var _pipe = null;
-var _loading = null;
-var _failed = false;
-var _device = "";
-async function getPipe(cfg) {
-  if (!cfg.enabled) return null;
-  if (_pipe) return _pipe;
-  if (_failed) return null;
-  if (_loading) return _loading;
-  _loading = (async () => {
-    try {
-      const mod = "@huggingface/transformers";
-      const tf = await import(mod);
-      tf.env.cacheDir = cfg.cacheDir;
-      tf.env.allowRemoteModels = true;
-      const threads = Math.max(1, cfg.threads || 1);
+var POOLINGS = /* @__PURE__ */ new Set(["mean", "cls", "last_token"]);
+var EmbedderHost = class extends ModelHost {
+  constructor(cfg) {
+    super(cfg.cacheDir, cfg.device, cfg.dtype, cfg.threads, cfg.dataDir, "embed");
+    this.cfg = cfg;
+  }
+  cfg;
+  progressCb;
+  // Maximize a single sequential embedding across its allowed threads:
+  //  - intraOpNumThreads = threads → fans the heavy matmuls of ONE inference over every allowed core.
+  //  - interOpNumThreads = 1 + executionMode sequential → no second pool (a transformer encoder is a
+  //    serial layer stack, so inter-op parallelism adds nothing and would risk exceeding the cap).
+  //  - graphOptimizationLevel 'all' → fused kernels run faster on the same threads.
+  sessionOptions(threads) {
+    return {
+      intraOpNumThreads: threads,
+      interOpNumThreads: 1,
+      executionMode: "sequential",
+      graphOptimizationLevel: "all"
+    };
+  }
+  async beforeAttempts(_tf, threads, dtype) {
+    log(this.dataDir, `[embed] onnx threads capped at ${threads}`);
+    log(this.dataDir, `[embed] loading ${this.cfg.model} (dtype=${dtype}) cache=${this.cfg.cacheDir}`);
+    writeStatus(this.dataDir, { state: "loading", model: this.cfg.model, progress: void 0, file: void 0 });
+    const lastPct = {};
+    this.progressCb = (p) => {
       try {
-        tf.env.backends.onnx.numThreads = threads;
-        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
+        if (p?.status === "progress" && p.file && typeof p.progress === "number") {
+          const pct = Math.round(p.progress);
+          const bucket = Math.floor(pct / 10);
+          if (lastPct[p.file] !== bucket) {
+            lastPct[p.file] = bucket;
+            log(this.dataDir, `[embed] download ${p.file} ${pct}%`);
+          }
+          writeStatus(this.dataDir, { state: "downloading", model: this.cfg.model, file: p.file, progress: pct });
+        } else if (p?.status === "done" && p.file) {
+          log(this.dataDir, `[embed] downloaded ${p.file}`);
+        } else if (p?.status === "ready") {
+          log(this.dataDir, `[embed] model ready (${this.cfg.model})`);
+        }
       } catch {
       }
-      log(cfg.dataDir, `[embed] onnx threads capped at ${threads}`);
-      const dtype = cfg.dtype || "q8";
-      log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
-      writeStatus(cfg.dataDir, { state: "loading", model: cfg.model, progress: void 0, file: void 0 });
-      const lastPct = {};
-      const progress_callback = (p) => {
-        try {
-          if (p?.status === "progress" && p.file && typeof p.progress === "number") {
-            const pct = Math.round(p.progress);
-            const bucket = Math.floor(pct / 10);
-            if (lastPct[p.file] !== bucket) {
-              lastPct[p.file] = bucket;
-              log(cfg.dataDir, `[embed] download ${p.file} ${pct}%`);
-            }
-            writeStatus(cfg.dataDir, { state: "downloading", model: cfg.model, file: p.file, progress: pct });
-          } else if (p?.status === "done" && p.file) {
-            log(cfg.dataDir, `[embed] downloaded ${p.file}`);
-          } else if (p?.status === "ready") {
-            log(cfg.dataDir, `[embed] model ready (${cfg.model})`);
-          }
-        } catch {
-        }
-      };
-      const session_options = {
-        intraOpNumThreads: threads,
-        interOpNumThreads: 1,
-        executionMode: "sequential",
-        graphOptimizationLevel: "all"
-      };
-      const pooling = cfg.pooling === "cls" ? "cls" : "mean";
-      const attempt = async (device, dt) => {
-        const opts = { dtype: dt, progress_callback, session_options };
-        if (device && device !== "cpu") opts.device = device;
-        const p = await tf.pipeline("feature-extraction", cfg.model, opts);
-        await p(["warmup"], { pooling, normalize: true });
-        return p;
-      };
-      let pipe;
-      try {
-        pipe = await attempt(cfg.device, dtype);
-        _device = cfg.device && cfg.device !== "cpu" ? cfg.device : "cpu";
-      } catch (e) {
-        log(
-          cfg.dataDir,
-          `[embed] device=${cfg.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
-        );
-        pipe = await attempt("cpu", "fp32");
-        _device = "cpu";
-      }
-      log(cfg.dataDir, `[embed] device=${_device}`);
-      _pipe = pipe;
-      writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
-      return pipe;
-    } catch (err) {
-      _failed = true;
-      const message = err instanceof Error ? err.message : String(err);
-      log(cfg.dataDir, `[embed] unavailable: ${message}`);
-      writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
-      process.stderr.write(`[memory] embedder unavailable: ${message}
-`);
-      return null;
-    } finally {
-      _loading = null;
-    }
-  })();
-  return _loading;
-}
-async function embedReady(cfg) {
-  return !!await getPipe(cfg);
-}
-var POOLINGS = /* @__PURE__ */ new Set(["mean", "cls", "last_token"]);
-async function embedBatch(texts, cfg, isQuery = false) {
-  if (!cfg.enabled || texts.length === 0) return texts.map(() => null);
-  const pipe = await getPipe(cfg);
-  if (!pipe) return texts.map(() => null);
-  try {
-    const inputs = isQuery && cfg.queryPrefix ? texts.map((t) => `${cfg.queryPrefix}${t}`) : texts;
-    const pooling = POOLINGS.has(cfg.pooling) ? cfg.pooling : "mean";
-    const out = await pipe(inputs, { pooling, normalize: true });
-    const arr = out.tolist();
-    return texts.map((_, i) => Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null);
-  } catch {
-    return texts.map(() => null);
+    };
   }
-}
+  async build(tf, device, dt, session_options) {
+    const opts = { dtype: dt, progress_callback: this.progressCb, session_options };
+    if (device && device !== "cpu") opts.device = device;
+    return tf.pipeline("feature-extraction", this.cfg.model, opts);
+  }
+  async warmup(pipe) {
+    const pooling = this.cfg.pooling === "cls" ? "cls" : "mean";
+    await pipe(["warmup"], { pooling, normalize: true });
+  }
+  async afterLoad() {
+    log(this.dataDir, `[embed] device=${this.effectiveDevice}`);
+    writeStatus(this.dataDir, { state: "idle", progress: void 0, file: void 0 });
+  }
+  async onLoadError(message) {
+    log(this.dataDir, `[embed] unavailable: ${message}`);
+    writeStatus(this.dataDir, { state: "idle", progress: void 0, file: void 0 });
+    process.stderr.write(`[memory] embedder unavailable: ${message}
+`);
+  }
+  /** True if the model is loadable (triggers loading). */
+  async ready() {
+    if (!this.cfg.enabled) return false;
+    return !!await this.load();
+  }
+  /**
+   * Embeds one text. `isQuery` matters for instruction-tuned models (e.g. Qwen3-Embedding) that want
+   * a query-side prefix; documents are embedded raw. No-op for models without a queryPrefix.
+   */
+  async embed(text, isQuery = false) {
+    const r = await this.embedBatch([text], isQuery);
+    return r[0] ?? null;
+  }
+  /** Batch embeddings (pooling per model + L2 normalization). null per entry on failure. */
+  async embedBatch(texts, isQuery = false) {
+    if (!this.cfg.enabled || texts.length === 0) return texts.map(() => null);
+    const pipe = await this.load();
+    if (!pipe) return texts.map(() => null);
+    try {
+      const inputs = isQuery && this.cfg.queryPrefix ? texts.map((t) => `${this.cfg.queryPrefix}${t}`) : texts;
+      const pooling = POOLINGS.has(this.cfg.pooling) ? this.cfg.pooling : "mean";
+      const out = await pipe(inputs, { pooling, normalize: true });
+      const arr = out.tolist();
+      return texts.map((_, i) => Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null);
+    } catch {
+      return texts.map(() => null);
+    }
+  }
+};
 
 // src/migrate.ts
 function parseArgs(argv) {
@@ -913,8 +1019,9 @@ async function main() {
     process.exit(1);
   }
   const embedCfg = cfg.embed;
+  const embedder = new EmbedderHost(embedCfg);
   if (args.embed && !args.dryRun) {
-    if (!await embedReady(embedCfg)) {
+    if (!await embedder.ready()) {
       console.error(
         `\u274C --embed requested but the local embedder (${embedCfg.model}) failed to load. Migrate without --embed, or check model access.`
       );
@@ -1033,7 +1140,7 @@ async function main() {
   for (let i = 0; i < items.length; i += args.batch) {
     const slice = items.slice(i, i + args.batch);
     if (doEmbed) {
-      const vectors = await embedBatch(slice.map((it) => docEmbedText(it.doc)), embedCfg);
+      const vectors = await embedder.embedBatch(slice.map((it) => docEmbedText(it.doc)));
       slice.forEach((it, j) => {
         it.embedding = vectors[j];
         if (vectors[j]) embedded++;

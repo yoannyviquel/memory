@@ -3,7 +3,7 @@ import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { loadConfig, EMBED_TEXT_VERSION, DIGEST_VERSION } from './config.js';
 import { MemoryStore, type BulkItem, type MemoryDoc } from './store.js';
-import { embedBatch, embedText, embedReady, type EmbedConfig } from './embeddings.js';
+import { EmbedderHost, embedText, type EmbedConfig } from './embeddings.js';
 
 interface Args {
   db: string;
@@ -89,8 +89,9 @@ async function main(): Promise<void> {
 
   // Migration embeddings (local transformers.js model, loaded once for the whole batch).
   const embedCfg: EmbedConfig = cfg.embed;
+  const embedder = new EmbedderHost(embedCfg);
   if (args.embed && !args.dryRun) {
-    if (!(await embedReady(embedCfg))) {
+    if (!(await embedder.ready())) {
       console.error(
         `❌ --embed requested but the local embedder (${embedCfg.model}) failed to load. Migrate without --embed, or check model access.`,
       );
@@ -226,7 +227,7 @@ async function main(): Promise<void> {
   for (let i = 0; i < items.length; i += args.batch) {
     const slice = items.slice(i, i + args.batch);
     if (doEmbed) {
-      const vectors = await embedBatch(slice.map((it) => docEmbedText(it.doc)), embedCfg);
+      const vectors = await embedder.embedBatch(slice.map((it) => docEmbedText(it.doc)));
       slice.forEach((it, j) => {
         it.embedding = vectors[j];
         if (vectors[j]) embedded++;

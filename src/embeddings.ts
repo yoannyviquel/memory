@@ -1,4 +1,5 @@
 import { log, writeStatus } from './log.js';
+import { ModelHost } from './model-host.js';
 
 export interface EmbedConfig {
   enabled: boolean;
@@ -29,164 +30,112 @@ export function embedText(parts: Array<string | undefined>, max = 2000): string 
     .slice(0, max);
 }
 
-// transformers.js pipeline singleton (loaded once per process).
-let _pipe: any = null;
-let _loading: Promise<any> | null = null;
-let _failed = false;
-let _device = ''; // effective device after load ('cpu' or a GPU EP), for status reporting
-
-async function getPipe(cfg: EmbedConfig): Promise<any | null> {
-  if (!cfg.enabled) return null;
-  if (_pipe) return _pipe;
-  if (_failed) return null;
-  if (_loading) return _loading;
-  _loading = (async () => {
-    try {
-      // Specifier as a variable: keeps the import resolvable at runtime from node_modules.
-      const mod = '@huggingface/transformers';
-      const tf: any = await import(mod);
-      tf.env.cacheDir = cfg.cacheDir;
-      tf.env.allowRemoteModels = true;
-      // Tier-derived thread budget: each embedding may use up to this many cores, no more.
-      // Both backends covered: onnxruntime-node reads `onnx.numThreads`; wasm reads
-      // `onnx.wasm.numThreads`. The per-session session_options below enforce the same budget.
-      const threads = Math.max(1, cfg.threads || 1);
-      try {
-        tf.env.backends.onnx.numThreads = threads;
-        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
-      } catch {
-        /* best-effort: older builds may not expose the backend tree */
-      }
-      log(cfg.dataDir, `[embed] onnx threads capped at ${threads}`);
-
-      const dtype = cfg.dtype || 'q8';
-      log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
-      writeStatus(cfg.dataDir, { state: 'loading', model: cfg.model, progress: undefined, file: undefined });
-
-      // HuggingFace download progress → logs + status.json (throttled by decile).
-      const lastPct: Record<string, number> = {};
-      const progress_callback = (p: any) => {
-        try {
-          if (p?.status === 'progress' && p.file && typeof p.progress === 'number') {
-            const pct = Math.round(p.progress);
-            const bucket = Math.floor(pct / 10);
-            if (lastPct[p.file] !== bucket) {
-              lastPct[p.file] = bucket;
-              log(cfg.dataDir, `[embed] download ${p.file} ${pct}%`);
-            }
-            writeStatus(cfg.dataDir, { state: 'downloading', model: cfg.model, file: p.file, progress: pct });
-          } else if (p?.status === 'done' && p.file) {
-            log(cfg.dataDir, `[embed] downloaded ${p.file}`);
-          } else if (p?.status === 'ready') {
-            log(cfg.dataDir, `[embed] model ready (${cfg.model})`);
-          }
-        } catch {
-          /* best-effort */
-        }
-      };
-
-      // Maximize a single sequential embedding across its allowed threads:
-      //  - intraOpNumThreads = threads → fans the heavy matmuls of ONE inference over every
-      //    allowed core (this is the lever that makes embed exploit the full cap).
-      //  - interOpNumThreads = 1 + executionMode sequential → no second pool; a transformer
-      //    encoder is a serial layer stack, so inter-op parallelism adds nothing and would only
-      //    risk spinning threads beyond the cap.
-      //  - graphOptimizationLevel 'all' → fused kernels run faster on the same threads.
-      const session_options = {
-        intraOpNumThreads: threads,
-        interOpNumThreads: 1,
-        executionMode: 'sequential',
-        graphOptimizationLevel: 'all',
-      };
-      const pooling = cfg.pooling === 'cls' ? 'cls' : 'mean';
-      // Load + a warmup inference. The warmup surfaces a GPU EP that loads but can't actually run the
-      // graph at startup (rather than silently returning null vectors during backfill).
-      const attempt = async (device: string, dt: string): Promise<any> => {
-        const opts: any = { dtype: dt, progress_callback, session_options };
-        if (device && device !== 'cpu') opts.device = device;
-        const p = await tf.pipeline('feature-extraction', cfg.model, opts);
-        await p(['warmup'], { pooling, normalize: true });
-        return p;
-      };
-      let pipe: any;
-      try {
-        pipe = await attempt(cfg.device, dtype);
-        _device = cfg.device && cfg.device !== 'cpu' ? cfg.device : 'cpu';
-      } catch (e) {
-        // GPU EP missing/unusable, or the quantized variant absent → fall back to CPU + fp32.
-        log(
-          cfg.dataDir,
-          `[embed] device=${cfg.device || 'cpu'}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`,
-        );
-        pipe = await attempt('cpu', 'fp32');
-        _device = 'cpu';
-      }
-      log(cfg.dataDir, `[embed] device=${_device}`);
-      _pipe = pipe;
-      writeStatus(cfg.dataDir, { state: 'idle', progress: undefined, file: undefined });
-      return pipe;
-    } catch (err) {
-      _failed = true;
-      const message = err instanceof Error ? err.message : String(err);
-      log(cfg.dataDir, `[embed] unavailable: ${message}`);
-      writeStatus(cfg.dataDir, { state: 'idle', progress: undefined, file: undefined });
-      process.stderr.write(`[memory] embedder unavailable: ${message}\n`);
-      return null;
-    } finally {
-      _loading = null;
-    }
-  })();
-  return _loading;
-}
-
-/** True if the model is loadable (triggers loading). */
-export async function embedReady(cfg: EmbedConfig): Promise<boolean> {
-  return !!(await getPipe(cfg));
-}
-
-/** True if the model is ALREADY loaded — never triggers a (blocking) load. For status reporting. */
-export function embedLoaded(): boolean {
-  return _pipe !== null;
-}
-
-/** Effective device after load ('cpu' or a GPU EP); '' if not loaded yet. For status reporting. */
-export function embedDevice(): string {
-  return _device;
-}
-
 const POOLINGS = new Set(['mean', 'cls', 'last_token']);
 
 /**
- * Embeds one text. `isQuery` matters for instruction-tuned models (e.g. Qwen3-Embedding) that want
- * a query-side prefix; documents are embedded raw. No-op for models without a queryPrefix.
+ * Hosts the transformers.js feature-extraction pipeline (e5 family). One instance per process holds
+ * the single loaded model; `embed*` lazily trigger the (shared) load. See {@link ModelHost} for the
+ * load/fallback skeleton.
  */
-export async function embed(
-  text: string,
-  cfg: EmbedConfig,
-  isQuery = false,
-): Promise<number[] | null> {
-  const r = await embedBatch([text], cfg, isQuery);
-  return r[0] ?? null;
-}
+export class EmbedderHost extends ModelHost<any> {
+  private progressCb: ((p: any) => void) | undefined;
 
-/** Batch embeddings (pooling per model + L2 normalization). null per entry on failure. */
-export async function embedBatch(
-  texts: string[],
-  cfg: EmbedConfig,
-  isQuery = false,
-): Promise<Array<number[] | null>> {
-  if (!cfg.enabled || texts.length === 0) return texts.map(() => null);
-  const pipe = await getPipe(cfg);
-  if (!pipe) return texts.map(() => null);
-  try {
-    // Instruction-tuned models: prefix queries only (documents stay raw).
-    const inputs =
-      isQuery && cfg.queryPrefix ? texts.map((t) => `${cfg.queryPrefix}${t}`) : texts;
-    const pooling = POOLINGS.has(cfg.pooling) ? cfg.pooling : 'mean';
-    const out = await pipe(inputs, { pooling, normalize: true });
-    const arr: number[][] = out.tolist();
-    return texts.map((_, i) => (Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null));
-  } catch {
-    return texts.map(() => null);
+  constructor(private readonly cfg: EmbedConfig) {
+    super(cfg.cacheDir, cfg.device, cfg.dtype, cfg.threads, cfg.dataDir, 'embed');
+  }
+
+  // Maximize a single sequential embedding across its allowed threads:
+  //  - intraOpNumThreads = threads → fans the heavy matmuls of ONE inference over every allowed core.
+  //  - interOpNumThreads = 1 + executionMode sequential → no second pool (a transformer encoder is a
+  //    serial layer stack, so inter-op parallelism adds nothing and would risk exceeding the cap).
+  //  - graphOptimizationLevel 'all' → fused kernels run faster on the same threads.
+  protected sessionOptions(threads: number): Record<string, unknown> {
+    return {
+      intraOpNumThreads: threads,
+      interOpNumThreads: 1,
+      executionMode: 'sequential',
+      graphOptimizationLevel: 'all',
+    };
+  }
+
+  protected async beforeAttempts(_tf: any, threads: number, dtype: string): Promise<void> {
+    log(this.dataDir, `[embed] onnx threads capped at ${threads}`);
+    log(this.dataDir, `[embed] loading ${this.cfg.model} (dtype=${dtype}) cache=${this.cfg.cacheDir}`);
+    writeStatus(this.dataDir, { state: 'loading', model: this.cfg.model, progress: undefined, file: undefined });
+    // HuggingFace download progress → logs + status.json (throttled by decile).
+    const lastPct: Record<string, number> = {};
+    this.progressCb = (p: any) => {
+      try {
+        if (p?.status === 'progress' && p.file && typeof p.progress === 'number') {
+          const pct = Math.round(p.progress);
+          const bucket = Math.floor(pct / 10);
+          if (lastPct[p.file] !== bucket) {
+            lastPct[p.file] = bucket;
+            log(this.dataDir, `[embed] download ${p.file} ${pct}%`);
+          }
+          writeStatus(this.dataDir, { state: 'downloading', model: this.cfg.model, file: p.file, progress: pct });
+        } else if (p?.status === 'done' && p.file) {
+          log(this.dataDir, `[embed] downloaded ${p.file}`);
+        } else if (p?.status === 'ready') {
+          log(this.dataDir, `[embed] model ready (${this.cfg.model})`);
+        }
+      } catch {
+        /* best-effort */
+      }
+    };
+  }
+
+  protected async build(tf: any, device: string, dt: string, session_options: Record<string, unknown>): Promise<any> {
+    const opts: any = { dtype: dt, progress_callback: this.progressCb, session_options };
+    if (device && device !== 'cpu') opts.device = device;
+    return tf.pipeline('feature-extraction', this.cfg.model, opts);
+  }
+
+  protected async warmup(pipe: any): Promise<void> {
+    const pooling = this.cfg.pooling === 'cls' ? 'cls' : 'mean';
+    await pipe(['warmup'], { pooling, normalize: true });
+  }
+
+  protected async afterLoad(): Promise<void> {
+    log(this.dataDir, `[embed] device=${this.effectiveDevice}`);
+    writeStatus(this.dataDir, { state: 'idle', progress: undefined, file: undefined });
+  }
+
+  protected async onLoadError(message: string): Promise<void> {
+    log(this.dataDir, `[embed] unavailable: ${message}`);
+    writeStatus(this.dataDir, { state: 'idle', progress: undefined, file: undefined });
+    process.stderr.write(`[memory] embedder unavailable: ${message}\n`);
+  }
+
+  /** True if the model is loadable (triggers loading). */
+  async ready(): Promise<boolean> {
+    if (!this.cfg.enabled) return false;
+    return !!(await this.load());
+  }
+
+  /**
+   * Embeds one text. `isQuery` matters for instruction-tuned models (e.g. Qwen3-Embedding) that want
+   * a query-side prefix; documents are embedded raw. No-op for models without a queryPrefix.
+   */
+  async embed(text: string, isQuery = false): Promise<number[] | null> {
+    const r = await this.embedBatch([text], isQuery);
+    return r[0] ?? null;
+  }
+
+  /** Batch embeddings (pooling per model + L2 normalization). null per entry on failure. */
+  async embedBatch(texts: string[], isQuery = false): Promise<Array<number[] | null>> {
+    if (!this.cfg.enabled || texts.length === 0) return texts.map(() => null);
+    const pipe = await this.load();
+    if (!pipe) return texts.map(() => null);
+    try {
+      // Instruction-tuned models: prefix queries only (documents stay raw).
+      const inputs = isQuery && this.cfg.queryPrefix ? texts.map((t) => `${this.cfg.queryPrefix}${t}`) : texts;
+      const pooling = POOLINGS.has(this.cfg.pooling) ? this.cfg.pooling : 'mean';
+      const out = await pipe(inputs, { pooling, normalize: true });
+      const arr: number[][] = out.tolist();
+      return texts.map((_, i) => (Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null));
+    } catch {
+      return texts.map(() => null);
+    }
   }
 }

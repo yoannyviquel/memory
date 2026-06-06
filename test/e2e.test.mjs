@@ -58,6 +58,71 @@ test('1.1 leader failover', { timeout: 60_000 }, async () => {
   }
 });
 
+// 1.2 — Follower routes query embedding to the leader's loopback service (QueryExecutor Strategy:
+// RemoteExecutor). A follower must NOT load its own model; its semantic search only works if it
+// reaches the leader. The query shares no token with the doc, so a hit can only come from a vector
+// match — proving the remote-embed path (leader publishes endpoint → follower posts /embed).
+test('1.2 follower routes query embed to leader', { timeout: 240_000 }, async () => {
+  const dataDir = freshDataDir();
+  const env = baseEnv(dataDir); // embed enabled (light tier)
+  const cwd = path.join(dataDir, 'proj12');
+  let leader, follower;
+  try {
+    await runHook(
+      'prompt',
+      {
+        session_id: 't12',
+        prompt: 'Le déploiement en production utilise la pipeline Azure DevOps tous les vendredis',
+        cwd,
+      },
+      env,
+    );
+    leader = await startServer(env);
+
+    // Leader publishes its loopback endpoint (port + token) in the lock once the service is up.
+    const lock = await pollUntil(
+      () => {
+        const l = readLock(dataDir);
+        return l?.port && l?.token ? l : null;
+      },
+      { label: 'leader publishes loopback endpoint' },
+    );
+    const pidLeader = lock.pid;
+
+    // Leader vectorizes the doc (backfill) → leader semantic search returns it.
+    await pollUntil(
+      async () => {
+        const r = await call(leader.client, 'memory_search', {
+          query: 'publier le logiciel en ligne chaque fin de semaine',
+        });
+        return /DevOps|production|vendredis/.test(r) ? r : null;
+      },
+      { timeoutMs: VECTO_TIMEOUT, stepMs: 1000, label: 'leader vectorized the doc' },
+    );
+
+    // Start a follower; it stays a follower (leader alive) → its executor is RemoteExecutor.
+    follower = await startServer(env);
+    await sleep(500);
+    assert.equal(readLock(dataDir).pid, pidLeader, 'follower did not steal leadership');
+
+    // Follower's semantic search (paraphrase, no shared token) only succeeds by routing to the leader.
+    const r = await pollUntil(
+      async () => {
+        const x = await call(follower.client, 'memory_search', {
+          query: 'publier le logiciel en ligne chaque fin de semaine',
+        });
+        return /DevOps|production|vendredis/.test(x) ? x : null;
+      },
+      { timeoutMs: 30_000, stepMs: 1000, label: 'follower semantic search via leader' },
+    );
+    assert.match(r, /DevOps|production|vendredis/, 'follower got the semantic hit by routing query embed to the leader');
+  } finally {
+    await follower?.close();
+    await leader?.close();
+    cleanup(dataDir);
+  }
+});
+
 // 2.1 — Create a memory (hook) → BM25 search → semantic search → delete → gone.
 test('2.1 tools: memory BM25 + vecto + delete', { timeout: 240_000 }, async () => {
   const dataDir = freshDataDir();
