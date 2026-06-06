@@ -23,6 +23,12 @@ var EMBED_TIERS = {
   }
 };
 var DEFAULT_TIER = "light";
+function resolveDevice(raw) {
+  if (raw !== "auto") return raw;
+  if (process.platform === "win32") return "dml";
+  if (process.platform === "darwin") return "coreml";
+  return "";
+}
 function readConfigFile(dataDir) {
   try {
     return JSON.parse(readFileSync(path.join(dataDir, "config.json"), "utf8"));
@@ -56,7 +62,10 @@ function loadConfig() {
   const queryPrefix = get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
-  const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
+  const device = resolveDevice((get("MEMORY_EMBED_DEVICE", "embedDevice") || "").toLowerCase());
+  const dtypeOverride = get("MEMORY_EMBED_DTYPE", "embedDtype");
+  const onGpu = device !== "" && device !== "cpu";
+  const dtype = (dtypeOverride || (onGpu ? "fp32" : "q8")).toLowerCase();
   const threadFraction = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
@@ -68,7 +77,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel }
   };
@@ -739,6 +748,7 @@ function embedText(parts, max = 2e3) {
 var _pipe = null;
 var _loading = null;
 var _failed = false;
+var _device = "";
 async function getPipe(cfg) {
   if (!cfg.enabled) return null;
   if (_pipe) return _pipe;
@@ -785,24 +795,27 @@ async function getPipe(cfg) {
         executionMode: "sequential",
         graphOptimizationLevel: "all"
       };
+      const pooling = cfg.pooling === "cls" ? "cls" : "mean";
+      const attempt = async (device, dt) => {
+        const opts = { dtype: dt, progress_callback, session_options };
+        if (device && device !== "cpu") opts.device = device;
+        const p = await tf.pipeline("feature-extraction", cfg.model, opts);
+        await p(["warmup"], { pooling, normalize: true });
+        return p;
+      };
       let pipe;
       try {
-        pipe = await tf.pipeline("feature-extraction", cfg.model, {
-          dtype,
-          progress_callback,
-          session_options
-        });
+        pipe = await attempt(cfg.device, dtype);
+        _device = cfg.device && cfg.device !== "cpu" ? cfg.device : "cpu";
       } catch (e) {
         log(
           cfg.dataDir,
-          `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
+          `[embed] device=${cfg.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
         );
-        pipe = await tf.pipeline("feature-extraction", cfg.model, {
-          dtype: "fp32",
-          progress_callback,
-          session_options
-        });
+        pipe = await attempt("cpu", "fp32");
+        _device = "cpu";
       }
+      log(cfg.dataDir, `[embed] device=${_device}`);
       _pipe = pipe;
       writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
       return pipe;

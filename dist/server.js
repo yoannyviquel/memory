@@ -37,6 +37,12 @@ var EMBED_TIERS = {
   }
 };
 var DEFAULT_TIER = "light";
+function resolveDevice(raw) {
+  if (raw !== "auto") return raw;
+  if (process.platform === "win32") return "dml";
+  if (process.platform === "darwin") return "coreml";
+  return "";
+}
 function readConfigFile(dataDir) {
   try {
     return JSON.parse(readFileSync(path.join(dataDir, "config.json"), "utf8"));
@@ -70,7 +76,10 @@ function loadConfig() {
   const queryPrefix = get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
   const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
   const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
-  const dtype = (get("MEMORY_EMBED_DTYPE", "embedDtype") || "q8").toLowerCase();
+  const device = resolveDevice((get("MEMORY_EMBED_DEVICE", "embedDevice") || "").toLowerCase());
+  const dtypeOverride = get("MEMORY_EMBED_DTYPE", "embedDtype");
+  const onGpu = device !== "" && device !== "cpu";
+  const dtype = (dtypeOverride || (onGpu ? "fp32" : "q8")).toLowerCase();
   const threadFraction = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
@@ -82,7 +91,7 @@ function loadConfig() {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel }
   };
@@ -750,6 +759,7 @@ function writeStatus(dataDir, patch) {
 var _pipe = null;
 var _loading = null;
 var _failed = false;
+var _device = "";
 async function getPipe(cfg) {
   if (!cfg.enabled) return null;
   if (_pipe) return _pipe;
@@ -796,24 +806,27 @@ async function getPipe(cfg) {
         executionMode: "sequential",
         graphOptimizationLevel: "all"
       };
+      const pooling = cfg.pooling === "cls" ? "cls" : "mean";
+      const attempt = async (device, dt) => {
+        const opts = { dtype: dt, progress_callback, session_options };
+        if (device && device !== "cpu") opts.device = device;
+        const p = await tf.pipeline("feature-extraction", cfg.model, opts);
+        await p(["warmup"], { pooling, normalize: true });
+        return p;
+      };
       let pipe;
       try {
-        pipe = await tf.pipeline("feature-extraction", cfg.model, {
-          dtype,
-          progress_callback,
-          session_options
-        });
+        pipe = await attempt(cfg.device, dtype);
+        _device = cfg.device && cfg.device !== "cpu" ? cfg.device : "cpu";
       } catch (e) {
         log(
           cfg.dataDir,
-          `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
+          `[embed] device=${cfg.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
         );
-        pipe = await tf.pipeline("feature-extraction", cfg.model, {
-          dtype: "fp32",
-          progress_callback,
-          session_options
-        });
+        pipe = await attempt("cpu", "fp32");
+        _device = "cpu";
       }
+      log(cfg.dataDir, `[embed] device=${_device}`);
       _pipe = pipe;
       writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
       return pipe;
@@ -836,6 +849,9 @@ async function embedReady(cfg) {
 }
 function embedLoaded() {
   return _pipe !== null;
+}
+function embedDevice() {
+  return _device;
 }
 var POOLINGS = /* @__PURE__ */ new Set(["mean", "cls", "last_token"]);
 async function embed(text, cfg, isQuery = false) {
@@ -1199,23 +1215,25 @@ async function getReranker(opts) {
       }
       const dtype = opts.dtype || "q8";
       const session_options = { intraOpNumThreads: threads, interOpNumThreads: 1 };
-      log(opts.dataDir, `[rerank] loading ${opts.model} (dtype=${dtype}, threads=${threads})`);
+      log(opts.dataDir, `[rerank] loading ${opts.model} (dtype=${dtype}, device=${opts.device || "cpu"}, threads=${threads})`);
       const tok = await tf.AutoTokenizer.from_pretrained(opts.model);
+      const attempt = async (device, dt) => {
+        const o = { dtype: dt, session_options };
+        if (device && device !== "cpu") o.device = device;
+        const m = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, o);
+        const probe = tok(["warmup"], { text_pair: ["warmup"], padding: true, truncation: true });
+        await m(probe);
+        return m;
+      };
       let model;
       try {
-        model = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, {
-          dtype,
-          session_options
-        });
+        model = await attempt(opts.device, dtype);
       } catch (e) {
         log(
           opts.dataDir,
-          `[rerank] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`
+          `[rerank] device=${opts.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
         );
-        model = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, {
-          dtype: "fp32",
-          session_options
-        });
+        model = await attempt("cpu", "fp32");
       }
       _tok = tok;
       _model = model;
@@ -1364,8 +1382,9 @@ var memoryStats = {
     lines.push(
       `- Vectors (sqlite-vec): ${s.vectorEnabled ? `\u2705 enabled (${s.vectorCount} indexed, ${missing} pending)` : "\u274C disabled"}`
     );
+    const dev = embedderUp ? ` (device=${embedDevice() || "cpu"})` : "";
     lines.push(
-      `- Embedder (${embedCfg.model}): ${!embedCfg.enabled ? "disabled (MEMORY_EMBED_ENABLED=0)" : embedderUp ? "\u2705 loaded" : "\u23F3 not loaded yet / unavailable"}`
+      `- Embedder (${embedCfg.model}): ${!embedCfg.enabled ? "disabled (MEMORY_EMBED_ENABLED=0)" : embedderUp ? `\u2705 loaded${dev}` : "\u23F3 not loaded yet / unavailable"}`
     );
     return lines.join("\n");
   }
@@ -1551,7 +1570,7 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.7.2" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.8.0" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1727,7 +1746,8 @@ async function main() {
     dtype: config.embed.dtype,
     cacheDir: config.embed.cacheDir,
     threads: config.embed.threads,
-    dataDir: config.dataDir
+    dataDir: config.dataDir,
+    device: config.embed.device
   };
   const rerankQuery = async (query, docs) => {
     if (!config.rerank.enabled || docs.length === 0) return null;

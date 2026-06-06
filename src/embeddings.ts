@@ -9,6 +9,8 @@ export interface EmbedConfig {
   cacheDir: string;
   /** ONNX precision: 'q8' (quantized, default, ~4× lighter) or 'fp32' (full precision). */
   dtype: string;
+  /** ONNX device: '' / 'cpu' (default), or a GPU EP — 'dml' | 'coreml' | 'cuda' | 'webgpu'. */
+  device: string;
   /** Pooling strategy: 'mean' (e5), 'cls' (bge), or 'last_token' (Qwen3-Embedding). Must match the model. */
   pooling: string;
   /** Instruction prefix prepended to QUERIES only (instruction-tuned models like Qwen3). '' = none. */
@@ -31,6 +33,7 @@ export function embedText(parts: Array<string | undefined>, max = 2000): string 
 let _pipe: any = null;
 let _loading: Promise<any> | null = null;
 let _failed = false;
+let _device = ''; // effective device after load ('cpu' or a GPU EP), for status reporting
 
 async function getPipe(cfg: EmbedConfig): Promise<any | null> {
   if (!cfg.enabled) return null;
@@ -95,25 +98,30 @@ async function getPipe(cfg: EmbedConfig): Promise<any | null> {
         executionMode: 'sequential',
         graphOptimizationLevel: 'all',
       };
+      const pooling = cfg.pooling === 'cls' ? 'cls' : 'mean';
+      // Load + a warmup inference. The warmup surfaces a GPU EP that loads but can't actually run the
+      // graph at startup (rather than silently returning null vectors during backfill).
+      const attempt = async (device: string, dt: string): Promise<any> => {
+        const opts: any = { dtype: dt, progress_callback, session_options };
+        if (device && device !== 'cpu') opts.device = device;
+        const p = await tf.pipeline('feature-extraction', cfg.model, opts);
+        await p(['warmup'], { pooling, normalize: true });
+        return p;
+      };
       let pipe: any;
       try {
-        pipe = await tf.pipeline('feature-extraction', cfg.model, {
-          dtype,
-          progress_callback,
-          session_options,
-        });
+        pipe = await attempt(cfg.device, dtype);
+        _device = cfg.device && cfg.device !== 'cpu' ? cfg.device : 'cpu';
       } catch (e) {
-        // The tier doesn't necessarily expose the quantized variant → fall back to full precision.
+        // GPU EP missing/unusable, or the quantized variant absent → fall back to CPU + fp32.
         log(
           cfg.dataDir,
-          `[embed] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`,
+          `[embed] device=${cfg.device || 'cpu'}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`,
         );
-        pipe = await tf.pipeline('feature-extraction', cfg.model, {
-          dtype: 'fp32',
-          progress_callback,
-          session_options,
-        });
+        pipe = await attempt('cpu', 'fp32');
+        _device = 'cpu';
       }
+      log(cfg.dataDir, `[embed] device=${_device}`);
       _pipe = pipe;
       writeStatus(cfg.dataDir, { state: 'idle', progress: undefined, file: undefined });
       return pipe;
@@ -139,6 +147,11 @@ export async function embedReady(cfg: EmbedConfig): Promise<boolean> {
 /** True if the model is ALREADY loaded — never triggers a (blocking) load. For status reporting. */
 export function embedLoaded(): boolean {
   return _pipe !== null;
+}
+
+/** Effective device after load ('cpu' or a GPU EP); '' if not loaded yet. For status reporting. */
+export function embedDevice(): string {
+  return _device;
 }
 
 const POOLINGS = new Set(['mean', 'cls', 'last_token']);

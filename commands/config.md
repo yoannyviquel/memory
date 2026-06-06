@@ -16,6 +16,10 @@ Selects the semantic embedding model. Three multilingual tiers (e5 family):
 > Models are loaded in **q8 (quantized)** by default: ~4× lighter to download
 > than fp32, for a negligible quality loss in semantic search. Force full
 > precision: `MEMORY_EMBED_DTYPE=fp32` (or `embedDtype` in `config.json`).
+>
+> **GPU (opt-in)**: `MEMORY_EMBED_DEVICE` / `embedDevice` runs the embedder + reranker on the GPU —
+> `dml` (Windows), `coreml` (macOS M), `cuda` (Linux NVIDIA), or `auto`. Default CPU; falls back to
+> CPU automatically if the device can't run. See the README "GPU acceleration" section.
 
 User argument: `$ARGUMENTS` (expected: `light`, `medium`, `heavy`, or empty to show the state).
 

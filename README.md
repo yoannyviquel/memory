@@ -159,6 +159,34 @@ cleared (detected via a `meta` table) and **re-vectorized in the background**; d
 searchable via BM25 in the meantime. Advanced override: env `MEMORY_EMBED_MODEL` +
 `MEMORY_EMBED_DIM`.
 
+### GPU acceleration (opt-in)
+
+Vectorization runs on **CPU by default**. To use the GPU, set `MEMORY_EMBED_DEVICE` — the embedder
+**and** reranker then run on it (leader only). `onnxruntime-node` bundles the execution providers, so
+no extra toolkit is needed (except an NVIDIA GPU for CUDA):
+
+| Platform | `MEMORY_EMBED_DEVICE` | Provider | Needs |
+|---|---|---|---|
+| Windows (any DX12 GPU, incl. iGPU) | `dml` | DirectML | a DX12 GPU |
+| macOS Apple Silicon (M1–M4) | `coreml` | CoreML (ANE/GPU) | macOS ≥ 10.15 |
+| Linux + NVIDIA | `cuda` | CUDA | NVIDIA GPU + driver |
+| any (experimental) | `webgpu` | WebGPU (Dawn) | — |
+| — (default) | unset / `cpu` | CPU | — |
+
+`auto` picks the platform's GPU EP (Windows→`dml`, macOS→`coreml`; else CPU). **The speedup is very
+hardware-dependent — not guaranteed.** Measured on an integrated GPU (DirectML), e5-large was
+break-even with CPU (~230/min both) and e5-small was *slower* on GPU: CPU `q8` (int8/AVX) is hard to
+beat for small models, and GPU EPs run `fp32`. A strong discrete GPU (or CUDA on NVIDIA) is where it
+pays off. **Benchmark before adopting** (`/memory:status` shows the effective `device=`; watch the
+backfill rate). Notes:
+- It's **opt-in**: the default stays CPU so the plugin installs and runs everywhere.
+- On GPU the default precision switches to **fp32** (int8/`q8` is poorly supported by GPU EPs);
+  override with `MEMORY_EMBED_DTYPE`.
+- **Safe fallback**: a device that loads but can't run is caught at startup (a warmup inference) and
+  the model falls back to **CPU/fp32** — logged, never a crash. `/memory:status` shows the effective
+  `device=…`.
+- CoreML op coverage is partial → some sub-graphs may run on CPU (less speedup).
+
 ## What it does
 
 - **Automatic capture** via hooks (same events as claude-mem):
@@ -231,7 +259,7 @@ Restart Claude Code (or `/reload-plugins`) to activate hooks + MCP server.
 
 Two mechanisms, **env takes precedence over the file**:
 - File `~/.claude-memory/config.json`, e.g. `{ "embedTier": "medium" }` (keys: `embedTier`,
-  `embedEnabled`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
+  `embedEnabled`, `embedDevice`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
 - System environment variables (overrides):
 
 | Variable | Default | Role |
@@ -247,7 +275,8 @@ Two mechanisms, **env takes precedence over the file**:
 | `MEMORY_RERANK_MODEL` | _(per tier)_ | Override the reranker model (empty = none) |
 | `MEMORY_EMBED_MODEL` | _(per tier)_ | Force a specific model (overrides the tier) |
 | `MEMORY_EMBED_DIM` | _(per tier)_ | Force the dimension (must match the model) |
-| `MEMORY_EMBED_DTYPE` | `q8` | ONNX precision: `q8` (quantized) or `fp32` (full precision) |
+| `MEMORY_EMBED_DTYPE` | `q8` (cpu) / `fp32` (gpu) | ONNX precision: `q8` (quantized) or `fp32` |
+| `MEMORY_EMBED_DEVICE` | _(cpu)_ | GPU opt-in: `dml` / `coreml` / `cuda` / `webgpu` / `auto` (see GPU section) |
 | `MEMORY_EMBED_CACHE_DIR` | `~/.claude-memory/models` | ONNX model cache |
 | `MEMORY_VEC_EXTENSION` | _(auto)_ | Explicit path to the sqlite-vec library |
 

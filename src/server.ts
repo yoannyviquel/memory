@@ -272,6 +272,7 @@ async function main(): Promise<void> {
     cacheDir: config.embed.cacheDir,
     threads: config.embed.threads,
     dataDir: config.dataDir,
+    device: config.embed.device,
   };
   const rerankQuery = async (query: string, docs: string[]): Promise<number[] | null> => {
     if (!config.rerank.enabled || docs.length === 0) return null;

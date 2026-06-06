@@ -64,6 +64,17 @@ export const EMBED_TIERS: Record<
 };
 const DEFAULT_TIER = 'light';
 
+/**
+ * Resolves the ONNX device string. '' = CPU (default). 'auto' picks the platform's bundled GPU EP
+ * (Windows→DirectML, macOS→CoreML); elsewhere CPU (CUDA stays explicit — it needs an NVIDIA GPU).
+ */
+function resolveDevice(raw: string): string {
+  if (raw !== 'auto') return raw; // '', 'cpu', 'dml', 'coreml', 'cuda', 'webgpu' → as-is
+  if (process.platform === 'win32') return 'dml';
+  if (process.platform === 'darwin') return 'coreml';
+  return '';
+}
+
 function readConfigFile(dataDir: string): Record<string, unknown> {
   try {
     return JSON.parse(readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
@@ -116,11 +127,18 @@ export function loadConfig(): MemoryConfig {
   const queryPrefix = get('MEMORY_EMBED_QUERY_PREFIX', 'embedQueryPrefix') ?? picked.queryPrefix ?? '';
   const enabled = get('MEMORY_EMBED_ENABLED', 'embedEnabled') !== '0';
   const cacheDir = get('MEMORY_EMBED_CACHE_DIR', 'embedCacheDir') || path.join(dataDir, 'models');
-  // Quantized by default: ~4× lighter to download, negligible quality loss in retrieval.
-  const dtype = (get('MEMORY_EMBED_DTYPE', 'embedDtype') || 'q8').toLowerCase();
-  // ONNX thread cap scales with the tier: a heavier model is the reason you'd want more cores, and
-  // the larger the model the longer each batch — so we let it use a bigger slice. light=25%,
-  // light=33%, medium=66%, heavy=100% of the cores. Floor of 1 so single/dual-core hosts still run.
+  // ONNX execution device (opt-in GPU). Empty = CPU (default → not passed to the pipeline).
+  //  - explicit: cpu | dml (Windows) | coreml (macOS) | cuda (Linux+NVIDIA) | webgpu (experimental)
+  //  - 'auto': pick the platform's GPU EP (win32→dml, darwin→coreml; else CPU since CUDA needs NVIDIA).
+  // EPs are bundled in onnxruntime-node; loads fall back to CPU at warmup if the device can't run.
+  const device = resolveDevice((get('MEMORY_EMBED_DEVICE', 'embedDevice') || '').toLowerCase());
+  // Precision. Quantized (q8) by default on CPU (~4× lighter); GPU EPs handle int8 poorly, so default
+  // to fp32 there. An explicit MEMORY_EMBED_DTYPE always wins.
+  const dtypeOverride = get('MEMORY_EMBED_DTYPE', 'embedDtype');
+  const onGpu = device !== '' && device !== 'cpu';
+  const dtype = (dtypeOverride || (onGpu ? 'fp32' : 'q8')).toLowerCase();
+  // ONNX thread cap scales with the tier (CPU only; ignored by GPU EPs). light=33%, medium=66%,
+  // heavy=100% of the cores. Floor of 1 so single/dual-core hosts still run.
   // Single source of truth: the tier (no separate override knob).
   const threadFraction: Record<string, number> = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
@@ -141,7 +159,7 @@ export function loadConfig(): MemoryConfig {
     dbPath,
     dataDir,
     contextLimit,
-    embed: { enabled, tier, model, dim, cacheDir, dtype, pooling, queryPrefix, threads, dataDir },
+    embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel },
   };

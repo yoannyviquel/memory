@@ -1,6 +1,6 @@
 import type { ToolDefinition } from './types.js';
 import type { MemoryDoc, MemoryType } from '../store.js';
-import { embedLoaded } from '../embeddings.js';
+import { embedLoaded, embedDevice } from '../embeddings.js';
 
 const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
 
@@ -135,12 +135,13 @@ const memoryStats: ToolDefinition = {
     lines.push(
       `- Vectors (sqlite-vec): ${s.vectorEnabled ? `✅ enabled (${s.vectorCount} indexed, ${missing} pending)` : '❌ disabled'}`,
     );
+    const dev = embedderUp ? ` (device=${embedDevice() || 'cpu'})` : '';
     lines.push(
       `- Embedder (${embedCfg.model}): ${
         !embedCfg.enabled
           ? 'disabled (MEMORY_EMBED_ENABLED=0)'
           : embedderUp
-            ? '✅ loaded'
+            ? `✅ loaded${dev}`
             : '⏳ not loaded yet / unavailable'
       }`,
     );

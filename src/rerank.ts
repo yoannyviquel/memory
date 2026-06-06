@@ -7,6 +7,8 @@ export interface RerankOptions {
   cacheDir: string;
   threads: number;
   dataDir: string;
+  /** ONNX device: '' / 'cpu' (default) or a GPU EP ('dml' | 'coreml' | 'cuda' | 'webgpu'). */
+  device: string;
 }
 
 // Singleton reranker (tokenizer + sequence-classification model), loaded once per process.
@@ -35,23 +37,26 @@ async function getReranker(opts: RerankOptions): Promise<{ tok: any; model: any 
       }
       const dtype = opts.dtype || 'q8';
       const session_options = { intraOpNumThreads: threads, interOpNumThreads: 1 };
-      log(opts.dataDir, `[rerank] loading ${opts.model} (dtype=${dtype}, threads=${threads})`);
+      log(opts.dataDir, `[rerank] loading ${opts.model} (dtype=${dtype}, device=${opts.device || 'cpu'}, threads=${threads})`);
       const tok = await tf.AutoTokenizer.from_pretrained(opts.model);
+      // Load + warmup on a tiny pair → surfaces a GPU EP that can't run at startup (→ CPU fallback).
+      const attempt = async (device: string, dt: string): Promise<any> => {
+        const o: any = { dtype: dt, session_options };
+        if (device && device !== 'cpu') o.device = device;
+        const m = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, o);
+        const probe = tok(['warmup'], { text_pair: ['warmup'], padding: true, truncation: true });
+        await m(probe);
+        return m;
+      };
       let model: any;
       try {
-        model = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, {
-          dtype,
-          session_options,
-        });
+        model = await attempt(opts.device, dtype);
       } catch (e) {
         log(
           opts.dataDir,
-          `[rerank] dtype=${dtype} unavailable (${e instanceof Error ? e.message : String(e)}); falling back to fp32`,
+          `[rerank] device=${opts.device || 'cpu'}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`,
         );
-        model = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, {
-          dtype: 'fp32',
-          session_options,
-        });
+        model = await attempt('cpu', 'fp32');
       }
       _tok = tok;
       _model = model;
