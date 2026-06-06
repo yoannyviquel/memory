@@ -1,6 +1,6 @@
 {
   "name": "memory",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Persistent memory for Claude Code (SQLite + FTS5) — capture via hooks, search via MCP.",
   "type": "module",
   "private": true,
@@ -13,6 +13,7 @@
     "dev": "tsx src/server.ts",
     "migrate": "node --no-warnings dist/migrate.js",
     "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
     "clean": "rimraf dist"
   },
   "dependencies": {

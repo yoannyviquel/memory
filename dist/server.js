@@ -1537,7 +1537,7 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.7.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.7.1" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
@@ -1642,6 +1642,7 @@ function processName(tier) {
   return `yoannyviquel_memory_${safe}`;
 }
 function ensureNamedBinary(name) {
+  if (process.env.MEMORY_DISABLE_RENAME === "1") return;
   if (process.platform !== "win32") return;
   try {
     const scriptPath = process.argv[1];

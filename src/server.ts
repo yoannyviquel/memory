@@ -182,6 +182,7 @@ function processName(tier: string): string {
  * yoannyviquel_memory_*.exe copies from previous tiers are pruned (skipping the one in use).
  */
 function ensureNamedBinary(name: string): void {
+  if (process.env.MEMORY_DISABLE_RENAME === '1') return; // tests / dev: don't copy the exe or touch .mcp.json
   if (process.platform !== 'win32') return; // Linux/macOS CLI is already covered by process.title
   try {
     const scriptPath = process.argv[1];
