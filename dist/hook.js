@@ -91,13 +91,16 @@ function loadConfig() {
   const digestModel = src.get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
   const rerankModel = src.get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
   const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
+  const autoRecallEnabled = src.flag("MEMORY_AUTO_RECALL", "autoRecall");
+  const autoRecallLimit = src.num("MEMORY_AUTO_RECALL_LIMIT", "autoRecallLimit", 3);
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
-    rerank: { enabled: rerankEnabled, model: rerankModel }
+    rerank: { enabled: rerankEnabled, model: rerankModel },
+    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit }
   };
 }
 
@@ -181,6 +184,7 @@ function jsonArr(v) {
 }
 function rowToDoc(r) {
   return {
+    id: r.mem_id ?? void 0,
     type: r.type,
     session_id: r.session_id ?? void 0,
     project: r.project ?? void 0,
@@ -732,7 +736,8 @@ function defaultState() {
     filesModified: [],
     filesRead: [],
     tools: [],
-    startedAt: (/* @__PURE__ */ new Date()).toISOString()
+    startedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    injected: []
   };
 }
 function stateDir(cfg) {
@@ -905,6 +910,63 @@ function uniq(arr) {
   return [...new Set(arr.filter(Boolean))];
 }
 
+// src/leader.ts
+import { readFileSync as readFileSync5, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, unlinkSync } from "fs";
+import path5 from "path";
+function lockPath(dataDir) {
+  return path5.join(dataDir, "worker.lock");
+}
+function readLock(dataDir) {
+  try {
+    return JSON.parse(readFileSync5(lockPath(dataDir), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// src/embed-service.ts
+import { createServer, request as httpRequest } from "http";
+var TOKEN_HEADER = "x-mem-token";
+function post(endpoint, path6, body, pick, timeoutMs = 8e3) {
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port: endpoint.port,
+        method: "POST",
+        path: path6,
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(data),
+          [TOKEN_HEADER]: endpoint.token
+        }
+      },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => d += c);
+        res.on("end", () => {
+          try {
+            resolve(pick(JSON.parse(d)));
+          } catch {
+            resolve(null);
+          }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.write(data);
+    req.end();
+  });
+}
+function remoteEmbed(endpoint, text, timeoutMs = 8e3) {
+  return post(endpoint, "/embed", { text }, (j) => Array.isArray(j?.vector) ? j.vector : null, timeoutMs);
+}
+
 // src/hook.ts
 var CONTINUE = JSON.stringify({ continue: true, suppressOutput: true });
 function readStdin() {
@@ -926,46 +988,55 @@ function baseFields(payload, state) {
     ts: nowIso()
   };
 }
+var RECALL_DIRECTIVE = "> \u{1F4A1} This project has persistent memory. Before answering about past work, decisions, bugs, or files here, consider `memory_search`. Relevant memories are auto-injected below and on each prompt.";
+function memoryLine(d) {
+  const date = (d.ts ?? "").slice(0, 10);
+  const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(no summary)";
+  const files = (d.files_modified ?? []).slice(0, 3).join(", ");
+  return `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` \u2014 files: ${files}` : ""}`;
+}
+async function leaderEmbed(cfg, text) {
+  if (!cfg.embed.enabled) return null;
+  const lock = readLock(cfg.dataDir);
+  if (lock?.port && lock?.token) {
+    return remoteEmbed({ port: lock.port, token: lock.token }, text, 1500);
+  }
+  return null;
+}
 function handleSessionStart(cfg, store, payload) {
   const project = projectFromCwd(payload.cwd);
   const cores = store.listCore(project).slice(0, 30);
   const digests = store.recent({ project, type: "digest", limit: cfg.contextLimit });
   const recent = digests.length > 0 ? digests : store.recent({ project, limit: cfg.contextLimit });
+  if (payload.session_id) {
+    const st = loadState(cfg, payload.session_id);
+    st.injected = uniq([
+      ...st.injected,
+      ...cores.map((c) => c.id),
+      ...recent.map((d) => d.id).filter((x) => !!x)
+    ]);
+    saveState(cfg, payload.session_id, st);
+  }
   const total = store.stats().total;
   const header = `\u{1F9E0} mem active \u2014 db: ${cfg.dbPath} \xB7 model: ${cfg.embed.model} \xB7 ${total} docs \xB7 vectors: ${store.vectorEnabled ? "on" : "off"}`;
-  if (cores.length === 0 && recent.length === 0) {
-    return JSON.stringify({
-      hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: header }
-    });
-  }
-  const lines = [header, ""];
+  const lines = [header, "", RECALL_DIRECTIVE];
   if (cores.length > 0) {
-    lines.push(`## \u2B50 Core memory (always-on)`);
+    lines.push("", `## \u2B50 Core memory (always-on)`);
     for (const c of cores) {
       const scope = c.doc.project ? `[${c.doc.project}]` : "[global]";
       lines.push(`- ${scope} ${summarize(c.doc.summary ?? "", 240)}`);
     }
-    lines.push("");
   }
   if (recent.length > 0) {
-    lines.push(`## Project memory "${project}"`);
-    lines.push(`Latest memories from previous sessions:`);
-    for (const d of recent) {
-      const date = (d.ts ?? "").slice(0, 10);
-      const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(no summary)";
-      const files = (d.files_modified ?? []).slice(0, 3).join(", ");
-      lines.push(
-        `- [${date}] (${d.type}) ${summarize(label, 160)}${files ? ` \u2014 files: ${files}` : ""}`
-      );
-    }
-    lines.push("");
+    lines.push("", `## Project memory "${project}"`, `Latest memories from previous sessions:`);
+    for (const d of recent) lines.push(memoryLine(d));
   }
-  lines.push(`_Search: \`memory_search\` \xB7 core: \`memory_core_add\` / \`/memory:core\`._`);
+  lines.push("", `_Search: \`memory_search\` \xB7 core: \`memory_core_add\` / \`/memory:core\`._`);
   return JSON.stringify({
     hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: lines.join("\n") }
   });
 }
-function handlePrompt(cfg, store, payload) {
+async function handlePrompt(cfg, store, payload) {
   if (!payload.session_id || !payload.prompt) return CONTINUE;
   const state = loadState(cfg, payload.session_id);
   state.project = projectFromCwd(payload.cwd);
@@ -973,6 +1044,7 @@ function handlePrompt(cfg, store, payload) {
   state.cwd = payload.cwd;
   state.promptNumber += 1;
   state.prompts.push(payload.prompt.slice(0, 4e3));
+  const promptId = `${payload.session_id}:prompt:${state.promptNumber}`;
   const doc = {
     type: "prompt",
     ...baseFields(payload, state),
@@ -980,9 +1052,40 @@ function handlePrompt(cfg, store, payload) {
     user_prompt: payload.prompt.slice(0, 4e3),
     summary: summarize(payload.prompt)
   };
-  store.upsert(`${payload.session_id}:prompt:${state.promptNumber}`, doc);
+  store.upsert(promptId, doc);
+  const recall = await buildRecall(cfg, store, payload.prompt, state, promptId);
   saveState(cfg, payload.session_id, state);
-  return CONTINUE;
+  if (!recall) return CONTINUE;
+  return JSON.stringify({
+    continue: true,
+    suppressOutput: true,
+    hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: recall }
+  });
+}
+async function buildRecall(cfg, store, prompt, state, promptId) {
+  if (!cfg.autoRecall.enabled) return null;
+  const q = prompt.trim();
+  if (q.length < 24) return null;
+  try {
+    const seen = new Set(state.injected);
+    const embedding = store.vectorEnabled ? await leaderEmbed(cfg, q) : null;
+    const cand = store.search({
+      query: q,
+      project: state.project,
+      limit: cfg.autoRecall.limit + seen.size + 5,
+      embedding
+    });
+    const fresh = cand.filter((d) => d.id && d.id !== promptId && !seen.has(d.id)).slice(0, cfg.autoRecall.limit);
+    if (fresh.length === 0) return null;
+    state.injected = [...state.injected, ...fresh.map((d) => d.id)];
+    return [
+      `## \u{1F9E0} Related memories (auto-recall)`,
+      ...fresh.map(memoryLine),
+      `_(\`memory_search\` / \`memory_recent\` for more)_`
+    ].join("\n");
+  } catch {
+    return null;
+  }
 }
 function handleObserve(cfg, store, payload) {
   if (!payload.session_id || !payload.tool_name) return CONTINUE;
@@ -1086,7 +1189,7 @@ async function main() {
         output = handleSessionStart(cfg, store, payload);
         break;
       case "prompt":
-        output = handlePrompt(cfg, store, payload);
+        output = await handlePrompt(cfg, store, payload);
         break;
       case "observe":
         output = handleObserve(cfg, store, payload);

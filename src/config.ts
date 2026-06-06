@@ -10,6 +10,14 @@ export interface MemoryConfig {
   embed: EmbedConfig;
   digest: DigestConfig;
   rerank: RerankConfig;
+  autoRecall: AutoRecallConfig;
+}
+
+export interface AutoRecallConfig {
+  /** Inject the most relevant memories into each user prompt (UserPromptSubmit hook). On by default. */
+  enabled: boolean;
+  /** Max NEW memories injected per prompt (deduped against what's already in this session's context). */
+  limit: number;
 }
 
 export interface RerankConfig {
@@ -182,6 +190,12 @@ export function loadConfig(): MemoryConfig {
   const rerankModel = src.get('MEMORY_RERANK_MODEL', 'rerankModel') || picked.reranker || '';
   const rerankEnabled = src.flag('MEMORY_RERANK_ENABLED', 'rerankEnabled') && !!rerankModel;
 
+  // Auto-recall: the UserPromptSubmit hook injects the top relevant memories into each prompt so
+  // recall is systematic (not left to the model deciding to call memory_search). On by default;
+  // bounded + deduped per session to keep the context from bloating. Disable with MEMORY_AUTO_RECALL=0.
+  const autoRecallEnabled = src.flag('MEMORY_AUTO_RECALL', 'autoRecall');
+  const autoRecallLimit = src.num('MEMORY_AUTO_RECALL_LIMIT', 'autoRecallLimit', 3);
+
   return {
     dbPath,
     dataDir,
@@ -189,5 +203,6 @@ export function loadConfig(): MemoryConfig {
     embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel },
+    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit },
   };
 }

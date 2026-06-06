@@ -91,13 +91,16 @@ function loadConfig() {
   const digestModel = src.get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
   const rerankModel = src.get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
   const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
+  const autoRecallEnabled = src.flag("MEMORY_AUTO_RECALL", "autoRecall");
+  const autoRecallLimit = src.num("MEMORY_AUTO_RECALL_LIMIT", "autoRecallLimit", 3);
   return {
     dbPath,
     dataDir,
     contextLimit,
     embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
-    rerank: { enabled: rerankEnabled, model: rerankModel }
+    rerank: { enabled: rerankEnabled, model: rerankModel },
+    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit }
   };
 }
 
@@ -181,6 +184,7 @@ function jsonArr(v) {
 }
 function rowToDoc(r) {
   return {
+    id: r.mem_id ?? void 0,
     type: r.type,
     session_id: r.session_id ?? void 0,
     project: r.project ?? void 0,
@@ -1143,8 +1147,8 @@ function post(endpoint, path9, body, pick, timeoutMs = 8e3) {
     req.end();
   });
 }
-function remoteEmbed(endpoint, text) {
-  return post(endpoint, "/embed", { text }, (j) => Array.isArray(j?.vector) ? j.vector : null);
+function remoteEmbed(endpoint, text, timeoutMs = 8e3) {
+  return post(endpoint, "/embed", { text }, (j) => Array.isArray(j?.vector) ? j.vector : null, timeoutMs);
 }
 function remoteRerank(endpoint, query, docs) {
   return post(endpoint, "/rerank", { query, docs }, (j) => Array.isArray(j?.scores) ? j.scores : null);
@@ -1923,7 +1927,7 @@ var allTools = [
 ];
 
 // src/memory-server.ts
-var PKG_VERSION = true ? "0.9.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.10.0" : "0.0.0-dev";
 var MemoryServer = class {
   constructor(config, store) {
     this.config = config;

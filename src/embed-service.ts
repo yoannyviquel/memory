@@ -111,8 +111,9 @@ function post(
 export function remoteEmbed(
   endpoint: { port: number; token: string },
   text: string,
+  timeoutMs = 8000,
 ): Promise<number[] | null> {
-  return post(endpoint, '/embed', { text }, (j) => (Array.isArray(j?.vector) ? j.vector : null));
+  return post(endpoint, '/embed', { text }, (j) => (Array.isArray(j?.vector) ? j.vector : null), timeoutMs);
 }
 
 /** Client: ask the leader to rerank docs for a query. Returns scores, or null (→ keep RRF order). */
