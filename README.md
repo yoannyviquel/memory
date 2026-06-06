@@ -31,6 +31,55 @@ flowchart TB
 - Across several open sessions, **one server is elected leader** (it holds the single loaded model);
   the others route their query embedding to it. See [Leader failover](#leader-failover-shared-model).
 
+### Auto-recall (systematic memory injection)
+
+Recall is **automatic** — it is **not** left to the model deciding to call `memory_search`. Memories
+reach the context through two injection paths:
+
+- **At `SessionStart`** — core memories + recent digests for the project (the session's starting context).
+- **On every prompt** (`UserPromptSubmit`) — the hook searches the prompt just typed and injects the
+  top relevant memories inline, so the answer is grounded in past work even on the first turn.
+
+The per-prompt recall is **hybrid**: the ephemeral hook embeds the *query* via the leader's loopback
+service (it loads no model itself), falling back to BM25 if no leader is reachable.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as User prompt
+    participant H as UserPromptSubmit hook (no model)
+    participant DB as SQLite (BM25 + sqlite-vec)
+    participant L as Leader (has model)
+    U->>H: prompt text
+    H->>DB: capture the prompt (BM25)
+    H->>L: embed query over loopback (1.5s, best-effort)
+    L-->>H: query vector (or none → BM25-only)
+    H->>DB: hybrid search (BM25 + KNN, RRF)
+    DB-->>H: top candidates
+    Note over H: drop what's already in context this session + the prompt itself · cap to N
+    H-->>U: inject "🧠 Related memories" into the prompt
+```
+
+**On by default**; disable with `MEMORY_AUTO_RECALL=0`, cap with `MEMORY_AUTO_RECALL_LIMIT` (default 3).
+
+**Anti-bloat** — the injected context can't snowball over a long session:
+
+- **Dedup per session** — a memory is injected **at most once** (the set includes what `SessionStart`
+  already showed), tracked in the session state file.
+- **Bounded** — at most `MEMORY_AUTO_RECALL_LIMIT` *new* memories per prompt (default 3), each a single
+  compact line.
+- **Gated** — trivial prompts (< 24 chars: "ok", "yes"…) skip recall entirely.
+
+So most turns inject **0** (nothing new or relevant), and a given memory never repeats.
+
+> **Single memory backend.** To make this plugin the *only* persistent memory — instead of Claude
+> Code's built-in `.md` file memory — add a memory-policy block to your global `~/.claude/CLAUDE.md`
+> instructing Claude to save durable facts via `memory_core_add` (and **not** write `.md` memory files
+> or a `MEMORY.md`). The plugin reinforces this with a `SessionStart` reminder. Explicit "remember
+> this" → `memory_core_add` (always-injected core memory); ordinary work is captured automatically by
+> the hooks. The CLAUDE.md instruction is what reliably overrides the built-in file memory — the
+> plugin can't disable it on its own.
+
 ## Why SQLite (and not Elasticsearch)
 
 SQLite is an **embedded** database: a library + a file opened in-process. No server to install
@@ -190,8 +239,9 @@ backfill rate). Notes:
 ## What it does
 
 - **Automatic capture** via hooks (same events as claude-mem):
-  - `SessionStart` → **injects** the project's recent memories into the context (token savings).
-  - `UserPromptSubmit` → indexes the user prompt.
+  - `SessionStart` → **injects** the project's core memories + recent digests into the context.
+  - `UserPromptSubmit` → indexes the user prompt **and injects** the top relevant memories
+    (auto-recall — see [Auto-recall](#auto-recall-systematic-memory-injection)).
   - `PostToolUse` → indexes one observation per tool call (tool, touched files).
   - `Stop` → indexes the assistant turn (text, tools, files).
   - `SessionEnd` → indexes a session summary.
@@ -229,8 +279,8 @@ backfill rate). Notes:
   drive automatic re-digest / re-vectorization when the prompt or embed text changes — no manual
   migration. Existing sessions are digested retroactively, **drip-limited** (3/tick) to avoid a burst.
 
-All hooks run with `suppressOutput` (no noise in the context), except `SessionStart` which
-emits `additionalContext`.
+All hooks run with `suppressOutput` (no noise in the context), except `SessionStart` and
+`UserPromptSubmit` (auto-recall), which emit `additionalContext`.
 
 ## Requirements
 
@@ -259,7 +309,7 @@ Restart Claude Code (or `/reload-plugins`) to activate hooks + MCP server.
 
 Two mechanisms, **env takes precedence over the file**:
 - File `~/.claude-memory/config.json`, e.g. `{ "embedTier": "medium" }` (keys: `embedTier`,
-  `embedEnabled`, `embedDevice`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
+  `embedEnabled`, `embedDevice`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `autoRecall`, `autoRecallLimit`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
 - System environment variables (overrides):
 
 | Variable | Default | Role |
@@ -273,6 +323,8 @@ Two mechanisms, **env takes precedence over the file**:
 | `MEMORY_DIGEST_MODEL` | `haiku` | Model for digests (`haiku` / `sonnet` / `opus` / pinned id) |
 | `MEMORY_RERANK_ENABLED` | _(enabled)_ | `0` to disable the cross-encoder reranker |
 | `MEMORY_RERANK_MODEL` | _(per tier)_ | Override the reranker model (empty = none) |
+| `MEMORY_AUTO_RECALL` | _(enabled)_ | `0` to disable per-prompt auto-recall injection |
+| `MEMORY_AUTO_RECALL_LIMIT` | `3` | Max new memories injected per prompt (auto-recall) |
 | `MEMORY_EMBED_MODEL` | _(per tier)_ | Force a specific model (overrides the tier) |
 | `MEMORY_EMBED_DIM` | _(per tier)_ | Force the dimension (must match the model) |
 | `MEMORY_EMBED_DTYPE` | `q8` (cpu) / `fp32` (gpu) | ONNX precision: `q8` (quantized) or `fp32` |

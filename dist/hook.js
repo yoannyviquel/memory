@@ -989,6 +989,7 @@ function baseFields(payload, state) {
   };
 }
 var RECALL_DIRECTIVE = "> \u{1F4A1} This project has persistent memory. Before answering about past work, decisions, bugs, or files here, consider `memory_search`. Relevant memories are auto-injected below and on each prompt.";
+var MEMORY_POLICY = "> \u{1F5C4}\uFE0F This `memory` plugin is the memory backend. To remember a durable fact, call `memory_core_add` (or `/memory:core`) \u2014 do NOT write `.md` memory files or a `MEMORY.md`. Ordinary work is captured automatically.";
 function memoryLine(d) {
   const date = (d.ts ?? "").slice(0, 10);
   const label = d.summary || d.user_prompt || d.assistant_text || d.prompts && d.prompts[0] || d.tool_brief || "(no summary)";
@@ -1019,7 +1020,7 @@ function handleSessionStart(cfg, store, payload) {
   }
   const total = store.stats().total;
   const header = `\u{1F9E0} mem active \u2014 db: ${cfg.dbPath} \xB7 model: ${cfg.embed.model} \xB7 ${total} docs \xB7 vectors: ${store.vectorEnabled ? "on" : "off"}`;
-  const lines = [header, "", RECALL_DIRECTIVE];
+  const lines = [header, "", RECALL_DIRECTIVE, MEMORY_POLICY];
   if (cores.length > 0) {
     lines.push("", `## \u2B50 Core memory (always-on)`);
     for (const c of cores) {
