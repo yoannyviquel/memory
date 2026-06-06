@@ -72,6 +72,14 @@ sequenceDiagram
 
 So most turns inject **0** (nothing new or relevant), and a given memory never repeats.
 
+> **Single memory backend.** To make this plugin the *only* persistent memory — instead of Claude
+> Code's built-in `.md` file memory — add a memory-policy block to your global `~/.claude/CLAUDE.md`
+> instructing Claude to save durable facts via `memory_core_add` (and **not** write `.md` memory files
+> or a `MEMORY.md`). The plugin reinforces this with a `SessionStart` reminder. Explicit "remember
+> this" → `memory_core_add` (always-injected core memory); ordinary work is captured automatically by
+> the hooks. The CLAUDE.md instruction is what reliably overrides the built-in file memory — the
+> plugin can't disable it on its own.
+
 ## Why SQLite (and not Elasticsearch)
 
 SQLite is an **embedded** database: a library + a file opened in-process. No server to install

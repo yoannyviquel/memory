@@ -59,6 +59,11 @@ function baseFields(payload: HookPayload, state: SessionState): Partial<MemoryDo
 const RECALL_DIRECTIVE =
   '> 💡 This project has persistent memory. Before answering about past work, decisions, bugs, or files here, consider `memory_search`. Relevant memories are auto-injected below and on each prompt.';
 
+// Memory-backend policy (lever to route persistence here instead of the built-in file memory). The
+// authoritative override lives in the user's global CLAUDE.md; this is the in-session reminder.
+const MEMORY_POLICY =
+  '> 🗄️ This `memory` plugin is the memory backend. To remember a durable fact, call `memory_core_add` (or `/memory:core`) — do NOT write `.md` memory files or a `MEMORY.md`. Ordinary work is captured automatically.';
+
 /** One compact line for an injected memory (SessionStart + auto-recall share this format). */
 function memoryLine(d: MemoryDoc): string {
   const date = (d.ts ?? '').slice(0, 10);
@@ -108,7 +113,7 @@ function handleSessionStart(cfg: MemoryConfig, store: MemoryStore, payload: Hook
   const total = store.stats().total;
   const header = `🧠 mem active — db: ${cfg.dbPath} · model: ${cfg.embed.model} · ${total} docs · vectors: ${store.vectorEnabled ? 'on' : 'off'}`;
 
-  const lines: string[] = [header, '', RECALL_DIRECTIVE];
+  const lines: string[] = [header, '', RECALL_DIRECTIVE, MEMORY_POLICY];
 
   // Core memories first — these must be in context from the start.
   if (cores.length > 0) {
