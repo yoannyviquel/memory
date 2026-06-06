@@ -17,7 +17,7 @@ import {
 import path from 'node:path';
 import { loadConfig, EMBED_TEXT_VERSION, type MemoryConfig } from './config.js';
 import { MemoryStore, type MemoryDoc } from './store.js';
-import { embed, embedReady } from './embeddings.js';
+import { embed, embedBatch, embedReady } from './embeddings.js';
 import { digestSession, claudeAvailable } from './digest.js';
 import { refreshLeadership, readLock, releaseLeadership } from './leader.js';
 import { startLeaderService, remoteEmbed, remoteRerank } from './embed-service.js';
@@ -36,6 +36,9 @@ console.log = (...args: unknown[]) => console.error('[stdout-redirected]', ...ar
 
 const BACKFILL_INTERVAL_MS = 60_000;
 const HEARTBEAT_MS = 30_000;
+// Docs vectorized per ONNX pass. Batching amortizes per-call overhead and uses the matmuls far
+// better than batch=1 → much faster backfill. CPU peak stays bounded by the tier's thread cap.
+const BACKFILL_BATCH = 32;
 let backfilling = false;
 // Only the elected leader runs the heavy background work; updated by the heartbeat below.
 let amLeader = false;
@@ -48,21 +51,28 @@ async function backfill(store: MemoryStore, cfg: MemoryConfig): Promise<void> {
   if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
   if (!(await embedReady(cfg.embed))) return;
   backfilling = true;
-  // One doc at a time, no inter-doc delay: CPU is bounded solely by the tier's ONNX thread cap.
-  // Docs stay searchable via BM25 while their vectors are still being filled in.
+  // Batched: one ONNX pass per BACKFILL_BATCH docs, written in a single transaction. CPU peak stays
+  // bounded by the tier's thread cap; docs stay searchable via BM25 while vectors fill in.
   try {
     for (;;) {
-      const docs = store.missingVectorDocs(1);
+      const docs = store.missingVectorDocs(BACKFILL_BATCH);
       if (docs.length === 0) break;
-      const doc = docs[0];
       writeStatus(cfg.dataDir, {
         state: 'backfilling',
         model: cfg.embed.model,
         vectorized: store.stats().vectorCount,
         missing: store.countMissingVectors(),
       });
-      const vector = await embed(doc.text, cfg.embed);
-      if (vector) store.setVectorByRowid(doc.rowid, vector);
+      const vectors = await embedBatch(
+        docs.map((d) => d.text),
+        cfg.embed,
+      );
+      const writes: Array<{ rowid: number; embedding: number[] }> = [];
+      for (let i = 0; i < docs.length; i++) {
+        const v = vectors[i];
+        if (v) writes.push({ rowid: docs[i].rowid, embedding: v });
+      }
+      store.setVectorsBulk(writes);
     }
   } catch {
     /* best-effort */

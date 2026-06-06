@@ -372,6 +372,22 @@ export class MemoryStore {
     this.upsertVector(rowid, embedding);
   }
 
+  /** Bulk vector writes in a single transaction (one commit instead of one fsync per vector). */
+  setVectorsBulk(items: Array<{ rowid: number; embedding: number[] }>): void {
+    if (!this._vectorEnabled || items.length === 0) return;
+    this.db.exec('BEGIN;');
+    try {
+      for (const it of items) this.upsertVector(it.rowid, it.embedding);
+      this.db.exec('COMMIT;');
+    } catch {
+      try {
+        this.db.exec('ROLLBACK;');
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   /**
    * Vectorizable documents (prompt/turn/session) without a vector, most recent first.
    * Returns the rowid + the text to embed. Empty if the vector index is disabled.

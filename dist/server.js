@@ -362,6 +362,20 @@ var MemoryStore = class {
   setVectorByRowid(rowid, embedding) {
     this.upsertVector(rowid, embedding);
   }
+  /** Bulk vector writes in a single transaction (one commit instead of one fsync per vector). */
+  setVectorsBulk(items) {
+    if (!this._vectorEnabled || items.length === 0) return;
+    this.db.exec("BEGIN;");
+    try {
+      for (const it of items) this.upsertVector(it.rowid, it.embedding);
+      this.db.exec("COMMIT;");
+    } catch {
+      try {
+        this.db.exec("ROLLBACK;");
+      } catch {
+      }
+    }
+  }
   /**
    * Vectorizable documents (prompt/turn/session) without a vector, most recent first.
    * Returns the rowid + the text to embed. Empty if the vector index is disabled.
@@ -1537,10 +1551,11 @@ var allTools = [
 ];
 
 // src/server.ts
-var PKG_VERSION = true ? "0.7.1" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.7.2" : "0.0.0-dev";
 console.log = (...args) => console.error("[stdout-redirected]", ...args);
 var BACKFILL_INTERVAL_MS = 6e4;
 var HEARTBEAT_MS = 3e4;
+var BACKFILL_BATCH = 32;
 var backfilling = false;
 var amLeader = false;
 var myEmbedPort = 0;
@@ -1551,17 +1566,24 @@ async function backfill(store, cfg) {
   backfilling = true;
   try {
     for (; ; ) {
-      const docs = store.missingVectorDocs(1);
+      const docs = store.missingVectorDocs(BACKFILL_BATCH);
       if (docs.length === 0) break;
-      const doc = docs[0];
       writeStatus(cfg.dataDir, {
         state: "backfilling",
         model: cfg.embed.model,
         vectorized: store.stats().vectorCount,
         missing: store.countMissingVectors()
       });
-      const vector = await embed(doc.text, cfg.embed);
-      if (vector) store.setVectorByRowid(doc.rowid, vector);
+      const vectors = await embedBatch(
+        docs.map((d) => d.text),
+        cfg.embed
+      );
+      const writes = [];
+      for (let i = 0; i < docs.length; i++) {
+        const v = vectors[i];
+        if (v) writes.push({ rowid: docs[i].rowid, embedding: v });
+      }
+      store.setVectorsBulk(writes);
     }
   } catch {
   } finally {
