@@ -1,6 +1,5 @@
 import type { ToolDefinition } from './types.js';
 import type { MemoryDoc, MemoryType } from '../store.js';
-import { embedLoaded, embedDevice } from '../embeddings.js';
 
 const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
 
@@ -113,12 +112,12 @@ const memoryStats: ToolDefinition = {
   description:
     'Diagnostics: SQLite database path, total documents, breakdown by type/project, state of the vector index and the local embedder.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  handler: async (_args, { store, embedCfg }) => {
+  handler: async (_args, { store, embedCfg, embedder }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
-    // Report state WITHOUT forcing a model load — embedReady() would block on a heavy-tier load
+    // Report state WITHOUT forcing a model load — ready() would block on a heavy-tier load
     // and make /memory:status unresponsive exactly while the model is initializing.
-    const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedLoaded() : false;
+    const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedder.loaded() : false;
     const lines: string[] = [];
     lines.push(`**memory — state**`);
     lines.push(`- SQLite database: \`${s.dbPath}\``);
@@ -135,7 +134,7 @@ const memoryStats: ToolDefinition = {
     lines.push(
       `- Vectors (sqlite-vec): ${s.vectorEnabled ? `✅ enabled (${s.vectorCount} indexed, ${missing} pending)` : '❌ disabled'}`,
     );
-    const dev = embedderUp ? ` (device=${embedDevice() || 'cpu'})` : '';
+    const dev = embedderUp ? ` (device=${embedder.deviceUsed() || 'cpu'})` : '';
     lines.push(
       `- Embedder (${embedCfg.model}): ${
         !embedCfg.enabled

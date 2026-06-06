@@ -1,24 +1,5 @@
 #!/usr/bin/env node
 
-// src/server.ts
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema
-} from "@modelcontextprotocol/sdk/types.js";
-import {
-  existsSync as existsSync4,
-  copyFileSync,
-  mkdirSync as mkdirSync4,
-  readFileSync as readFileSync5,
-  writeFileSync as writeFileSync3,
-  readdirSync,
-  unlinkSync as unlinkSync2,
-  watch
-} from "fs";
-import path7 from "path";
-
 // src/config.ts
 import os from "os";
 import path from "path";
@@ -715,6 +696,14 @@ var MemoryStore = class {
   }
 };
 
+// src/memory-server.ts
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { existsSync as existsSync5 } from "fs";
+import { randomBytes } from "crypto";
+import path8 from "path";
+
 // src/log.ts
 import { appendFileSync, mkdirSync as mkdirSync2, existsSync as existsSync2, statSync, renameSync, readFileSync as readFileSync2, writeFileSync } from "fs";
 import path3 from "path";
@@ -755,129 +744,558 @@ function writeStatus(dataDir, patch) {
   }
 }
 
-// src/embeddings.ts
-var _pipe = null;
-var _loading = null;
-var _failed = false;
-var _device = "";
-async function getPipe(cfg) {
-  if (!cfg.enabled) return null;
-  if (_pipe) return _pipe;
-  if (_failed) return null;
-  if (_loading) return _loading;
-  _loading = (async () => {
-    try {
-      const mod = "@huggingface/transformers";
-      const tf = await import(mod);
-      tf.env.cacheDir = cfg.cacheDir;
-      tf.env.allowRemoteModels = true;
-      const threads = Math.max(1, cfg.threads || 1);
+// src/model-host.ts
+var ModelHost = class {
+  constructor(cacheDir, device, dtype, threads, dataDir, tag) {
+    this.cacheDir = cacheDir;
+    this.device = device;
+    this.dtype = dtype;
+    this.threads = threads;
+    this.dataDir = dataDir;
+    this.tag = tag;
+  }
+  cacheDir;
+  device;
+  dtype;
+  threads;
+  dataDir;
+  tag;
+  model = null;
+  loading = null;
+  failed = false;
+  /** Effective device after load ('cpu' or a GPU EP); '' until loaded. For status reporting. */
+  effectiveDevice = "";
+  /** True if the model is ALREADY loaded — never triggers a (blocking) load. For status reporting. */
+  loaded() {
+    return this.model !== null;
+  }
+  /** Effective device after load ('cpu' or a GPU EP); '' if not loaded yet. */
+  deviceUsed() {
+    return this.effectiveDevice;
+  }
+  /** Loads the model once (shared promise) and returns it, or null if unavailable. */
+  async load() {
+    if (this.model) return this.model;
+    if (this.failed) return null;
+    if (this.loading) return this.loading;
+    this.loading = (async () => {
       try {
-        tf.env.backends.onnx.numThreads = threads;
-        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
-      } catch {
-      }
-      log(cfg.dataDir, `[embed] onnx threads capped at ${threads}`);
-      const dtype = cfg.dtype || "q8";
-      log(cfg.dataDir, `[embed] loading ${cfg.model} (dtype=${dtype}) cache=${cfg.cacheDir}`);
-      writeStatus(cfg.dataDir, { state: "loading", model: cfg.model, progress: void 0, file: void 0 });
-      const lastPct = {};
-      const progress_callback = (p) => {
+        const mod = "@huggingface/transformers";
+        const tf = await import(mod);
+        tf.env.cacheDir = this.cacheDir;
+        tf.env.allowRemoteModels = true;
+        const threads = Math.max(1, this.threads || 1);
         try {
-          if (p?.status === "progress" && p.file && typeof p.progress === "number") {
-            const pct = Math.round(p.progress);
-            const bucket = Math.floor(pct / 10);
-            if (lastPct[p.file] !== bucket) {
-              lastPct[p.file] = bucket;
-              log(cfg.dataDir, `[embed] download ${p.file} ${pct}%`);
-            }
-            writeStatus(cfg.dataDir, { state: "downloading", model: cfg.model, file: p.file, progress: pct });
-          } else if (p?.status === "done" && p.file) {
-            log(cfg.dataDir, `[embed] downloaded ${p.file}`);
-          } else if (p?.status === "ready") {
-            log(cfg.dataDir, `[embed] model ready (${cfg.model})`);
-          }
+          tf.env.backends.onnx.numThreads = threads;
+          if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
         } catch {
         }
-      };
-      const session_options = {
-        intraOpNumThreads: threads,
-        interOpNumThreads: 1,
-        executionMode: "sequential",
-        graphOptimizationLevel: "all"
-      };
-      const pooling = cfg.pooling === "cls" ? "cls" : "mean";
-      const attempt = async (device, dt) => {
-        const opts = { dtype: dt, progress_callback, session_options };
-        if (device && device !== "cpu") opts.device = device;
-        const p = await tf.pipeline("feature-extraction", cfg.model, opts);
-        await p(["warmup"], { pooling, normalize: true });
-        return p;
-      };
-      let pipe;
-      try {
-        pipe = await attempt(cfg.device, dtype);
-        _device = cfg.device && cfg.device !== "cpu" ? cfg.device : "cpu";
-      } catch (e) {
-        log(
-          cfg.dataDir,
-          `[embed] device=${cfg.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
-        );
-        pipe = await attempt("cpu", "fp32");
-        _device = "cpu";
+        const session_options = this.sessionOptions(threads);
+        const dtype = this.dtype || "q8";
+        await this.beforeAttempts(tf, threads, dtype);
+        const attempt = async (device, dt) => {
+          const m2 = await this.build(tf, device, dt, session_options);
+          await this.warmup(m2);
+          return m2;
+        };
+        let m;
+        try {
+          m = await attempt(this.device, dtype);
+          this.effectiveDevice = this.device && this.device !== "cpu" ? this.device : "cpu";
+        } catch (e) {
+          log(
+            this.dataDir,
+            `[${this.tag}] device=${this.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
+          );
+          m = await attempt("cpu", "fp32");
+          this.effectiveDevice = "cpu";
+        }
+        this.model = m;
+        await this.afterLoad();
+        return m;
+      } catch (err) {
+        this.failed = true;
+        const message = err instanceof Error ? err.message : String(err);
+        await this.onLoadError(message);
+        return null;
+      } finally {
+        this.loading = null;
       }
-      log(cfg.dataDir, `[embed] device=${_device}`);
-      _pipe = pipe;
-      writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
-      return pipe;
-    } catch (err) {
-      _failed = true;
-      const message = err instanceof Error ? err.message : String(err);
-      log(cfg.dataDir, `[embed] unavailable: ${message}`);
-      writeStatus(cfg.dataDir, { state: "idle", progress: void 0, file: void 0 });
-      process.stderr.write(`[memory] embedder unavailable: ${message}
-`);
-      return null;
-    } finally {
-      _loading = null;
-    }
-  })();
-  return _loading;
-}
-async function embedReady(cfg) {
-  return !!await getPipe(cfg);
-}
-function embedLoaded() {
-  return _pipe !== null;
-}
-function embedDevice() {
-  return _device;
-}
+    })();
+    return this.loading;
+  }
+  // --- Varying steps (defaults are no-ops; subclasses override what they need) ---
+  /** ONNX session tuning. Default: single-pool sequential. */
+  sessionOptions(threads) {
+    return { intraOpNumThreads: threads, interOpNumThreads: 1 };
+  }
+  /** One-time pre-load step (logging, status writes, tokenizer load). */
+  async beforeAttempts(_tf, _threads, _dtype) {
+  }
+  /** Success side-effects (final logging, status idle). */
+  async afterLoad() {
+  }
+  /** Failure side-effects (logging, status idle, stderr). */
+  async onLoadError(_message) {
+  }
+};
+
+// src/embeddings.ts
 var POOLINGS = /* @__PURE__ */ new Set(["mean", "cls", "last_token"]);
-async function embed(text, cfg, isQuery = false) {
-  const r = await embedBatch([text], cfg, isQuery);
-  return r[0] ?? null;
+var EmbedderHost = class extends ModelHost {
+  constructor(cfg) {
+    super(cfg.cacheDir, cfg.device, cfg.dtype, cfg.threads, cfg.dataDir, "embed");
+    this.cfg = cfg;
+  }
+  cfg;
+  progressCb;
+  // Maximize a single sequential embedding across its allowed threads:
+  //  - intraOpNumThreads = threads → fans the heavy matmuls of ONE inference over every allowed core.
+  //  - interOpNumThreads = 1 + executionMode sequential → no second pool (a transformer encoder is a
+  //    serial layer stack, so inter-op parallelism adds nothing and would risk exceeding the cap).
+  //  - graphOptimizationLevel 'all' → fused kernels run faster on the same threads.
+  sessionOptions(threads) {
+    return {
+      intraOpNumThreads: threads,
+      interOpNumThreads: 1,
+      executionMode: "sequential",
+      graphOptimizationLevel: "all"
+    };
+  }
+  async beforeAttempts(_tf, threads, dtype) {
+    log(this.dataDir, `[embed] onnx threads capped at ${threads}`);
+    log(this.dataDir, `[embed] loading ${this.cfg.model} (dtype=${dtype}) cache=${this.cfg.cacheDir}`);
+    writeStatus(this.dataDir, { state: "loading", model: this.cfg.model, progress: void 0, file: void 0 });
+    const lastPct = {};
+    this.progressCb = (p) => {
+      try {
+        if (p?.status === "progress" && p.file && typeof p.progress === "number") {
+          const pct = Math.round(p.progress);
+          const bucket = Math.floor(pct / 10);
+          if (lastPct[p.file] !== bucket) {
+            lastPct[p.file] = bucket;
+            log(this.dataDir, `[embed] download ${p.file} ${pct}%`);
+          }
+          writeStatus(this.dataDir, { state: "downloading", model: this.cfg.model, file: p.file, progress: pct });
+        } else if (p?.status === "done" && p.file) {
+          log(this.dataDir, `[embed] downloaded ${p.file}`);
+        } else if (p?.status === "ready") {
+          log(this.dataDir, `[embed] model ready (${this.cfg.model})`);
+        }
+      } catch {
+      }
+    };
+  }
+  async build(tf, device, dt, session_options) {
+    const opts = { dtype: dt, progress_callback: this.progressCb, session_options };
+    if (device && device !== "cpu") opts.device = device;
+    return tf.pipeline("feature-extraction", this.cfg.model, opts);
+  }
+  async warmup(pipe) {
+    const pooling = this.cfg.pooling === "cls" ? "cls" : "mean";
+    await pipe(["warmup"], { pooling, normalize: true });
+  }
+  async afterLoad() {
+    log(this.dataDir, `[embed] device=${this.effectiveDevice}`);
+    writeStatus(this.dataDir, { state: "idle", progress: void 0, file: void 0 });
+  }
+  async onLoadError(message) {
+    log(this.dataDir, `[embed] unavailable: ${message}`);
+    writeStatus(this.dataDir, { state: "idle", progress: void 0, file: void 0 });
+    process.stderr.write(`[memory] embedder unavailable: ${message}
+`);
+  }
+  /** True if the model is loadable (triggers loading). */
+  async ready() {
+    if (!this.cfg.enabled) return false;
+    return !!await this.load();
+  }
+  /**
+   * Embeds one text. `isQuery` matters for instruction-tuned models (e.g. Qwen3-Embedding) that want
+   * a query-side prefix; documents are embedded raw. No-op for models without a queryPrefix.
+   */
+  async embed(text, isQuery = false) {
+    const r = await this.embedBatch([text], isQuery);
+    return r[0] ?? null;
+  }
+  /** Batch embeddings (pooling per model + L2 normalization). null per entry on failure. */
+  async embedBatch(texts, isQuery = false) {
+    if (!this.cfg.enabled || texts.length === 0) return texts.map(() => null);
+    const pipe = await this.load();
+    if (!pipe) return texts.map(() => null);
+    try {
+      const inputs = isQuery && this.cfg.queryPrefix ? texts.map((t) => `${this.cfg.queryPrefix}${t}`) : texts;
+      const pooling = POOLINGS.has(this.cfg.pooling) ? this.cfg.pooling : "mean";
+      const out = await pipe(inputs, { pooling, normalize: true });
+      const arr = out.tolist();
+      return texts.map((_, i) => Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null);
+    } catch {
+      return texts.map(() => null);
+    }
+  }
+};
+
+// src/rerank.ts
+var RerankerHost = class extends ModelHost {
+  constructor(opts) {
+    super(opts.cacheDir, opts.device, opts.dtype, opts.threads, opts.dataDir, "rerank");
+    this.opts = opts;
+  }
+  opts;
+  tok = null;
+  async beforeAttempts(tf, threads, dtype) {
+    log(
+      this.dataDir,
+      `[rerank] loading ${this.opts.model} (dtype=${dtype}, device=${this.opts.device || "cpu"}, threads=${threads})`
+    );
+    this.tok = await tf.AutoTokenizer.from_pretrained(this.opts.model);
+  }
+  async build(tf, device, dt, session_options) {
+    const o = { dtype: dt, session_options };
+    if (device && device !== "cpu") o.device = device;
+    return tf.AutoModelForSequenceClassification.from_pretrained(this.opts.model, o);
+  }
+  async warmup(model) {
+    const probe = this.tok(["warmup"], { text_pair: ["warmup"], padding: true, truncation: true });
+    await model(probe);
+  }
+  async afterLoad() {
+    log(this.dataDir, `[rerank] model ready (${this.opts.model})`);
+  }
+  async onLoadError(message) {
+    log(this.dataDir, `[rerank] unavailable: ${message}`);
+  }
+  /**
+   * Cross-encoder relevance scores for (query, doc) pairs. Returns one score per doc (higher = more
+   * relevant), aligned to `docs`, or null if the reranker is unavailable (→ caller keeps RRF order).
+   */
+  async rerank(query, docs) {
+    if (docs.length === 0) return [];
+    if (!this.opts.model) return null;
+    const model = await this.load();
+    if (!model) return null;
+    try {
+      const inputs = this.tok(new Array(docs.length).fill(query), {
+        text_pair: docs,
+        padding: true,
+        truncation: true
+      });
+      const { logits } = await model(inputs);
+      const rows = logits.sigmoid().tolist();
+      return rows.map((row) => Array.isArray(row) ? Number(row[0]) : Number(row));
+    } catch {
+      return null;
+    }
+  }
+};
+
+// src/leader.ts
+import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, unlinkSync } from "fs";
+import path4 from "path";
+var STALE_MS = 9e4;
+function lockPath(dataDir) {
+  return path4.join(dataDir, "worker.lock");
 }
-async function embedBatch(texts, cfg, isQuery = false) {
-  if (!cfg.enabled || texts.length === 0) return texts.map(() => null);
-  const pipe = await getPipe(cfg);
-  if (!pipe) return texts.map(() => null);
+function pidAlive(pid) {
   try {
-    const inputs = isQuery && cfg.queryPrefix ? texts.map((t) => `${cfg.queryPrefix}${t}`) : texts;
-    const pooling = POOLINGS.has(cfg.pooling) ? cfg.pooling : "mean";
-    const out = await pipe(inputs, { pooling, normalize: true });
-    const arr = out.tolist();
-    return texts.map((_, i) => Array.isArray(arr[i]) && arr[i].length > 0 ? arr[i] : null);
-  } catch {
-    return texts.map(() => null);
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e?.code === "EPERM";
   }
 }
+function readLock(dataDir) {
+  try {
+    return JSON.parse(readFileSync3(lockPath(dataDir), "utf8"));
+  } catch {
+    return null;
+  }
+}
+function releaseLeadership(dataDir) {
+  try {
+    const cur = readLock(dataDir);
+    if (cur && cur.pid === process.pid) unlinkSync(lockPath(dataDir));
+  } catch {
+  }
+}
+function refreshLeadership(dataDir, extra) {
+  const file = lockPath(dataDir);
+  const now = Date.now();
+  const cur = readLock(dataDir);
+  if (cur && cur.pid !== process.pid) {
+    const fresh = typeof cur.ts === "number" && now - cur.ts < STALE_MS;
+    if (fresh && typeof cur.pid === "number" && pidAlive(cur.pid)) return false;
+  }
+  try {
+    mkdirSync3(path4.dirname(file), { recursive: true });
+    writeFileSync2(file, JSON.stringify({ pid: process.pid, ts: now, ...extra ?? {} }));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/embed-service.ts
+import { createServer, request as httpRequest } from "http";
+var TOKEN_HEADER = "x-mem-token";
+function readBody(req) {
+  return new Promise((resolve) => {
+    let body = "";
+    req.on("data", (c) => body += c);
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+async function startLeaderService(handlers, token) {
+  const server = createServer(async (req, res) => {
+    if (req.method !== "POST" || req.headers[TOKEN_HEADER] !== token) {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    try {
+      const body = await readBody(req);
+      let payload;
+      if (req.url === "/embed") {
+        payload = { vector: await handlers.embed(String(body?.text ?? "")) };
+      } else if (req.url === "/rerank") {
+        const docs = Array.isArray(body?.docs) ? body.docs.map((d) => String(d)) : [];
+        payload = { scores: await handlers.rerank(String(body?.query ?? ""), docs) };
+      } else {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    } catch {
+      res.writeHead(500);
+      res.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+  server.unref?.();
+  return port;
+}
+function post(endpoint, path9, body, pick, timeoutMs = 8e3) {
+  return new Promise((resolve) => {
+    const data = JSON.stringify(body);
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port: endpoint.port,
+        method: "POST",
+        path: path9,
+        headers: {
+          "content-type": "application/json",
+          "content-length": Buffer.byteLength(data),
+          [TOKEN_HEADER]: endpoint.token
+        }
+      },
+      (res) => {
+        let d = "";
+        res.on("data", (c) => d += c);
+        res.on("end", () => {
+          try {
+            resolve(pick(JSON.parse(d)));
+          } catch {
+            resolve(null);
+          }
+        });
+      }
+    );
+    req.on("error", () => resolve(null));
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve(null);
+    });
+    req.write(data);
+    req.end();
+  });
+}
+function remoteEmbed(endpoint, text) {
+  return post(endpoint, "/embed", { text }, (j) => Array.isArray(j?.vector) ? j.vector : null);
+}
+function remoteRerank(endpoint, query, docs) {
+  return post(endpoint, "/rerank", { query, docs }, (j) => Array.isArray(j?.scores) ? j.scores : null);
+}
+
+// src/query-executor.ts
+var LocalExecutor = class {
+  constructor(embedder, reranker) {
+    this.embedder = embedder;
+    this.reranker = reranker;
+  }
+  embedder;
+  reranker;
+  embedQuery(text) {
+    return this.embedder.embed(text, true);
+  }
+  rerankQuery(query, docs) {
+    return this.reranker.rerank(query, docs);
+  }
+};
+var RemoteExecutor = class {
+  constructor(dataDir) {
+    this.dataDir = dataDir;
+  }
+  dataDir;
+  async embedQuery(text) {
+    const lock = readLock(this.dataDir);
+    if (lock?.port && lock?.token) return remoteEmbed({ port: lock.port, token: lock.token }, text);
+    return null;
+  }
+  async rerankQuery(query, docs) {
+    const lock = readLock(this.dataDir);
+    if (lock?.port && lock?.token) return remoteRerank({ port: lock.port, token: lock.token }, query, docs);
+    return null;
+  }
+};
+
+// src/leader-coordinator.ts
+import { EventEmitter } from "events";
+import { watch } from "fs";
+var HEARTBEAT_MS = 3e4;
+var LeaderCoordinator = class extends EventEmitter {
+  constructor(dataDir) {
+    super();
+    this.dataDir = dataDir;
+  }
+  dataDir;
+  leader = false;
+  /** Extra fields published into the lock (the leader's loopback endpoint). */
+  extra = {};
+  heartbeat;
+  watcher;
+  watchT;
+  releasing = false;
+  isLeader() {
+    return this.leader;
+  }
+  /** Publishes the leader's loopback endpoint into the lock (re-refreshes immediately). */
+  publishEndpoint(port, token) {
+    this.extra = { port, token };
+    this.sync();
+  }
+  /**
+   * Acquires/renews the lock once and emits a transition event if leadership changed. Safe to call
+   * repeatedly (heartbeat + fs.watch). A tiny two-leaders race is harmless (writes are idempotent).
+   */
+  sync() {
+    const was = this.leader;
+    this.leader = refreshLeadership(this.dataDir, this.extra);
+    if (this.leader !== was) {
+      log(this.dataDir, `[server] leadership \u2192 ${this.leader}`);
+      this.emit(this.leader ? "becameLeader" : "lostLeadership");
+    }
+  }
+  /**
+   * First sync + heartbeat + near-instant failover watch. When the leader releases the lock, a
+   * follower re-checks immediately instead of waiting for its 30 s heartbeat (only followers react;
+   * a leader ignores its own writes). Heartbeat remains the fallback if fs.watch is unsupported.
+   */
+  start() {
+    this.sync();
+    this.heartbeat = setInterval(() => this.sync(), HEARTBEAT_MS);
+    this.heartbeat.unref?.();
+    try {
+      this.watcher = watch(this.dataDir, (_event, filename) => {
+        if (!this.leader && filename && String(filename).includes("worker.lock")) {
+          clearTimeout(this.watchT);
+          this.watchT = setTimeout(() => this.sync(), 200);
+        }
+      });
+      this.watcher.unref?.();
+    } catch {
+    }
+  }
+  /**
+   * Releases leadership if held (called on exit/session close) so a sibling takes over on its next
+   * heartbeat instead of waiting out the stale timeout. Idempotent.
+   */
+  release() {
+    if (this.releasing) return;
+    this.releasing = true;
+    if (this.leader) {
+      releaseLeadership(this.dataDir);
+      log(this.dataDir, `[server] released leadership on exit (pid ${process.pid})`);
+    }
+  }
+};
+
+// src/backfill-loop.ts
+var BACKFILL_INTERVAL_MS = 6e4;
+var BACKFILL_BATCH = 32;
+var BackfillLoop = class {
+  constructor(store, cfg, embedder) {
+    this.store = store;
+    this.cfg = cfg;
+    this.embedder = embedder;
+  }
+  store;
+  cfg;
+  embedder;
+  running = false;
+  timer;
+  /** Kicks one pass now (warm + drain) and every interval afterwards. */
+  start() {
+    if (this.timer || !this.store.vectorEnabled || !this.cfg.embed.enabled) return;
+    void this.run();
+    this.timer = setInterval(() => void this.run(), BACKFILL_INTERVAL_MS);
+    this.timer.unref?.();
+  }
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = void 0;
+  }
+  /** One backfill drain: batched ONNX passes, each written in a single transaction. Best-effort. */
+  async run() {
+    if (this.running || !this.store.vectorEnabled || !this.cfg.embed.enabled) return;
+    if (!await this.embedder.ready()) return;
+    this.running = true;
+    try {
+      for (; ; ) {
+        const docs = this.store.missingVectorDocs(BACKFILL_BATCH);
+        if (docs.length === 0) break;
+        writeStatus(this.cfg.dataDir, {
+          state: "backfilling",
+          model: this.cfg.embed.model,
+          vectorized: this.store.stats().vectorCount,
+          missing: this.store.countMissingVectors()
+        });
+        const vectors = await this.embedder.embedBatch(docs.map((d) => d.text));
+        const writes = [];
+        for (let i = 0; i < docs.length; i++) {
+          const v = vectors[i];
+          if (v) writes.push({ rowid: docs[i].rowid, embedding: v });
+        }
+        this.store.setVectorsBulk(writes);
+      }
+    } catch {
+    } finally {
+      this.running = false;
+      const s = this.store.stats();
+      writeStatus(this.cfg.dataDir, {
+        state: "idle",
+        vectorized: s.vectorCount,
+        missing: this.store.countMissingVectors()
+      });
+    }
+  }
+};
 
 // src/digest.ts
 import { spawn } from "child_process";
 import { existsSync as existsSync3 } from "fs";
 import os2 from "os";
-import path4 from "path";
+import path5 from "path";
 var KINDS = /* @__PURE__ */ new Set(["decision", "bugfix", "discovery", "conclusion"]);
 var INPUT_BUDGET = 48e3;
 var TIMEOUT_MS = 18e4;
@@ -956,10 +1374,10 @@ function resolveClaudeExe() {
   const isWin = process.platform === "win32";
   const name = isWin ? "claude.exe" : "claude";
   const sep = isWin ? ";" : ":";
-  const dirs = [path4.join(os2.homedir(), ".local", "bin"), ...(process.env.PATH || "").split(sep)];
+  const dirs = [path5.join(os2.homedir(), ".local", "bin"), ...(process.env.PATH || "").split(sep)];
   for (const d of dirs) {
     if (!d) continue;
-    const p = path4.join(d, name);
+    const p = path5.join(d, name);
     if (existsSync3(p)) return p;
   }
   return null;
@@ -1053,223 +1471,6 @@ async function digestSession(input) {
   };
 }
 
-// src/leader.ts
-import { readFileSync as readFileSync3, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, unlinkSync } from "fs";
-import path5 from "path";
-var STALE_MS = 9e4;
-function lockPath(dataDir) {
-  return path5.join(dataDir, "worker.lock");
-}
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return e?.code === "EPERM";
-  }
-}
-function readLock(dataDir) {
-  try {
-    return JSON.parse(readFileSync3(lockPath(dataDir), "utf8"));
-  } catch {
-    return null;
-  }
-}
-function releaseLeadership(dataDir) {
-  try {
-    const cur = readLock(dataDir);
-    if (cur && cur.pid === process.pid) unlinkSync(lockPath(dataDir));
-  } catch {
-  }
-}
-function refreshLeadership(dataDir, extra) {
-  const file = lockPath(dataDir);
-  const now = Date.now();
-  const cur = readLock(dataDir);
-  if (cur && cur.pid !== process.pid) {
-    const fresh = typeof cur.ts === "number" && now - cur.ts < STALE_MS;
-    if (fresh && typeof cur.pid === "number" && pidAlive(cur.pid)) return false;
-  }
-  try {
-    mkdirSync3(path5.dirname(file), { recursive: true });
-    writeFileSync2(file, JSON.stringify({ pid: process.pid, ts: now, ...extra ?? {} }));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// src/embed-service.ts
-import { createServer, request as httpRequest } from "http";
-var TOKEN_HEADER = "x-mem-token";
-function readBody(req) {
-  return new Promise((resolve) => {
-    let body = "";
-    req.on("data", (c) => body += c);
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        resolve(null);
-      }
-    });
-  });
-}
-async function startLeaderService(handlers, token) {
-  const server = createServer(async (req, res) => {
-    if (req.method !== "POST" || req.headers[TOKEN_HEADER] !== token) {
-      res.writeHead(404);
-      res.end();
-      return;
-    }
-    try {
-      const body = await readBody(req);
-      let payload;
-      if (req.url === "/embed") {
-        payload = { vector: await handlers.embed(String(body?.text ?? "")) };
-      } else if (req.url === "/rerank") {
-        const docs = Array.isArray(body?.docs) ? body.docs.map((d) => String(d)) : [];
-        payload = { scores: await handlers.rerank(String(body?.query ?? ""), docs) };
-      } else {
-        res.writeHead(404);
-        res.end();
-        return;
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(payload));
-    } catch {
-      res.writeHead(500);
-      res.end();
-    }
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const addr = server.address();
-  const port = typeof addr === "object" && addr ? addr.port : 0;
-  server.unref?.();
-  return port;
-}
-function post(endpoint, path8, body, pick, timeoutMs = 8e3) {
-  return new Promise((resolve) => {
-    const data = JSON.stringify(body);
-    const req = httpRequest(
-      {
-        host: "127.0.0.1",
-        port: endpoint.port,
-        method: "POST",
-        path: path8,
-        headers: {
-          "content-type": "application/json",
-          "content-length": Buffer.byteLength(data),
-          [TOKEN_HEADER]: endpoint.token
-        }
-      },
-      (res) => {
-        let d = "";
-        res.on("data", (c) => d += c);
-        res.on("end", () => {
-          try {
-            resolve(pick(JSON.parse(d)));
-          } catch {
-            resolve(null);
-          }
-        });
-      }
-    );
-    req.on("error", () => resolve(null));
-    req.setTimeout(timeoutMs, () => {
-      req.destroy();
-      resolve(null);
-    });
-    req.write(data);
-    req.end();
-  });
-}
-function remoteEmbed(endpoint, text) {
-  return post(endpoint, "/embed", { text }, (j) => Array.isArray(j?.vector) ? j.vector : null);
-}
-function remoteRerank(endpoint, query, docs) {
-  return post(endpoint, "/rerank", { query, docs }, (j) => Array.isArray(j?.scores) ? j.scores : null);
-}
-
-// src/rerank.ts
-var _tok = null;
-var _model = null;
-var _loading2 = null;
-var _failed2 = false;
-async function getReranker(opts) {
-  if (!opts.model) return null;
-  if (_model && _tok) return { tok: _tok, model: _model };
-  if (_failed2) return null;
-  if (_loading2) return _loading2;
-  _loading2 = (async () => {
-    try {
-      const mod = "@huggingface/transformers";
-      const tf = await import(mod);
-      tf.env.cacheDir = opts.cacheDir;
-      tf.env.allowRemoteModels = true;
-      const threads = Math.max(1, opts.threads || 1);
-      try {
-        tf.env.backends.onnx.numThreads = threads;
-        if (tf.env.backends.onnx.wasm) tf.env.backends.onnx.wasm.numThreads = threads;
-      } catch {
-      }
-      const dtype = opts.dtype || "q8";
-      const session_options = { intraOpNumThreads: threads, interOpNumThreads: 1 };
-      log(opts.dataDir, `[rerank] loading ${opts.model} (dtype=${dtype}, device=${opts.device || "cpu"}, threads=${threads})`);
-      const tok = await tf.AutoTokenizer.from_pretrained(opts.model);
-      const attempt = async (device, dt) => {
-        const o = { dtype: dt, session_options };
-        if (device && device !== "cpu") o.device = device;
-        const m = await tf.AutoModelForSequenceClassification.from_pretrained(opts.model, o);
-        const probe = tok(["warmup"], { text_pair: ["warmup"], padding: true, truncation: true });
-        await m(probe);
-        return m;
-      };
-      let model;
-      try {
-        model = await attempt(opts.device, dtype);
-      } catch (e) {
-        log(
-          opts.dataDir,
-          `[rerank] device=${opts.device || "cpu"}/dtype=${dtype} failed (${e instanceof Error ? e.message : String(e)}); falling back to cpu/fp32`
-        );
-        model = await attempt("cpu", "fp32");
-      }
-      _tok = tok;
-      _model = model;
-      log(opts.dataDir, `[rerank] model ready (${opts.model})`);
-      return { tok, model };
-    } catch (err) {
-      _failed2 = true;
-      log(opts.dataDir, `[rerank] unavailable: ${err instanceof Error ? err.message : String(err)}`);
-      return null;
-    } finally {
-      _loading2 = null;
-    }
-  })();
-  return _loading2;
-}
-async function rerank(query, docs, opts) {
-  if (docs.length === 0) return [];
-  const r = await getReranker(opts);
-  if (!r) return null;
-  try {
-    const inputs = r.tok(new Array(docs.length).fill(query), {
-      text_pair: docs,
-      padding: true,
-      truncation: true
-    });
-    const { logits } = await r.model(inputs);
-    const rows = logits.sigmoid().tolist();
-    return rows.map((row) => Array.isArray(row) ? Number(row[0]) : Number(row));
-  } catch {
-    return null;
-  }
-}
-
-// src/server.ts
-import { randomBytes } from "crypto";
-
 // src/memory.ts
 import { readFileSync as readFileSync4 } from "fs";
 import path6 from "path";
@@ -1278,6 +1479,135 @@ function nowIso() {
 }
 function uniq(arr) {
   return [...new Set(arr.filter(Boolean))];
+}
+
+// src/digest-loop.ts
+var DIGEST_INTERVAL_MS = 6e4;
+var DIGEST_PER_TICK = 3;
+var DigestLoop = class {
+  constructor(store, cfg) {
+    this.store = store;
+    this.cfg = cfg;
+  }
+  store;
+  cfg;
+  running = false;
+  timer;
+  warnedNoClaude = false;
+  /** Kicks one pass now and every interval afterwards. */
+  start() {
+    if (this.timer || !this.cfg.digest.enabled) return;
+    void this.run();
+    this.timer = setInterval(() => void this.run(), DIGEST_INTERVAL_MS);
+    this.timer.unref?.();
+  }
+  stop() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = void 0;
+  }
+  /** One drip of digests (up to DIGEST_PER_TICK sessions). Best-effort: never blocks the server. */
+  async run() {
+    if (this.running || !this.cfg.digest.enabled) return;
+    if (!claudeAvailable()) {
+      if (!this.warnedNoClaude) {
+        this.warnedNoClaude = true;
+        log(this.cfg.dataDir, "[digest] disabled: no native `claude` binary found on PATH (~/.local/bin)");
+      }
+      return;
+    }
+    this.running = true;
+    try {
+      const sessions = this.store.sessionsNeedingDigest(this.cfg.digest.version, DIGEST_PER_TICK);
+      for (const sess of sessions) {
+        const turns = this.store.turnsForSession(sess.session_id);
+        if (turns.length === 0) continue;
+        writeStatus(this.cfg.dataDir, {
+          state: "digesting",
+          digestPending: this.store.countSessionsNeedingDigest(this.cfg.digest.version)
+        });
+        const result = await digestSession({
+          session_id: sess.session_id,
+          project: sess.project,
+          branch: sess.branch,
+          model: this.cfg.digest.model,
+          turns
+        });
+        if (!result) continue;
+        const ts = nowIso();
+        const base = { session_id: sess.session_id, project: sess.project, branch: sess.branch, ts };
+        const digestFiles = uniq(result.insights.flatMap((i) => i.files ?? []));
+        const digestDoc = {
+          type: "digest",
+          ...base,
+          summary: result.conclusion,
+          source: String(this.cfg.digest.version),
+          // version marker → re-digest selector
+          files_modified: digestFiles
+        };
+        const insightDocs = result.insights.map((ins) => ({
+          type: "insight",
+          ...base,
+          summary: ins.text,
+          assistant_text: ins.text,
+          source: ins.kind,
+          // decision | bugfix | discovery | conclusion
+          files_modified: ins.files ?? []
+        }));
+        this.store.writeDigest(sess.session_id, digestDoc, insightDocs);
+        log(
+          this.cfg.dataDir,
+          `[digest] ${sess.session_id} \u2192 ${result.insights.length} insights${result.costUsd != null ? ` ($${result.costUsd.toFixed(4)})` : ""}`
+        );
+      }
+    } catch {
+    } finally {
+      this.running = false;
+      const remaining = this.store.countSessionsNeedingDigest(this.cfg.digest.version);
+      if (remaining === 0) writeStatus(this.cfg.dataDir, { state: "idle", digestPending: 0 });
+    }
+  }
+};
+
+// src/process-name.ts
+import { existsSync as existsSync4, copyFileSync, mkdirSync as mkdirSync4, readFileSync as readFileSync5, writeFileSync as writeFileSync3, readdirSync, unlinkSync as unlinkSync2 } from "fs";
+import path7 from "path";
+function processName(tier) {
+  const safe = (tier || "light").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return `yoannyviquel_memory_${safe}`;
+}
+function ensureNamedBinary(name) {
+  if (process.env.MEMORY_DISABLE_RENAME === "1") return;
+  if (process.platform !== "win32") return;
+  try {
+    const scriptPath = process.argv[1];
+    if (!scriptPath) return;
+    const root = path7.resolve(path7.dirname(scriptPath), "..");
+    const binDir = path7.join(root, "bin");
+    const exe = path7.join(binDir, `${name}.exe`);
+    if (path7.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
+    if (!existsSync4(exe)) {
+      mkdirSync4(binDir, { recursive: true });
+      copyFileSync(process.execPath, exe);
+    }
+    try {
+      const running = path7.basename(process.execPath).toLowerCase();
+      for (const f of readdirSync(binDir)) {
+        const low = f.toLowerCase();
+        if (low.startsWith("yoannyviquel_memory_") && low.endsWith(".exe") && low !== `${name}.exe` && low !== running) {
+          unlinkSync2(path7.join(binDir, f));
+        }
+      }
+    } catch {
+    }
+    const mcpPath = path7.join(root, ".mcp.json");
+    const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + name + ".exe";
+    const mcp = JSON.parse(readFileSync5(mcpPath, "utf8"));
+    if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
+      mcp.mcpServers.memory.command = desired;
+      writeFileSync3(mcpPath, JSON.stringify(mcp, null, 2) + "\n");
+    }
+  } catch {
+  }
 }
 
 // src/tools/search.ts
@@ -1314,7 +1644,7 @@ var memorySearch = {
     required: ["query"],
     additionalProperties: false
   },
-  handler: async (args, { store, embedQuery, rerank: rerank2, config }) => {
+  handler: async (args, { store, embedQuery, rerank, config }) => {
     const query = String(args.query ?? "").trim();
     if (!query) return "\u274C `query` is required.";
     const limit = args.limit ? Number(args.limit) : 10;
@@ -1327,7 +1657,7 @@ var memorySearch = {
     if (docs.length === 0) return `No memory for "${query}".`;
     let mode = embedding ? "hybrid BM25+semantic" : "BM25";
     if (rerankOn && docs.length > limit) {
-      const scores = await rerank2(query, docs.map(rerankText));
+      const scores = await rerank(query, docs.map(rerankText));
       if (scores && scores.length === docs.length) {
         docs = docs.map((d, i) => ({ d, s: scores[i] ?? -Infinity })).sort((a, b) => b.s - a.s).map((x) => x.d);
         mode += " + rerank";
@@ -1367,10 +1697,10 @@ var memoryStats = {
   name: "memory_stats",
   description: "Diagnostics: SQLite database path, total documents, breakdown by type/project, state of the vector index and the local embedder.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  handler: async (_args, { store, embedCfg }) => {
+  handler: async (_args, { store, embedCfg, embedder }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
-    const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedLoaded() : false;
+    const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedder.loaded() : false;
     const lines = [];
     lines.push(`**memory \u2014 state**`);
     lines.push(`- SQLite database: \`${s.dbPath}\``);
@@ -1382,7 +1712,7 @@ var memoryStats = {
     lines.push(
       `- Vectors (sqlite-vec): ${s.vectorEnabled ? `\u2705 enabled (${s.vectorCount} indexed, ${missing} pending)` : "\u274C disabled"}`
     );
-    const dev = embedderUp ? ` (device=${embedDevice() || "cpu"})` : "";
+    const dev = embedderUp ? ` (device=${embedder.deviceUsed() || "cpu"})` : "";
     lines.push(
       `- Embedder (${embedCfg.model}): ${!embedCfg.enabled ? "disabled (MEMORY_EMBED_ENABLED=0)" : embedderUp ? `\u2705 loaded${dev}` : "\u23F3 not loaded yet / unavailable"}`
     );
@@ -1569,324 +1899,166 @@ var allTools = [
   ...coreTools
 ];
 
-// src/server.ts
+// src/memory-server.ts
 var PKG_VERSION = true ? "0.8.0" : "0.0.0-dev";
-console.log = (...args) => console.error("[stdout-redirected]", ...args);
-var BACKFILL_INTERVAL_MS = 6e4;
-var HEARTBEAT_MS = 3e4;
-var BACKFILL_BATCH = 32;
-var backfilling = false;
-var amLeader = false;
-var myEmbedPort = 0;
-var myEmbedToken = "";
-async function backfill(store, cfg) {
-  if (backfilling || !store.vectorEnabled || !cfg.embed.enabled) return;
-  if (!await embedReady(cfg.embed)) return;
-  backfilling = true;
-  try {
-    for (; ; ) {
-      const docs = store.missingVectorDocs(BACKFILL_BATCH);
-      if (docs.length === 0) break;
-      writeStatus(cfg.dataDir, {
-        state: "backfilling",
-        model: cfg.embed.model,
-        vectorized: store.stats().vectorCount,
-        missing: store.countMissingVectors()
-      });
-      const vectors = await embedBatch(
-        docs.map((d) => d.text),
-        cfg.embed
-      );
-      const writes = [];
-      for (let i = 0; i < docs.length; i++) {
-        const v = vectors[i];
-        if (v) writes.push({ rowid: docs[i].rowid, embedding: v });
-      }
-      store.setVectorsBulk(writes);
-    }
-  } catch {
-  } finally {
-    backfilling = false;
-    const s = store.stats();
-    writeStatus(cfg.dataDir, {
-      state: "idle",
-      vectorized: s.vectorCount,
-      missing: store.countMissingVectors()
+var MemoryServer = class {
+  constructor(config, store) {
+    this.config = config;
+    this.store = store;
+    this.embedder = new EmbedderHost(config.embed);
+    this.reranker = new RerankerHost({
+      model: config.rerank.model,
+      dtype: config.embed.dtype,
+      cacheDir: config.embed.cacheDir,
+      threads: config.embed.threads,
+      dataDir: config.dataDir,
+      device: config.embed.device
     });
+    this.local = new LocalExecutor(this.embedder, this.reranker);
+    this.remote = new RemoteExecutor(config.dataDir);
+    this.executor = this.remote;
+    this.coordinator = new LeaderCoordinator(config.dataDir);
+    this.backfill = new BackfillLoop(store, config, this.embedder);
+    this.digest = new DigestLoop(store, config);
   }
-}
-var digesting = false;
-var DIGEST_PER_TICK = 3;
-var warnedNoClaude = false;
-async function digestPending(store, cfg) {
-  if (digesting || !cfg.digest.enabled) return;
-  if (!claudeAvailable()) {
-    if (!warnedNoClaude) {
-      warnedNoClaude = true;
-      log(cfg.dataDir, "[digest] disabled: no native `claude` binary found on PATH (~/.local/bin)");
-    }
-    return;
+  config;
+  store;
+  embedder;
+  reranker;
+  local;
+  remote;
+  coordinator;
+  backfill;
+  digest;
+  /** Active strategy (Local when leader, Remote otherwise). */
+  executor;
+  embedPort = 0;
+  embedToken = "";
+  /**
+   * Query embedding for search: routed through the active executor (leader embeds locally; a follower
+   * routes to the leader's loopback service; null mid-failover → search degrades to BM25-only).
+   */
+  embedQuery(text) {
+    if (!this.config.embed.enabled || !this.store.vectorEnabled) return Promise.resolve(null);
+    return this.executor.embedQuery(text);
   }
-  digesting = true;
-  try {
-    const sessions = store.sessionsNeedingDigest(cfg.digest.version, DIGEST_PER_TICK);
-    for (const sess of sessions) {
-      const turns = store.turnsForSession(sess.session_id);
-      if (turns.length === 0) continue;
-      writeStatus(cfg.dataDir, {
-        state: "digesting",
-        digestPending: store.countSessionsNeedingDigest(cfg.digest.version)
-      });
-      const result = await digestSession({
-        session_id: sess.session_id,
-        project: sess.project,
-        branch: sess.branch,
-        model: cfg.digest.model,
-        turns
-      });
-      if (!result) continue;
-      const ts = nowIso();
-      const base = { session_id: sess.session_id, project: sess.project, branch: sess.branch, ts };
-      const digestFiles = uniq(result.insights.flatMap((i) => i.files ?? []));
-      const digestDoc = {
-        type: "digest",
-        ...base,
-        summary: result.conclusion,
-        source: String(cfg.digest.version),
-        // version marker → re-digest selector
-        files_modified: digestFiles
-      };
-      const insightDocs = result.insights.map((ins) => ({
-        type: "insight",
-        ...base,
-        summary: ins.text,
-        assistant_text: ins.text,
-        source: ins.kind,
-        // decision | bugfix | discovery | conclusion
-        files_modified: ins.files ?? []
-      }));
-      store.writeDigest(sess.session_id, digestDoc, insightDocs);
-      log(
-        cfg.dataDir,
-        `[digest] ${sess.session_id} \u2192 ${result.insights.length} insights${result.costUsd != null ? ` ($${result.costUsd.toFixed(4)})` : ""}`
-      );
-    }
-  } catch {
-  } finally {
-    digesting = false;
-    const remaining = store.countSessionsNeedingDigest(cfg.digest.version);
-    if (remaining === 0) writeStatus(cfg.dataDir, { state: "idle", digestPending: 0 });
+  /** Reranking shares the leader/loopback pattern. null → caller keeps the RRF order. */
+  rerankQuery(query, docs) {
+    if (!this.config.rerank.enabled || docs.length === 0) return Promise.resolve(null);
+    return this.executor.rerankQuery(query, docs);
   }
-}
-function processName(tier) {
-  const safe = (tier || "light").toLowerCase().replace(/[^a-z0-9]+/g, "");
-  return `yoannyviquel_memory_${safe}`;
-}
-function ensureNamedBinary(name) {
-  if (process.env.MEMORY_DISABLE_RENAME === "1") return;
-  if (process.platform !== "win32") return;
-  try {
-    const scriptPath = process.argv[1];
-    if (!scriptPath) return;
-    const root = path7.resolve(path7.dirname(scriptPath), "..");
-    const binDir = path7.join(root, "bin");
-    const exe = path7.join(binDir, `${name}.exe`);
-    if (path7.basename(process.execPath).toLowerCase() === `${name}.exe`) return;
-    if (!existsSync4(exe)) {
-      mkdirSync4(binDir, { recursive: true });
-      copyFileSync(process.execPath, exe);
-    }
+  async start() {
+    const name = processName(this.config.embed.tier);
     try {
-      const running = path7.basename(process.execPath).toLowerCase();
-      for (const f of readdirSync(binDir)) {
-        const low = f.toLowerCase();
-        if (low.startsWith("yoannyviquel_memory_") && low.endsWith(".exe") && low !== `${name}.exe` && low !== running) {
-          unlinkSync2(path7.join(binDir, f));
-        }
-      }
+      process.title = name;
     } catch {
     }
-    const mcpPath = path7.join(root, ".mcp.json");
-    const desired = "${CLAUDE_PLUGIN_ROOT}/bin/" + name + ".exe";
-    const mcp = JSON.parse(readFileSync5(mcpPath, "utf8"));
-    if (mcp?.mcpServers?.memory && mcp.mcpServers.memory.command !== desired) {
-      mcp.mcpServers.memory.command = desired;
-      writeFileSync3(mcpPath, JSON.stringify(mcp, null, 2) + "\n");
-    }
-  } catch {
-  }
-}
-async function main() {
-  const config = loadConfig();
-  const name = processName(config.embed.tier);
-  try {
-    process.title = name;
-  } catch {
-  }
-  ensureNamedBinary(name);
-  const store = new MemoryStore(
-    config.dbPath,
-    config.embed.dim,
-    config.embed.model,
-    EMBED_TEXT_VERSION
-  );
-  await store.init();
-  const embedQuery = async (text) => {
-    if (!config.embed.enabled || !store.vectorEnabled) return null;
-    if (amLeader) return embed(text, config.embed, true);
-    const lock = readLock(config.dataDir);
-    if (lock?.port && lock?.token) {
-      const v = await remoteEmbed({ port: lock.port, token: lock.token }, text);
-      if (v) return v;
-    }
-    return null;
-  };
-  const rerankOpts = {
-    model: config.rerank.model,
-    dtype: config.embed.dtype,
-    cacheDir: config.embed.cacheDir,
-    threads: config.embed.threads,
-    dataDir: config.dataDir,
-    device: config.embed.device
-  };
-  const rerankQuery = async (query, docs) => {
-    if (!config.rerank.enabled || docs.length === 0) return null;
-    if (amLeader) return rerank(query, docs, rerankOpts);
-    const lock = readLock(config.dataDir);
-    if (lock?.port && lock?.token) {
-      return remoteRerank({ port: lock.port, token: lock.token }, query, docs);
-    }
-    return null;
-  };
-  const ctx = { store, embedCfg: config.embed, config, embedQuery, rerank: rerankQuery };
-  const server = new Server(
-    { name: "memory", version: PKG_VERSION },
-    { capabilities: { tools: {} } }
-  );
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: allTools.map(({ name: name2, description, inputSchema }) => ({
-      name: name2,
-      description,
-      inputSchema
-    }))
-  }));
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const tool = allTools.find((t) => t.name === req.params.name);
-    if (!tool) {
-      return {
-        content: [{ type: "text", text: `\u274C Unknown tool: ${req.params.name}` }],
-        isError: true
-      };
-    }
-    try {
-      const text = await tool.handler(
-        req.params.arguments ?? {},
-        ctx
-      );
-      return { content: [{ type: "text", text }] };
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: "text", text: `\u274C ${tool.name} failed: ${message}` }],
-        isError: true
-      };
-    }
-  });
-  await server.connect(new StdioServerTransport());
-  process.stderr.write(
-    `memory v${PKG_VERSION} ready (stdio) \u2192 ${config.dbPath} | vectors: ${store.vectorEnabled ? "on" : "off"}
-`
-  );
-  log(config.dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
-  log(config.dataDir, `[server] exec=${process.execPath}`);
-  log(config.dataDir, `[server] db=${config.dbPath} model=${config.embed.model} dim=${config.embed.dim} dtype=${config.embed.dtype} vectors=${store.vectorEnabled ? "on" : "off"}`);
-  const modelDir = path7.join(config.embed.cacheDir, ...config.embed.model.split("/"));
-  log(config.dataDir, `[server] model cache: ${existsSync4(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);
-  writeStatus(config.dataDir, {
-    state: "idle",
-    model: config.embed.model,
-    vectorized: store.stats().vectorCount,
-    missing: store.countMissingVectors()
-  });
-  const leaderExtra = () => myEmbedPort ? { port: myEmbedPort, token: myEmbedToken } : {};
-  const syncLeadership = async () => {
-    const was = amLeader;
-    amLeader = refreshLeadership(config.dataDir, leaderExtra());
-    if (amLeader && !myEmbedPort && store.vectorEnabled && config.embed.enabled) {
-      myEmbedToken = randomBytes(16).toString("hex");
+    ensureNamedBinary(name);
+    const ctx = {
+      store: this.store,
+      embedCfg: this.config.embed,
+      config: this.config,
+      embedder: this.embedder,
+      embedQuery: (t) => this.embedQuery(t),
+      rerank: (q, d) => this.rerankQuery(q, d)
+    };
+    const server = new Server({ name: "memory", version: PKG_VERSION }, { capabilities: { tools: {} } });
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: allTools.map(({ name: name2, description, inputSchema }) => ({ name: name2, description, inputSchema }))
+    }));
+    server.setRequestHandler(CallToolRequestSchema, async (req) => {
+      const tool = allTools.find((t) => t.name === req.params.name);
+      if (!tool) {
+        return { content: [{ type: "text", text: `\u274C Unknown tool: ${req.params.name}` }], isError: true };
+      }
       try {
-        myEmbedPort = await startLeaderService(
-          {
-            embed: (text) => embed(text, config.embed, true),
-            rerank: (query, docs) => config.rerank.enabled ? rerank(query, docs, rerankOpts) : Promise.resolve(null)
-          },
-          myEmbedToken
-        );
-        refreshLeadership(config.dataDir, leaderExtra());
-        log(config.dataDir, `[server] leader service on 127.0.0.1:${myEmbedPort}`);
-      } catch {
-        myEmbedPort = 0;
-      }
-    }
-    if (amLeader !== was) {
-      log(config.dataDir, `[server] leadership \u2192 ${amLeader}`);
-      if (amLeader) {
-        if (store.vectorEnabled && config.embed.enabled) void backfill(store, config);
-        if (config.digest.enabled) void digestPending(store, config);
-      }
-    }
-  };
-  await syncLeadership();
-  log(config.dataDir, `[server] leader=${amLeader} (pid ${process.pid})`);
-  const heartbeat = setInterval(() => void syncLeadership(), HEARTBEAT_MS);
-  heartbeat.unref?.();
-  let releasing = false;
-  const releaseAndExit = () => {
-    if (releasing) return;
-    releasing = true;
-    if (amLeader) {
-      releaseLeadership(config.dataDir);
-      log(config.dataDir, `[server] released leadership on exit (pid ${process.pid})`);
-    }
-    process.exit(0);
-  };
-  process.on("SIGTERM", releaseAndExit);
-  process.on("SIGINT", releaseAndExit);
-  process.stdin.on("end", releaseAndExit);
-  process.stdin.on("close", releaseAndExit);
-  try {
-    let watchT;
-    const watcher = watch(config.dataDir, (_event, filename) => {
-      if (!amLeader && filename && String(filename).includes("worker.lock")) {
-        clearTimeout(watchT);
-        watchT = setTimeout(() => void syncLeadership(), 200);
+        const text = await tool.handler(req.params.arguments ?? {}, ctx);
+        return { content: [{ type: "text", text }] };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return { content: [{ type: "text", text: `\u274C ${tool.name} failed: ${message}` }], isError: true };
       }
     });
-    watcher.unref?.();
-  } catch {
-  }
-  if (store.vectorEnabled && config.embed.enabled) {
-    const tick = () => {
-      if (amLeader) void backfill(store, config);
+    await server.connect(new StdioServerTransport());
+    process.stderr.write(
+      `memory v${PKG_VERSION} ready (stdio) \u2192 ${this.config.dbPath} | vectors: ${this.store.vectorEnabled ? "on" : "off"}
+`
+    );
+    this.logStartupDiagnostics();
+    this.coordinator.on("becameLeader", () => this.onBecameLeader());
+    this.coordinator.on("lostLeadership", () => this.onLostLeadership());
+    this.coordinator.start();
+    log(this.config.dataDir, `[server] leader=${this.coordinator.isLeader()} (pid ${process.pid})`);
+    let releasing = false;
+    const releaseAndExit = () => {
+      if (releasing) return;
+      releasing = true;
+      this.coordinator.release();
+      process.exit(0);
     };
-    tick();
-    const timer = setInterval(tick, BACKFILL_INTERVAL_MS);
-    timer.unref?.();
+    process.on("SIGTERM", releaseAndExit);
+    process.on("SIGINT", releaseAndExit);
+    process.stdin.on("end", releaseAndExit);
+    process.stdin.on("close", releaseAndExit);
   }
-  if (config.digest.enabled) {
-    const tick = () => {
-      if (amLeader) void digestPending(store, config);
-    };
-    tick();
-    const timer = setInterval(tick, BACKFILL_INTERVAL_MS);
-    timer.unref?.();
+  /** Just acquired leadership (startup or failover): swap to local, start the service + loops. */
+  onBecameLeader() {
+    this.executor = this.local;
+    if (!this.embedPort && this.store.vectorEnabled && this.config.embed.enabled) {
+      this.embedToken = randomBytes(16).toString("hex");
+      startLeaderService(
+        {
+          embed: (text) => this.embedder.embed(text, true),
+          rerank: (query, docs) => this.config.rerank.enabled ? this.reranker.rerank(query, docs) : Promise.resolve(null)
+        },
+        this.embedToken
+      ).then((port) => {
+        this.embedPort = port;
+        this.coordinator.publishEndpoint(port, this.embedToken);
+        log(this.config.dataDir, `[server] leader service on 127.0.0.1:${port}`);
+      }).catch(() => {
+        this.embedPort = 0;
+      });
+    }
+    this.backfill.start();
+    this.digest.start();
   }
+  /** Lost leadership (rare for a healthy process): swap back to remote, stop the loops. */
+  onLostLeadership() {
+    this.executor = this.remote;
+    this.backfill.stop();
+    this.digest.stop();
+  }
+  logStartupDiagnostics() {
+    const { dataDir, dbPath, embed } = this.config;
+    log(dataDir, `[server] memory v${PKG_VERSION} \u2014 node ${process.version} ${process.platform}/${process.arch}`);
+    log(dataDir, `[server] exec=${process.execPath}`);
+    log(
+      dataDir,
+      `[server] db=${dbPath} model=${embed.model} dim=${embed.dim} dtype=${embed.dtype} vectors=${this.store.vectorEnabled ? "on" : "off"}`
+    );
+    const modelDir = path8.join(embed.cacheDir, ...embed.model.split("/"));
+    log(dataDir, `[server] model cache: ${existsSync5(modelDir) ? "present" : "absent \u2192 download on first use"} (${modelDir})`);
+    writeStatus(dataDir, {
+      state: "idle",
+      model: embed.model,
+      vectorized: this.store.stats().vectorCount,
+      missing: this.store.countMissingVectors()
+    });
+  }
+};
+
+// src/server.ts
+console.log = (...args) => console.error("[stdout-redirected]", ...args);
+async function main() {
+  const config = loadConfig();
+  const store = new MemoryStore(config.dbPath, config.embed.dim, config.embed.model, EMBED_TEXT_VERSION);
+  await store.init();
+  await new MemoryServer(config, store).start();
 }
 main().catch((err) => {
-  process.stderr.write(
-    `fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}
-`
-  );
+  process.stderr.write(`fatal: ${err instanceof Error ? err.stack ?? err.message : String(err)}
+`);
   process.exit(1);
 });
 //# sourceMappingURL=server.js.map
