@@ -36,43 +36,66 @@ function readConfigFile(dataDir) {
     return {};
   }
 }
+var ConfigSource = class {
+  constructor(file) {
+    this.file = file;
+  }
+  file;
+  envValue(envKey) {
+    const e = process.env[envKey];
+    return e !== void 0 && e !== "" && !e.startsWith("${") ? e : void 0;
+  }
+  /** env > file > undefined. */
+  get(envKey, fileKey) {
+    const e = this.envValue(envKey);
+    if (e !== void 0) return e;
+    const f = this.file[fileKey];
+    return f === void 0 || f === null ? void 0 : String(f);
+  }
+  /**
+   * file > env > undefined. Used for the embedding tier so the runtime config.json (written by
+   * /memory:config and the /memory:*-load commands) overrides the install-time
+   * `${user_config.embedTier}` env injected by .mcp.json — otherwise the install choice would pin
+   * the tier forever and /memory:config would be a silent no-op.
+   */
+  fileFirst(fileKey, envKey) {
+    const f = this.file[fileKey];
+    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
+    return this.envValue(envKey);
+  }
+  /** Numeric setting (env > file), falling back to `def` when unset or unparseable. */
+  num(envKey, fileKey, def) {
+    return Number(this.get(envKey, fileKey)) || def;
+  }
+  /** Boolean flag: true unless explicitly set to '0'. */
+  flag(envKey, fileKey) {
+    return this.get(envKey, fileKey) !== "0";
+  }
+};
 function loadConfig() {
   const dataDir = process.env.MEMORY_DATA_DIR || path.join(os.homedir(), ".claude-memory");
-  const file = readConfigFile(dataDir);
-  const get = (envKey, fileKey) => {
-    const e = process.env[envKey];
-    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
-    const f = file[fileKey];
-    return f === void 0 || f === null ? void 0 : String(f);
-  };
-  const getFileFirst = (fileKey, envKey) => {
-    const f = file[fileKey];
-    if (f !== void 0 && f !== null && String(f) !== "") return String(f);
-    const e = process.env[envKey];
-    if (e !== void 0 && e !== "" && !e.startsWith("${")) return e;
-    return void 0;
-  };
-  const dbPath = get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
-  const contextLimit = Number(get("MEMORY_CONTEXT_LIMIT", "contextLimit")) || 10;
-  const tier = (getFileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
+  const src = new ConfigSource(readConfigFile(dataDir));
+  const dbPath = src.get("MEMORY_DB_PATH", "dbPath") || path.join(dataDir, "memories.db");
+  const contextLimit = src.num("MEMORY_CONTEXT_LIMIT", "contextLimit", 10);
+  const tier = (src.fileFirst("embedTier", "MEMORY_EMBED_TIER") || DEFAULT_TIER).toLowerCase();
   const picked = EMBED_TIERS[tier] ?? EMBED_TIERS[DEFAULT_TIER];
-  const model = get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
-  const dim = Number(get("MEMORY_EMBED_DIM", "embedDim")) || picked.dim;
-  const pooling = (get("MEMORY_EMBED_POOLING", "embedPooling") || picked.pooling || "mean").toLowerCase();
-  const queryPrefix = get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
-  const enabled = get("MEMORY_EMBED_ENABLED", "embedEnabled") !== "0";
-  const cacheDir = get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
-  const device = resolveDevice((get("MEMORY_EMBED_DEVICE", "embedDevice") || "").toLowerCase());
-  const dtypeOverride = get("MEMORY_EMBED_DTYPE", "embedDtype");
+  const model = src.get("MEMORY_EMBED_MODEL", "embedModel") || picked.model;
+  const dim = src.num("MEMORY_EMBED_DIM", "embedDim", picked.dim);
+  const pooling = (src.get("MEMORY_EMBED_POOLING", "embedPooling") || picked.pooling || "mean").toLowerCase();
+  const queryPrefix = src.get("MEMORY_EMBED_QUERY_PREFIX", "embedQueryPrefix") ?? picked.queryPrefix ?? "";
+  const enabled = src.flag("MEMORY_EMBED_ENABLED", "embedEnabled");
+  const cacheDir = src.get("MEMORY_EMBED_CACHE_DIR", "embedCacheDir") || path.join(dataDir, "models");
+  const device = resolveDevice((src.get("MEMORY_EMBED_DEVICE", "embedDevice") || "").toLowerCase());
+  const dtypeOverride = src.get("MEMORY_EMBED_DTYPE", "embedDtype");
   const onGpu = device !== "" && device !== "cpu";
   const dtype = (dtypeOverride || (onGpu ? "fp32" : "q8")).toLowerCase();
   const threadFraction = { light: 1 / 3, medium: 2 / 3, heavy: 1 };
   const fraction = threadFraction[tier] ?? 0.25;
   const threads = Math.max(1, Math.floor(os.cpus().length * fraction));
-  const digestEnabled = get("MEMORY_DIGEST_ENABLED", "digestEnabled") !== "0";
-  const digestModel = get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
-  const rerankModel = get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
-  const rerankEnabled = get("MEMORY_RERANK_ENABLED", "rerankEnabled") !== "0" && !!rerankModel;
+  const digestEnabled = src.flag("MEMORY_DIGEST_ENABLED", "digestEnabled");
+  const digestModel = src.get("MEMORY_DIGEST_MODEL", "digestModel") || DEFAULT_DIGEST_MODEL;
+  const rerankModel = src.get("MEMORY_RERANK_MODEL", "rerankModel") || picked.reranker || "";
+  const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
   return {
     dbPath,
     dataDir,
