@@ -80,21 +80,20 @@ So most turns inject **0** (nothing new or relevant), and a given memory never r
 > the hooks. The CLAUDE.md instruction is what reliably overrides the built-in file memory — the
 > plugin can't disable it on its own.
 
-## Why SQLite (and not Elasticsearch)
+## Why SQLite (embedded, no server)
 
-SQLite is an **embedded** database: a library + a file opened in-process. No server to install
-or start. Elasticsearch is a **server** (JVM, port, ~1-2 GB RAM) you have to run alongside —
-exactly the kind of external dependency (like Chroma/uvx) that made claude-mem fragile. Here,
-FTS5 (BM25) and the vector index (sqlite-vec) are loaded in-process inside Node's SQLite, and
-embeddings are computed locally by transformers.js — nothing to run alongside.
+SQLite is an **embedded** database: a library + a file opened in-process. No server to install or
+start, no external dependency (like the Chroma/uvx stack that made claude-mem fragile). FTS5 (BM25)
+and the vector index (sqlite-vec) are loaded in-process inside Node's SQLite, and embeddings are
+computed locally by transformers.js — nothing to run alongside.
 
 ## Search: BM25 + semantic (hybrid)
 
 - **BM25 (FTS5)**: lexical, always on, zero dependency. Excellent on exact identifiers
   (files, errors, commands).
 - **Semantic**: embeddings computed locally (**transformers.js**, ONNX model) and stored in
-  **sqlite-vec**. Finds by meaning (synonyms, paraphrase) even without a common word. No cloud,
-  no key, no daemon. The model is downloaded once (local cache) on first use.
+  **sqlite-vec**. Finds by meaning (synonyms, paraphrase) even without a common word. The model is
+  downloaded once (local cache) on first use.
 - The two rankings are fused (**Reciprocal Rank Fusion**).
 - **Reranker (optional, on by default)**: a cross-encoder reorders the top candidates for precision
   (see below).
@@ -247,9 +246,9 @@ backfill rate). Notes:
   - `SessionEnd` → indexes a session summary.
 - **LLM digests** (background, opt-out): the MCP server compresses each finished session into a
   `digest` (1–3 sentence conclusion) + typed `insight` docs (`decision` / `bugfix` / `discovery` /
-  `conclusion`) via `claude -p` using **Haiku by default** and your **existing auth** (no API key). These
-  high-signal docs are what `SessionStart` injects and what ranks best in search. Raw turns stay as
-  the recall safety net. Disable with `MEMORY_DIGEST_ENABLED=0`.
+  `conclusion`). These high-signal docs are what `SessionStart` injects and what ranks best in
+  search; raw turns stay as the recall safety net. Model, cost & isolation:
+  see [LLM digests — cost & isolation](#llm-digests--cost--isolation).
 - **Core memories**: primordial facts injected into **every** session at load (above the digests).
   Created explicitly (the user asks to remember something), or **proposed by Claude** when a fact
   recurs across many memories (`memory_core_suggest` surfaces signals; the user must agree before it
@@ -290,13 +289,30 @@ All hooks run with `suppressOutput` (no noise in the context), except `SessionSt
 
 ## Installation
 
+### From the marketplace (recommended)
+
+The plugin ships with its build artifacts committed (`dist/`), so **no `npm install` /
+build is needed** — add the marketplace and install:
+
+```
+/plugin marketplace add yoannyviquel/marketplace
+/plugin install memory
+```
+
+Restart Claude Code (or `/reload-plugins`) to activate the hooks + MCP server.
+
+> The `yoannyviquel/marketplace` catalogue references this plugin by its own GitHub repo
+> (`github.com/yoannyviquel/memory`, ref `main`); each plugin updates independently of the catalogue.
+
+### From source (local development)
+
 ```bash
 cd memory
 npm install
 npm run build      # -> dist/server.js, dist/hook.js, dist/migrate.js, dist/vec0.dll
 ```
 
-In Claude Code (add the repo as a local marketplace, then install):
+Then add the local checkout as a marketplace and install:
 
 ```
 /plugin marketplace add C:/tfs/yoannyviquel/memory
@@ -332,8 +348,8 @@ Two mechanisms, **env takes precedence over the file**:
 | `MEMORY_EMBED_CACHE_DIR` | `~/.claude-memory/models` | ONNX model cache |
 | `MEMORY_VEC_EXTENSION` | _(auto)_ | Explicit path to the sqlite-vec library |
 
-> The plugin itself requires **no** config at install time. Changing model/tier is safe:
-> old vectors are detected (`meta` table), cleared and re-vectorized in the background automatically.
+> The plugin itself requires **no** config at install time. Changing model/tier is safe — see
+> [Model tiers](#model-tiers-multilingual).
 
 ## Schema
 
@@ -399,8 +415,7 @@ Or via the command: `/memory:migrate`.
 
 If anything fails (locked database, unavailable model, missing sqlite-vec), everything degrades
 gracefully: hooks output `{"continue":true,"suppressOutput":true}` (exit 0), search falls back
-to BM25, the backfill retries. Claude Code is never blocked. No server, no daemon, no cloud, no
-native compilation (sqlite-vec = prebuilt binary; onnxruntime-node = prebuilt binary installed
-by npm).
+to BM25, the backfill retries. Claude Code is never blocked. And **no native compilation**:
+sqlite-vec and onnxruntime-node ship as prebuilt binaries installed by npm.
 </content>
 </invoke>
