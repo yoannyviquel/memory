@@ -3,6 +3,7 @@ import type { MemoryStore, MemoryDoc } from './store.js';
 import { digestSession, claudeAvailable } from './digest.js';
 import { nowIso, uniq } from './memory.js';
 import { log, writeStatus } from './log.js';
+import { sleep, throttlePause } from './throttle.js';
 
 const DIGEST_INTERVAL_MS = 60_000;
 // Drip rate: sessions digested per tick. Keeps the first-run backlog from bursting `claude -p` calls.
@@ -58,7 +59,9 @@ export class DigestLoop {
         writeStatus(this.cfg.dataDir, {
           state: 'digesting',
           digestPending: this.store.countSessionsNeedingDigest(this.cfg.digest.version),
+          loadPercent: this.cfg.loadPercent,
         });
+        const t0 = Date.now();
         const result = await digestSession({
           session_id: sess.session_id,
           project: sess.project,
@@ -76,6 +79,8 @@ export class DigestLoop {
           summary: result.conclusion,
           source: String(this.cfg.digest.version), // version marker → re-digest selector
           files_modified: digestFiles,
+          satisfaction: result.satisfaction,
+          mood: result.mood,
         };
         const insightDocs: MemoryDoc[] = result.insights.map((ins) => ({
           type: 'insight',
@@ -84,6 +89,8 @@ export class DigestLoop {
           assistant_text: ins.text,
           source: ins.kind, // decision | bugfix | discovery | conclusion
           files_modified: ins.files ?? [],
+          // Insights inherit the session's satisfaction so the weighting applies to them too.
+          satisfaction: result.satisfaction,
         }));
         this.store.writeDigest(sess.session_id, digestDoc, insightDocs);
         log(
@@ -92,6 +99,10 @@ export class DigestLoop {
             result.costUsd != null ? ` ($${result.costUsd.toFixed(4)})` : ''
           }`,
         );
+        // Duty-cycle throttle: pace the digests (and the re-vectorization they trigger) so memory
+        // uses the device only ~loadPercent of the time (no-op at 100%).
+        const pause = throttlePause(Date.now() - t0, this.cfg.loadPercent);
+        if (pause > 0) await sleep(pause);
       }
     } catch {
       /* best-effort: never block the server */

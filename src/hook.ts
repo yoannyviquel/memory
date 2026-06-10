@@ -193,6 +193,7 @@ async function buildRecall(
       project: state.project,
       limit: cfg.autoRecall.limit + seen.size + 5,
       embedding,
+      satisfactionWeight: cfg.satisfactionWeight,
     });
     const fresh = cand
       .filter((d) => d.id && d.id !== promptId && !seen.has(d.id))

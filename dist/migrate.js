@@ -10,7 +10,7 @@ import os from "os";
 import path from "path";
 import { readFileSync } from "fs";
 var DEFAULT_DIGEST_MODEL = "haiku";
-var DIGEST_VERSION = 1;
+var DIGEST_VERSION = 2;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384, pooling: "mean" },
@@ -98,6 +98,8 @@ function loadConfig() {
   const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
   const autoRecallEnabled = src.flag("MEMORY_AUTO_RECALL", "autoRecall");
   const autoRecallLimit = src.num("MEMORY_AUTO_RECALL_LIMIT", "autoRecallLimit", 3);
+  const satisfactionWeight = src.num("MEMORY_SATISFACTION_WEIGHT", "satisfactionWeight", 0.12);
+  const loadPercent = Math.max(5, Math.min(100, src.num("MEMORY_LOAD_PERCENT", "loadPercent", 100)));
   return {
     dbPath,
     dataDir,
@@ -105,7 +107,9 @@ function loadConfig() {
     embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel },
-    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit }
+    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit },
+    satisfactionWeight,
+    loadPercent
   };
 }
 
@@ -117,6 +121,11 @@ import { createHash } from "crypto";
 import path2 from "path";
 var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core"];
 var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
+function satisfactionFactor(satisfaction, weight) {
+  if (weight <= 0 || satisfaction == null || !Number.isFinite(satisfaction)) return 1;
+  const s = Math.max(0, Math.min(1, satisfaction));
+  return 1 + weight * (s - 0.5) * 2;
+}
 var HERE = path2.dirname(fileURLToPath(import.meta.url));
 var COLS = [
   "mem_id",
@@ -142,7 +151,9 @@ var COLS = [
   "started_at",
   "ended_at",
   "end_reason",
-  "source"
+  "source",
+  "satisfaction",
+  "mood"
 ];
 var FTS_COLS = ["summary", "user_prompt", "assistant_text", "tool_brief", "prompts_text"];
 var BM25_WEIGHTS = "3.0, 2.0, 1.0, 1.0, 1.5";
@@ -210,7 +221,9 @@ function rowToDoc(r) {
     started_at: r.started_at ?? void 0,
     ended_at: r.ended_at ?? void 0,
     end_reason: r.end_reason ?? void 0,
-    source: r.source ?? void 0
+    source: r.source ?? void 0,
+    satisfaction: r.satisfaction == null ? void 0 : Number(r.satisfaction),
+    mood: r.mood ?? void 0
   };
 }
 function toBlob(arr) {
@@ -246,6 +259,14 @@ var MemoryStore = class {
   metaSet(k, v) {
     this.db.prepare("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(k, v);
   }
+  /** Adds a column to an existing table if missing (lightweight forward migration). Best-effort. */
+  ensureColumn(table, col, decl) {
+    try {
+      const cols = this.db.prepare(`PRAGMA table_info(${table});`).all().map((r) => String(r.name));
+      if (!cols.includes(col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl};`);
+    } catch {
+    }
+  }
   async init() {
     if (this.db) return;
     const DatabaseSync = await getDatabaseSync();
@@ -264,9 +285,12 @@ var MemoryStore = class {
         tool_name TEXT, tool_brief TEXT,
         tools TEXT, files_read TEXT, files_modified TEXT,
         prompts TEXT, prompts_text TEXT,
-        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT
+        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT,
+        satisfaction REAL, mood TEXT
       );
     `);
+    this.ensureColumn("memories", "satisfaction", "REAL");
+    this.ensureColumn("memories", "mood", "TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);");
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -349,7 +373,9 @@ var MemoryStore = class {
       started_at: d.started_at ?? null,
       ended_at: d.ended_at ?? null,
       end_reason: d.end_reason ?? null,
-      source: d.source ?? null
+      source: d.source ?? null,
+      satisfaction: d.satisfaction ?? null,
+      mood: d.mood ?? null
     };
     return COLS.map((c) => map[c]);
   }
@@ -508,17 +534,42 @@ var MemoryStore = class {
     const byRowid = new Map(rows.map((r) => [Number(r.rowid), r]));
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
+  /** Satisfaction scores for a set of rowids (rowid → satisfaction in [0,1]). Missing → absent. */
+  satisfactionByRowids(rowids) {
+    const m = /* @__PURE__ */ new Map();
+    if (rowids.length === 0) return m;
+    const placeholders = rowids.map(() => "?").join(",");
+    try {
+      const rows = this.db.prepare(`SELECT rowid, satisfaction FROM memories WHERE rowid IN (${placeholders});`).all(...rowids);
+      for (const r of rows) {
+        if (r.satisfaction != null && Number.isFinite(Number(r.satisfaction)))
+          m.set(Number(r.rowid), Number(r.satisfaction));
+      }
+    } catch {
+    }
+    return m;
+  }
   /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params) {
     const limit = params.limit ?? 10;
     const cand = Math.max(limit * 4, 40);
     const bm = this.bm25Rows(params.query, params.project, params.type, cand);
     const vec = params.embedding && this._vectorEnabled ? this.vecRows(params.embedding, params.project, params.type, cand) : [];
-    if (vec.length === 0) return this.docsByRowids(bm.slice(0, limit));
     const score = /* @__PURE__ */ new Map();
-    bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
-    vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
-    const ordered = [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map((e) => e[0]);
+    if (vec.length === 0) {
+      bm.forEach((rid, i) => score.set(rid, 1 / (RRF_K + i + 1)));
+    } else {
+      bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+      vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+    }
+    if (score.size === 0) return [];
+    const weight = params.satisfactionWeight ?? 0;
+    const rowids = [...score.keys()];
+    const sat = weight > 0 ? this.satisfactionByRowids(rowids) : null;
+    const ordered = rowids.map((rid) => ({
+      rid,
+      s: score.get(rid) * (sat ? satisfactionFactor(sat.get(rid), weight) : 1)
+    })).sort((a, b) => b.s - a.s).slice(0, limit).map((e) => e.rid);
     return this.docsByRowids(ordered);
   }
   recent(params) {

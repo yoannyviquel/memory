@@ -1,7 +1,14 @@
 import type { ToolDefinition } from './types.js';
-import type { MemoryDoc, MemoryType } from '../store.js';
+import { satisfactionFactor, type MemoryDoc, type MemoryType } from '../store.js';
 
 const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
+
+/** Compact mood marker for a doc carrying a satisfaction signal (😀 satisfied / 😐 neutral / 🙁 not). */
+function moodMarker(d: MemoryDoc): string {
+  if (d.satisfaction == null || !Number.isFinite(d.satisfaction)) return '';
+  const emoji = d.satisfaction >= 0.66 ? '😀' : d.satisfaction <= 0.33 ? '🙁' : '😐';
+  return d.mood ? ` ${emoji} ${d.mood}` : ` ${emoji}`;
+}
 
 function fmtDoc(d: MemoryDoc): string {
   const date = (d.ts ?? d.ended_at ?? '').slice(0, 16).replace('T', ' ');
@@ -16,7 +23,7 @@ function fmtDoc(d: MemoryDoc): string {
   const text = label.replace(/\s+/g, ' ').trim().slice(0, 300);
   const files = (d.files_modified ?? []).slice(0, 4);
   const filesLine = files.length ? `\n  📝 ${files.join(', ')}` : '';
-  return `- **[${d.type}]** \`${proj}\` · ${date}\n  ${text}${filesLine}`;
+  return `- **[${d.type}]** \`${proj}\` · ${date}${moodMarker(d)}\n  ${text}${filesLine}`;
 }
 
 /** Text handed to the cross-encoder reranker for a candidate doc. */
@@ -64,15 +71,26 @@ const memorySearch: ToolDefinition = {
     // constant regardless of base size — the recall stage already scales via the indexes.
     const rerankOn = config.rerank.enabled;
     const candidateK = rerankOn ? Math.min(100, Math.max(50, limit * 5)) : limit;
-    let docs = store.search({ query, project, type, limit: candidateK, embedding });
+    const satWeight = config.satisfactionWeight;
+    let docs = store.search({
+      query,
+      project,
+      type,
+      limit: candidateK,
+      embedding,
+      satisfactionWeight: satWeight,
+    });
     if (docs.length === 0) return `No memory for "${query}".`;
 
     let mode = embedding ? 'hybrid BM25+semantic' : 'BM25';
     if (rerankOn && docs.length > limit) {
       const scores = await rerank(query, docs.map(rerankText));
       if (scores && scores.length === docs.length) {
+        // Re-rank by cross-encoder relevance, then apply the same satisfaction tie-breaker so a more
+        // satisfying memory wins at near-equal relevance (the recall-stage weighting is lost here
+        // because rerank reorders purely on its own scores).
         docs = docs
-          .map((d, i) => ({ d, s: scores[i] ?? -Infinity }))
+          .map((d, i) => ({ d, s: (scores[i] ?? -Infinity) * satisfactionFactor(d.satisfaction, satWeight) }))
           .sort((a, b) => b.s - a.s)
           .map((x) => x.d);
         mode += ' + rerank';
@@ -112,7 +130,7 @@ const memoryStats: ToolDefinition = {
   description:
     'Diagnostics: SQLite database path, total documents, breakdown by type/project, state of the vector index and the local embedder.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-  handler: async (_args, { store, embedCfg, embedder }) => {
+  handler: async (_args, { store, embedCfg, embedder, config }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
     // Report state WITHOUT forcing a model load — ready() would block on a heavy-tier load
@@ -144,6 +162,27 @@ const memoryStats: ToolDefinition = {
             : '⏳ not loaded yet / unavailable'
       }`,
     );
+
+    // Background work + load cap. When there's a backlog (typically right after an update that
+    // re-processes the history), this is what explains a transient CPU/GPU spike — and how to tame it.
+    const digestPending = config.digest.enabled
+      ? store.countSessionsNeedingDigest(config.digest.version)
+      : 0;
+    const load = config.loadPercent;
+    lines.push(
+      `- Background load cap: ${load >= 100 ? 'none (100% — full speed)' : `${load}% of CPU/GPU (paced)`}`,
+    );
+    if (missing > 0 || digestPending > 0) {
+      const bits: string[] = [];
+      if (digestPending > 0) bits.push(`${digestPending} session(s) to (re)digest`);
+      if (missing > 0) bits.push(`${missing} vector(s) to compute`);
+      lines.push(`- Background indexing in progress: ${bits.join(', ')}.`);
+      lines.push(
+        `  This is a **one-time catch-up** (e.g. after a plugin update that improves memories). It runs ` +
+          `in the background and memory stays usable meanwhile. To use less CPU/GPU, lower the load cap ` +
+          `via \`/memory:load <percent>\` (e.g. 30) — slower backfill, lighter machine.`,
+      );
+    }
     return lines.join('\n');
   },
 };

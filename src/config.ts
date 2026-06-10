@@ -11,6 +11,19 @@ export interface MemoryConfig {
   digest: DigestConfig;
   rerank: RerankConfig;
   autoRecall: AutoRecallConfig;
+  /**
+   * Satisfaction weighting strength applied at search time, in [0, ~0.5]. 0 disables it. A digest's
+   * satisfaction (0..1) becomes a bounded relevance multiplier so that, at near-equal relevance, the
+   * memory that pleased the user most ranks first. Default 0.12 (a tie-breaker, not an override).
+   */
+  satisfactionWeight: number;
+  /**
+   * Target share of wall-time the background loops (vectorization + LLM digests) may keep the
+   * inference device busy, in [5, 100]. 100 = drain at full speed; lower values pace the work
+   * (duty-cycle throttle) so memory uses less CPU/GPU at the cost of a slower backfill. Useful right
+   * after an update that re-processes the whole history. See {@link throttlePause}.
+   */
+  loadPercent: number;
 }
 
 export interface AutoRecallConfig {
@@ -49,7 +62,8 @@ const DEFAULT_DIGEST_MODEL = 'haiku';
  *  - EMBED_TEXT_VERSION: bump when the text we feed the embedder changes (e.g. we start embedding
  *    digests) → init() clears the vector index so the backfill refills it with the new text.
  */
-export const DIGEST_VERSION = 1;
+// v2: the digest now also extracts the user's satisfaction (0..1) and mood → re-digest every session.
+export const DIGEST_VERSION = 2;
 export const EMBED_TEXT_VERSION = 1;
 
 /**
@@ -196,6 +210,14 @@ export function loadConfig(): MemoryConfig {
   const autoRecallEnabled = src.flag('MEMORY_AUTO_RECALL', 'autoRecall');
   const autoRecallLimit = src.num('MEMORY_AUTO_RECALL_LIMIT', 'autoRecallLimit', 3);
 
+  // Satisfaction weighting: how strongly a digest's satisfaction score biases search ranking.
+  // Bounded multiplier ±weight (see satisfactionFactor). Tie-breaker by default; 0 disables it.
+  const satisfactionWeight = src.num('MEMORY_SATISFACTION_WEIGHT', 'satisfactionWeight', 0.12);
+
+  // Background-work load cap (duty-cycle). Clamp to [5, 100]: never fully starves the loops (would
+  // mean the backfill never finishes), 100 = no throttle. See throttlePause / the background loops.
+  const loadPercent = Math.max(5, Math.min(100, src.num('MEMORY_LOAD_PERCENT', 'loadPercent', 100)));
+
   return {
     dbPath,
     dataDir,
@@ -204,5 +226,7 @@ export function loadConfig(): MemoryConfig {
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel },
     autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit },
+    satisfactionWeight,
+    loadPercent,
   };
 }

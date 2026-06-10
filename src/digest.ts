@@ -13,6 +13,14 @@ export interface Insight {
 export interface DigestResult {
   conclusion: string;
   insights: Insight[];
+  /**
+   * How satisfied/content the user seemed across the session, in [0, 1]: 0 = clearly
+   * frustrated/dissatisfied, 0.5 = neutral, 1 = clearly satisfied/pleased. Defaults to 0.5 (neutral)
+   * when the model gives no usable signal. Drives the satisfaction weighting at search time.
+   */
+  satisfaction: number;
+  /** One or two words for the user's overall mood (e.g. "satisfied", "frustrated"). Optional. */
+  mood?: string;
   /** Usage envelope from `claude -p --output-format json`, for transparency/logging. */
   usage?: unknown;
   costUsd?: number;
@@ -67,12 +75,19 @@ function buildPrompt(input: DigestInput): string {
     '  "conclusion": "1-3 sentences: what was achieved and the final state",',
     '  "insights": [',
     '    { "kind": "decision|bugfix|discovery|conclusion", "text": "one concrete durable fact", "files": ["path"] }',
-    '  ]',
+    '  ],',
+    '  "satisfaction": 0.0,',
+    '  "mood": "one or two words"',
     '}',
     '',
     'Rules:',
     '- 3 to 8 insights max. Only decisions made, bugs fixed, things discovered, or conclusions. Skip chit-chat and intermediate noise.',
     '- "files" is optional; include only files actually touched for that fact.',
+    '- "satisfaction" is a number in [0, 1] rating how satisfied/content the USER seemed by the end:',
+    '  0 = clearly frustrated or dissatisfied (repeated corrections, complaints, things still broken),',
+    '  0.5 = neutral or unclear, 1 = clearly satisfied/pleased (thanks, praise, goal achieved cleanly).',
+    '  Judge ONLY from the user\'s tone and reactions, not your own opinion. Use 0.5 when in doubt.',
+    '- "mood" is one or two words for the user\'s overall mood (e.g. satisfied, frustrated, neutral, grateful).',
     '- Be concise and specific. Write in the language of the session.',
     '- Do not use any tools. Just read the session text below and respond with the JSON.',
     '',
@@ -233,9 +248,19 @@ export async function digestSession(input: DigestInput): Promise<DigestResult | 
         : undefined,
     }));
 
+  // Satisfaction: clamp to [0, 1]; default to 0.5 (neutral) when the model gives no usable number.
+  const satRaw = parsed ? Number(parsed.satisfaction) : NaN;
+  const satisfaction = Number.isFinite(satRaw) ? Math.max(0, Math.min(1, satRaw)) : 0.5;
+  const mood =
+    parsed && typeof parsed.mood === 'string' && parsed.mood.trim()
+      ? parsed.mood.trim().slice(0, 40)
+      : undefined;
+
   return {
     conclusion,
     insights,
+    satisfaction,
+    mood,
     usage: envelope.usage,
     costUsd: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : undefined,
   };

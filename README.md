@@ -125,6 +125,26 @@ The reranker is a **second model**, loaded **lazily on the leader** (only when a
 reranks), reused by followers via the same loopback service. If unavailable → the RRF order is kept,
 never an error.
 
+### Satisfaction weighting (mood-aware ranking)
+
+When the LLM digests a session it also rates, from **the user's tone alone**, how satisfied they
+seemed — `satisfaction` ∈ [0, 1] (0 = frustrated, 0.5 = neutral, 1 = pleased) plus a one/two-word
+`mood` — and stores both on the `digest`/`insight` docs. At search time this becomes a **bounded
+relevance multiplier** `1 + w·(2·satisfaction − 1)` ∈ `[1−w, 1+w]` (`w` = `MEMORY_SATISFACTION_WEIGHT`,
+default `0.12`):
+
+- **The more a memory pleased the user, the more weight it carries.** At (near-)equal relevance the
+  most satisfying memory ranks first; a clearly more relevant memory still wins (it's a tie-breaker,
+  not an override).
+- Applied **everywhere** retrieval happens: the hybrid/BM25 recall stage, the reranker's final sort,
+  and per-prompt auto-recall — all share the same factor.
+- **Neutral on missing signal**: docs without a satisfaction score (raw prompts/turns, pre-upgrade
+  memories) get factor `1`, so they're never penalised. Disable entirely with
+  `MEMORY_SATISFACTION_WEIGHT=0`.
+
+`memory_search` surfaces the mood inline (😀 / 😐 / 🙁 + the mood word). Bumping `DIGEST_VERSION`
+re-digests existing sessions so they pick up the new fields.
+
 ### Embeddings architecture (important)
 
 The **hooks are ephemeral processes**: loading a model on every hook would be too slow. So the
@@ -281,6 +301,26 @@ backfill rate). Notes:
 All hooks run with `suppressOutput` (no noise in the context), except `SessionStart` and
 `UserPromptSubmit` (auto-recall), which emit `additionalContext`.
 
+### Resource use & throttling
+
+Background work (semantic **vectorization** + **LLM digests**) runs only on the leader, drip-limited
+and best-effort. It's normally invisible — but it spikes briefly after an **update that re-processes
+the history**: bumping `digest_version` re-digests every past session, and each new digest's text is
+re-vectorized. That's a **one-time catch-up**; memory stays fully usable (BM25) the whole time.
+
+To bound that load, `loadPercent` (env `MEMORY_LOAD_PERCENT` / file `loadPercent`, default `100`)
+caps the **duty cycle** of the background loops — the share of wall-time they may keep the inference
+device busy. After each batch/session they idle a proportional slice:
+
+```
+pause = work_time · (100 / loadPercent − 1)      # 100 → 0 (full speed), 50 → ~half, 30 → ~third
+```
+
+Unlike an ONNX thread cap (CPU-only, caps the *peak*), this caps the *average* load and is
+**device-agnostic** — it throttles a GPU run too, which a thread cap can't. Set it live with
+`/memory:load <percent>` then `/reload-plugins`. `memory_stats` reports the current cap and any
+indexing backlog, so "why is memory busy?" has a clear, self-describing answer.
+
 ## Requirements
 
 - **Node ≥ 22.5** (`node:sqlite` module + FTS5 + extension loading). Launched via `node --no-warnings`.
@@ -325,7 +365,7 @@ Restart Claude Code (or `/reload-plugins`) to activate hooks + MCP server.
 
 Two mechanisms, **env takes precedence over the file**:
 - File `~/.claude-memory/config.json`, e.g. `{ "embedTier": "medium" }` (keys: `embedTier`,
-  `embedEnabled`, `embedDevice`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `autoRecall`, `autoRecallLimit`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
+  `embedEnabled`, `embedDevice`, `digestEnabled`, `digestModel`, `rerankEnabled`, `rerankModel`, `autoRecall`, `autoRecallLimit`, `satisfactionWeight`, `loadPercent`, `dbPath`, `embedModel`, `embedDim`, `contextLimit`). Editable via `/memory:config`.
 - System environment variables (overrides):
 
 | Variable | Default | Role |
@@ -341,6 +381,8 @@ Two mechanisms, **env takes precedence over the file**:
 | `MEMORY_RERANK_MODEL` | _(per tier)_ | Override the reranker model (empty = none) |
 | `MEMORY_AUTO_RECALL` | _(enabled)_ | `0` to disable per-prompt auto-recall injection |
 | `MEMORY_AUTO_RECALL_LIMIT` | `3` | Max new memories injected per prompt (auto-recall) |
+| `MEMORY_SATISFACTION_WEIGHT` | `0.12` | Satisfaction ranking strength (±factor); `0` to disable |
+| `MEMORY_LOAD_PERCENT` | `100` | Cap background work (vectorization + digests) to this % of CPU/GPU |
 | `MEMORY_EMBED_MODEL` | _(per tier)_ | Force a specific model (overrides the tier) |
 | `MEMORY_EMBED_DIM` | _(per tier)_ | Force the dimension (must match the model) |
 | `MEMORY_EMBED_DTYPE` | `q8` (cpu) / `fp32` (gpu) | ONNX precision: `q8` (quantized) or `fp32` |
@@ -356,8 +398,9 @@ Two mechanisms, **env takes precedence over the file**:
 Table `memories` (7 `type`s: `observation`, `prompt`, `turn`, `session`, `digest`, `insight`, `core`)
 + FTS5 `memories_fts` (sync triggers) + `vec_memories` (sqlite-vec). Deterministic `mem_id`
 (`{session}:obs:{n}`, `…:prompt:{n}`, `…:turn:{n}`, `…:session`, `…:digest`, `…:insight:{i}`,
-`core:{hash}`) → idempotent upsert (`ON CONFLICT`). `digest`/`insight` store their kind/version in `source`.
-A `meta` table holds version markers (`embed_model`, `embed_dim`, `embed_text_version`,
+`core:{hash}`) → idempotent upsert (`ON CONFLICT`). `digest`/`insight` store their kind/version in `source`,
+and their `satisfaction` (REAL, 0..1) + `mood` (TEXT) — added by a forward migration (`ALTER TABLE`) on
+older DBs. A `meta` table holds version markers (`embed_model`, `embed_dim`, `embed_text_version`,
 `digest_version`). WAL mode for concurrent hook/server access.
 
 ## Migration from claude-mem

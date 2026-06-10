@@ -5,7 +5,7 @@ import os from "os";
 import path from "path";
 import { readFileSync } from "fs";
 var DEFAULT_DIGEST_MODEL = "haiku";
-var DIGEST_VERSION = 1;
+var DIGEST_VERSION = 2;
 var EMBED_TEXT_VERSION = 1;
 var EMBED_TIERS = {
   light: { model: "Xenova/multilingual-e5-small", dim: 384, pooling: "mean" },
@@ -93,6 +93,8 @@ function loadConfig() {
   const rerankEnabled = src.flag("MEMORY_RERANK_ENABLED", "rerankEnabled") && !!rerankModel;
   const autoRecallEnabled = src.flag("MEMORY_AUTO_RECALL", "autoRecall");
   const autoRecallLimit = src.num("MEMORY_AUTO_RECALL_LIMIT", "autoRecallLimit", 3);
+  const satisfactionWeight = src.num("MEMORY_SATISFACTION_WEIGHT", "satisfactionWeight", 0.12);
+  const loadPercent = Math.max(5, Math.min(100, src.num("MEMORY_LOAD_PERCENT", "loadPercent", 100)));
   return {
     dbPath,
     dataDir,
@@ -100,7 +102,9 @@ function loadConfig() {
     embed: { enabled, tier, model, dim, cacheDir, dtype, device, pooling, queryPrefix, threads, dataDir },
     digest: { enabled: digestEnabled, model: digestModel, version: DIGEST_VERSION },
     rerank: { enabled: rerankEnabled, model: rerankModel },
-    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit }
+    autoRecall: { enabled: autoRecallEnabled, limit: autoRecallLimit },
+    satisfactionWeight,
+    loadPercent
   };
 }
 
@@ -112,6 +116,11 @@ import { createHash } from "crypto";
 import path2 from "path";
 var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core"];
 var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
+function satisfactionFactor(satisfaction, weight) {
+  if (weight <= 0 || satisfaction == null || !Number.isFinite(satisfaction)) return 1;
+  const s = Math.max(0, Math.min(1, satisfaction));
+  return 1 + weight * (s - 0.5) * 2;
+}
 var HERE = path2.dirname(fileURLToPath(import.meta.url));
 var COLS = [
   "mem_id",
@@ -137,7 +146,9 @@ var COLS = [
   "started_at",
   "ended_at",
   "end_reason",
-  "source"
+  "source",
+  "satisfaction",
+  "mood"
 ];
 var FTS_COLS = ["summary", "user_prompt", "assistant_text", "tool_brief", "prompts_text"];
 var BM25_WEIGHTS = "3.0, 2.0, 1.0, 1.0, 1.5";
@@ -205,7 +216,9 @@ function rowToDoc(r) {
     started_at: r.started_at ?? void 0,
     ended_at: r.ended_at ?? void 0,
     end_reason: r.end_reason ?? void 0,
-    source: r.source ?? void 0
+    source: r.source ?? void 0,
+    satisfaction: r.satisfaction == null ? void 0 : Number(r.satisfaction),
+    mood: r.mood ?? void 0
   };
 }
 function toBlob(arr) {
@@ -241,6 +254,14 @@ var MemoryStore = class {
   metaSet(k, v) {
     this.db.prepare("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").run(k, v);
   }
+  /** Adds a column to an existing table if missing (lightweight forward migration). Best-effort. */
+  ensureColumn(table, col, decl) {
+    try {
+      const cols = this.db.prepare(`PRAGMA table_info(${table});`).all().map((r) => String(r.name));
+      if (!cols.includes(col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl};`);
+    } catch {
+    }
+  }
   async init() {
     if (this.db) return;
     const DatabaseSync = await getDatabaseSync();
@@ -259,9 +280,12 @@ var MemoryStore = class {
         tool_name TEXT, tool_brief TEXT,
         tools TEXT, files_read TEXT, files_modified TEXT,
         prompts TEXT, prompts_text TEXT,
-        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT
+        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT,
+        satisfaction REAL, mood TEXT
       );
     `);
+    this.ensureColumn("memories", "satisfaction", "REAL");
+    this.ensureColumn("memories", "mood", "TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);");
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -344,7 +368,9 @@ var MemoryStore = class {
       started_at: d.started_at ?? null,
       ended_at: d.ended_at ?? null,
       end_reason: d.end_reason ?? null,
-      source: d.source ?? null
+      source: d.source ?? null,
+      satisfaction: d.satisfaction ?? null,
+      mood: d.mood ?? null
     };
     return COLS.map((c) => map[c]);
   }
@@ -503,17 +529,42 @@ var MemoryStore = class {
     const byRowid = new Map(rows.map((r) => [Number(r.rowid), r]));
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
+  /** Satisfaction scores for a set of rowids (rowid → satisfaction in [0,1]). Missing → absent. */
+  satisfactionByRowids(rowids) {
+    const m = /* @__PURE__ */ new Map();
+    if (rowids.length === 0) return m;
+    const placeholders = rowids.map(() => "?").join(",");
+    try {
+      const rows = this.db.prepare(`SELECT rowid, satisfaction FROM memories WHERE rowid IN (${placeholders});`).all(...rowids);
+      for (const r of rows) {
+        if (r.satisfaction != null && Number.isFinite(Number(r.satisfaction)))
+          m.set(Number(r.rowid), Number(r.satisfaction));
+      }
+    } catch {
+    }
+    return m;
+  }
   /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params) {
     const limit = params.limit ?? 10;
     const cand = Math.max(limit * 4, 40);
     const bm = this.bm25Rows(params.query, params.project, params.type, cand);
     const vec = params.embedding && this._vectorEnabled ? this.vecRows(params.embedding, params.project, params.type, cand) : [];
-    if (vec.length === 0) return this.docsByRowids(bm.slice(0, limit));
     const score = /* @__PURE__ */ new Map();
-    bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
-    vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
-    const ordered = [...score.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map((e) => e[0]);
+    if (vec.length === 0) {
+      bm.forEach((rid, i) => score.set(rid, 1 / (RRF_K + i + 1)));
+    } else {
+      bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+      vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+    }
+    if (score.size === 0) return [];
+    const weight = params.satisfactionWeight ?? 0;
+    const rowids = [...score.keys()];
+    const sat = weight > 0 ? this.satisfactionByRowids(rowids) : null;
+    const ordered = rowids.map((rid) => ({
+      rid,
+      s: score.get(rid) * (sat ? satisfactionFactor(sat.get(rid), weight) : 1)
+    })).sort((a, b) => b.s - a.s).slice(0, limit).map((e) => e.rid);
     return this.docsByRowids(ordered);
   }
   recent(params) {
@@ -1257,6 +1308,18 @@ var LeaderCoordinator = class extends EventEmitter {
   }
 };
 
+// src/throttle.ts
+function sleep(ms) {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    t.unref?.();
+  });
+}
+function throttlePause(workMs, loadPercent, capMs = 3e4) {
+  if (!Number.isFinite(loadPercent) || loadPercent >= 100 || loadPercent <= 0 || workMs <= 0) return 0;
+  return Math.min(capMs, Math.round(workMs * (100 / loadPercent - 1)));
+}
+
 // src/backfill-loop.ts
 var BACKFILL_INTERVAL_MS = 6e4;
 var BACKFILL_BATCH = 32;
@@ -1295,8 +1358,10 @@ var BackfillLoop = class {
           state: "backfilling",
           model: this.cfg.embed.model,
           vectorized: this.store.stats().vectorCount,
-          missing: this.store.countMissingVectors()
+          missing: this.store.countMissingVectors(),
+          loadPercent: this.cfg.loadPercent
         });
+        const t0 = Date.now();
         const vectors = await this.embedder.embedBatch(docs.map((d) => d.text));
         const writes = [];
         for (let i = 0; i < docs.length; i++) {
@@ -1304,6 +1369,8 @@ var BackfillLoop = class {
           if (v) writes.push({ rowid: docs[i].rowid, embedding: v });
         }
         this.store.setVectorsBulk(writes);
+        const pause = throttlePause(Date.now() - t0, this.cfg.loadPercent);
+        if (pause > 0) await sleep(pause);
       }
     } catch {
     } finally {
@@ -1357,12 +1424,19 @@ function buildPrompt(input) {
     '  "conclusion": "1-3 sentences: what was achieved and the final state",',
     '  "insights": [',
     '    { "kind": "decision|bugfix|discovery|conclusion", "text": "one concrete durable fact", "files": ["path"] }',
-    "  ]",
+    "  ],",
+    '  "satisfaction": 0.0,',
+    '  "mood": "one or two words"',
     "}",
     "",
     "Rules:",
     "- 3 to 8 insights max. Only decisions made, bugs fixed, things discovered, or conclusions. Skip chit-chat and intermediate noise.",
     '- "files" is optional; include only files actually touched for that fact.',
+    '- "satisfaction" is a number in [0, 1] rating how satisfied/content the USER seemed by the end:',
+    "  0 = clearly frustrated or dissatisfied (repeated corrections, complaints, things still broken),",
+    "  0.5 = neutral or unclear, 1 = clearly satisfied/pleased (thanks, praise, goal achieved cleanly).",
+    "  Judge ONLY from the user's tone and reactions, not your own opinion. Use 0.5 when in doubt.",
+    `- "mood" is one or two words for the user's overall mood (e.g. satisfied, frustrated, neutral, grateful).`,
     "- Be concise and specific. Write in the language of the session.",
     "- Do not use any tools. Just read the session text below and respond with the JSON.",
     "",
@@ -1490,9 +1564,14 @@ async function digestSession(input) {
     text: String(x.text).trim().slice(0, 1e3),
     files: Array.isArray(x.files) ? x.files.filter((f) => typeof f === "string").slice(0, 10) : void 0
   }));
+  const satRaw = parsed ? Number(parsed.satisfaction) : NaN;
+  const satisfaction = Number.isFinite(satRaw) ? Math.max(0, Math.min(1, satRaw)) : 0.5;
+  const mood = parsed && typeof parsed.mood === "string" && parsed.mood.trim() ? parsed.mood.trim().slice(0, 40) : void 0;
   return {
     conclusion,
     insights,
+    satisfaction,
+    mood,
     usage: envelope.usage,
     costUsd: typeof envelope.total_cost_usd === "number" ? envelope.total_cost_usd : void 0
   };
@@ -1550,8 +1629,10 @@ var DigestLoop = class {
         if (turns.length === 0) continue;
         writeStatus(this.cfg.dataDir, {
           state: "digesting",
-          digestPending: this.store.countSessionsNeedingDigest(this.cfg.digest.version)
+          digestPending: this.store.countSessionsNeedingDigest(this.cfg.digest.version),
+          loadPercent: this.cfg.loadPercent
         });
+        const t0 = Date.now();
         const result = await digestSession({
           session_id: sess.session_id,
           project: sess.project,
@@ -1569,7 +1650,9 @@ var DigestLoop = class {
           summary: result.conclusion,
           source: String(this.cfg.digest.version),
           // version marker → re-digest selector
-          files_modified: digestFiles
+          files_modified: digestFiles,
+          satisfaction: result.satisfaction,
+          mood: result.mood
         };
         const insightDocs = result.insights.map((ins) => ({
           type: "insight",
@@ -1578,13 +1661,17 @@ var DigestLoop = class {
           assistant_text: ins.text,
           source: ins.kind,
           // decision | bugfix | discovery | conclusion
-          files_modified: ins.files ?? []
+          files_modified: ins.files ?? [],
+          // Insights inherit the session's satisfaction so the weighting applies to them too.
+          satisfaction: result.satisfaction
         }));
         this.store.writeDigest(sess.session_id, digestDoc, insightDocs);
         log(
           this.cfg.dataDir,
           `[digest] ${sess.session_id} \u2192 ${result.insights.length} insights${result.costUsd != null ? ` ($${result.costUsd.toFixed(4)})` : ""}`
         );
+        const pause = throttlePause(Date.now() - t0, this.cfg.loadPercent);
+        if (pause > 0) await sleep(pause);
       }
     } catch {
     } finally {
@@ -1639,6 +1726,11 @@ function ensureNamedBinary(name) {
 
 // src/tools/search.ts
 var TYPES = ["observation", "prompt", "turn", "session", "digest", "insight"];
+function moodMarker(d) {
+  if (d.satisfaction == null || !Number.isFinite(d.satisfaction)) return "";
+  const emoji = d.satisfaction >= 0.66 ? "\u{1F600}" : d.satisfaction <= 0.33 ? "\u{1F641}" : "\u{1F610}";
+  return d.mood ? ` ${emoji} ${d.mood}` : ` ${emoji}`;
+}
 function fmtDoc(d) {
   const date = (d.ts ?? d.ended_at ?? "").slice(0, 16).replace("T", " ");
   const proj = d.project ?? "?";
@@ -1647,7 +1739,7 @@ function fmtDoc(d) {
   const files = (d.files_modified ?? []).slice(0, 4);
   const filesLine = files.length ? `
   \u{1F4DD} ${files.join(", ")}` : "";
-  return `- **[${d.type}]** \`${proj}\` \xB7 ${date}
+  return `- **[${d.type}]** \`${proj}\` \xB7 ${date}${moodMarker(d)}
   ${text}${filesLine}`;
 }
 function rerankText(d) {
@@ -1680,13 +1772,21 @@ var memorySearch = {
     const embedding = store.vectorEnabled ? await embedQuery(query) : null;
     const rerankOn = config.rerank.enabled;
     const candidateK = rerankOn ? Math.min(100, Math.max(50, limit * 5)) : limit;
-    let docs = store.search({ query, project, type, limit: candidateK, embedding });
+    const satWeight = config.satisfactionWeight;
+    let docs = store.search({
+      query,
+      project,
+      type,
+      limit: candidateK,
+      embedding,
+      satisfactionWeight: satWeight
+    });
     if (docs.length === 0) return `No memory for "${query}".`;
     let mode = embedding ? "hybrid BM25+semantic" : "BM25";
     if (rerankOn && docs.length > limit) {
       const scores = await rerank(query, docs.map(rerankText));
       if (scores && scores.length === docs.length) {
-        docs = docs.map((d, i) => ({ d, s: scores[i] ?? -Infinity })).sort((a, b) => b.s - a.s).map((x) => x.d);
+        docs = docs.map((d, i) => ({ d, s: (scores[i] ?? -Infinity) * satisfactionFactor(d.satisfaction, satWeight) })).sort((a, b) => b.s - a.s).map((x) => x.d);
         mode += " + rerank";
       }
     }
@@ -1724,7 +1824,7 @@ var memoryStats = {
   name: "memory_stats",
   description: "Diagnostics: SQLite database path, total documents, breakdown by type/project, state of the vector index and the local embedder.",
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  handler: async (_args, { store, embedCfg, embedder }) => {
+  handler: async (_args, { store, embedCfg, embedder, config }) => {
     const s = store.stats();
     const missing = store.countMissingVectors();
     const embedderUp = embedCfg.enabled && s.vectorEnabled ? embedder.loaded() : false;
@@ -1743,6 +1843,20 @@ var memoryStats = {
     lines.push(
       `- Embedder (${embedCfg.model}): ${!embedCfg.enabled ? "disabled (MEMORY_EMBED_ENABLED=0)" : embedderUp ? `\u2705 loaded${dev}` : "\u23F3 not loaded yet / unavailable"}`
     );
+    const digestPending = config.digest.enabled ? store.countSessionsNeedingDigest(config.digest.version) : 0;
+    const load = config.loadPercent;
+    lines.push(
+      `- Background load cap: ${load >= 100 ? "none (100% \u2014 full speed)" : `${load}% of CPU/GPU (paced)`}`
+    );
+    if (missing > 0 || digestPending > 0) {
+      const bits = [];
+      if (digestPending > 0) bits.push(`${digestPending} session(s) to (re)digest`);
+      if (missing > 0) bits.push(`${missing} vector(s) to compute`);
+      lines.push(`- Background indexing in progress: ${bits.join(", ")}.`);
+      lines.push(
+        `  This is a **one-time catch-up** (e.g. after a plugin update that improves memories). It runs in the background and memory stays usable meanwhile. To use less CPU/GPU, lower the load cap via \`/memory:load <percent>\` (e.g. 30) \u2014 slower backfill, lighter machine.`
+      );
+    }
     return lines.join("\n");
   }
 };

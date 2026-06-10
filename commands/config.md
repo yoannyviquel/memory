@@ -26,6 +26,11 @@ Selects the semantic embedding model. Three multilingual tiers (e5 family):
 > `memory_search`). Bounded + deduped per session to avoid context bloat. Tune with
 > `MEMORY_AUTO_RECALL=0` (off) and `MEMORY_AUTO_RECALL_LIMIT` (max injected per prompt, default 3),
 > or the `autoRecall` / `autoRecallLimit` keys in `config.json`.
+>
+> **Background load cap**: vectorization + LLM digests run in the background and can briefly use the
+> CPU/GPU — especially right after an update that re-processes the history. Cap their share of the
+> device with `/memory:load <percent>` (or `MEMORY_LOAD_PERCENT` / `loadPercent` in `config.json`,
+> default 100 = no throttle).
 
 User argument: `$ARGUMENTS` (expected: `light`, `medium`, `heavy`, or empty to show the state).
 

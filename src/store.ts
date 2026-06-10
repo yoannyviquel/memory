@@ -42,6 +42,22 @@ export interface MemoryDoc {
   ended_at?: string;
   end_reason?: string;
   source?: string;
+  /** User satisfaction across the session, in [0, 1] (0.5 = neutral). Set on digest/insight docs. */
+  satisfaction?: number;
+  /** One or two words for the user's mood (e.g. "satisfied", "frustrated"). Set on digest docs. */
+  mood?: string;
+}
+
+/**
+ * Maps a satisfaction score (0..1, 0.5 = neutral) to a bounded relevance multiplier in
+ * [1 - weight, 1 + weight]. Undefined/NaN satisfaction → 1 (neutral), so memories without a
+ * satisfaction signal are never penalised. Keeps satisfaction a tie-breaker that lifts the memories
+ * that pleased the user at (near-)equal relevance — not an override of relevance.
+ */
+export function satisfactionFactor(satisfaction: number | undefined | null, weight: number): number {
+  if (weight <= 0 || satisfaction == null || !Number.isFinite(satisfaction)) return 1;
+  const s = Math.max(0, Math.min(1, satisfaction));
+  return 1 + weight * (s - 0.5) * 2;
 }
 
 export interface SearchParams {
@@ -51,6 +67,8 @@ export interface SearchParams {
   limit?: number;
   /** Query embedding (enables hybrid search if provided and vectors enabled). */
   embedding?: number[] | null;
+  /** Satisfaction weighting strength (0 = off). See {@link satisfactionFactor}. */
+  satisfactionWeight?: number;
 }
 
 export interface RecentParams {
@@ -81,7 +99,7 @@ const COLS = [
   'mem_id', 'type', 'session_id', 'project', 'branch', 'cwd', 'ts', 'ts_epoch',
   'prompt_number', 'user_prompt', 'assistant_text', 'summary', 'tool_name', 'tool_brief',
   'tools', 'files_read', 'files_modified', 'prompts', 'prompts_text', 'turn_count',
-  'started_at', 'ended_at', 'end_reason', 'source',
+  'started_at', 'ended_at', 'end_reason', 'source', 'satisfaction', 'mood',
 ] as const;
 
 const FTS_COLS = ['summary', 'user_prompt', 'assistant_text', 'tool_brief', 'prompts_text'];
@@ -165,6 +183,8 @@ function rowToDoc(r: any): MemoryDoc {
     ended_at: r.ended_at ?? undefined,
     end_reason: r.end_reason ?? undefined,
     source: r.source ?? undefined,
+    satisfaction: r.satisfaction == null ? undefined : Number(r.satisfaction),
+    mood: r.mood ?? undefined,
   };
 }
 
@@ -208,6 +228,19 @@ export class MemoryStore {
       .run(k, v);
   }
 
+  /** Adds a column to an existing table if missing (lightweight forward migration). Best-effort. */
+  private ensureColumn(table: string, col: string, decl: string): void {
+    try {
+      const cols = this.db
+        .prepare(`PRAGMA table_info(${table});`)
+        .all()
+        .map((r: any) => String(r.name));
+      if (!cols.includes(col)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${decl};`);
+    } catch {
+      /* ignore — the column is non-essential; capture still works without it */
+    }
+  }
+
   async init(): Promise<void> {
     if (this.db) return;
     const DatabaseSync = await getDatabaseSync();
@@ -226,9 +259,14 @@ export class MemoryStore {
         tool_name TEXT, tool_brief TEXT,
         tools TEXT, files_read TEXT, files_modified TEXT,
         prompts TEXT, prompts_text TEXT,
-        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT
+        turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT,
+        satisfaction REAL, mood TEXT
       );
     `);
+    // Columns added after the initial schema: a CREATE TABLE IF NOT EXISTS won't add them to an
+    // existing DB, so backfill them with ALTER TABLE (no-op once present).
+    this.ensureColumn('memories', 'satisfaction', 'REAL');
+    this.ensureColumn('memories', 'mood', 'TEXT');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);');
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -330,6 +368,8 @@ export class MemoryStore {
       ended_at: d.ended_at ?? null,
       end_reason: d.end_reason ?? null,
       source: d.source ?? null,
+      satisfaction: d.satisfaction ?? null,
+      mood: d.mood ?? null,
     };
     return COLS.map((c) => map[c]);
   }
@@ -525,6 +565,25 @@ export class MemoryStore {
     return rowids.map((rid) => byRowid.get(rid)).filter(Boolean).map(rowToDoc);
   }
 
+  /** Satisfaction scores for a set of rowids (rowid → satisfaction in [0,1]). Missing → absent. */
+  private satisfactionByRowids(rowids: number[]): Map<number, number> {
+    const m = new Map<number, number>();
+    if (rowids.length === 0) return m;
+    const placeholders = rowids.map(() => '?').join(',');
+    try {
+      const rows = this.db
+        .prepare(`SELECT rowid, satisfaction FROM memories WHERE rowid IN (${placeholders});`)
+        .all(...rowids);
+      for (const r of rows) {
+        if (r.satisfaction != null && Number.isFinite(Number(r.satisfaction)))
+          m.set(Number(r.rowid), Number(r.satisfaction));
+      }
+    } catch {
+      /* satisfaction column absent on a very old DB → no weighting */
+    }
+    return m;
+  }
+
   /** Search: BM25 only, or hybrid (RRF of BM25 + KNN) if an embedding is provided. */
   search(params: SearchParams): MemoryDoc[] {
     const limit = params.limit ?? 10;
@@ -534,16 +593,31 @@ export class MemoryStore {
       params.embedding && this._vectorEnabled
         ? this.vecRows(params.embedding, params.project, params.type, cand)
         : [];
-    if (vec.length === 0) return this.docsByRowids(bm.slice(0, limit));
 
-    // Reciprocal Rank Fusion.
+    // Base relevance score per rowid: Reciprocal Rank Fusion of BM25 + KNN, or — when BM25 only —
+    // a strictly-decreasing inverse-rank score that preserves the BM25 order.
     const score = new Map<number, number>();
-    bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
-    vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
-    const ordered = [...score.entries()]
-      .sort((a, b) => b[1] - a[1])
+    if (vec.length === 0) {
+      bm.forEach((rid, i) => score.set(rid, 1 / (RRF_K + i + 1)));
+    } else {
+      bm.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+      vec.forEach((rid, i) => score.set(rid, (score.get(rid) ?? 0) + 1 / (RRF_K + i + 1)));
+    }
+    if (score.size === 0) return [];
+
+    // Satisfaction weighting: at (near-)equal relevance, lift the memories that pleased the user
+    // most. A bounded multiplier (satisfactionFactor) keeps it a tie-breaker, not an override.
+    const weight = params.satisfactionWeight ?? 0;
+    const rowids = [...score.keys()];
+    const sat = weight > 0 ? this.satisfactionByRowids(rowids) : null;
+    const ordered = rowids
+      .map((rid) => ({
+        rid,
+        s: (score.get(rid) as number) * (sat ? satisfactionFactor(sat.get(rid), weight) : 1),
+      }))
+      .sort((a, b) => b.s - a.s)
       .slice(0, limit)
-      .map((e) => e[0]);
+      .map((e) => e.rid);
     return this.docsByRowids(ordered);
   }
 

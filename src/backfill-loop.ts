@@ -2,6 +2,7 @@ import type { MemoryConfig } from './config.js';
 import type { MemoryStore } from './store.js';
 import type { EmbedderHost } from './embeddings.js';
 import { writeStatus } from './log.js';
+import { sleep, throttlePause } from './throttle.js';
 
 const BACKFILL_INTERVAL_MS = 60_000;
 // Docs vectorized per ONNX pass. Batching amortizes per-call overhead and uses the matmuls far
@@ -50,7 +51,9 @@ export class BackfillLoop {
           model: this.cfg.embed.model,
           vectorized: this.store.stats().vectorCount,
           missing: this.store.countMissingVectors(),
+          loadPercent: this.cfg.loadPercent,
         });
+        const t0 = Date.now();
         const vectors = await this.embedder.embedBatch(docs.map((d) => d.text));
         const writes: Array<{ rowid: number; embedding: number[] }> = [];
         for (let i = 0; i < docs.length; i++) {
@@ -58,6 +61,10 @@ export class BackfillLoop {
           if (v) writes.push({ rowid: docs[i].rowid, embedding: v });
         }
         this.store.setVectorsBulk(writes);
+        // Duty-cycle throttle: idle a slice proportional to the batch time so the backfill keeps the
+        // CPU/GPU busy only ~loadPercent of the time (no-op at 100%).
+        const pause = throttlePause(Date.now() - t0, this.cfg.loadPercent);
+        if (pause > 0) await sleep(pause);
       }
     } catch {
       /* best-effort */

@@ -13,7 +13,8 @@
     "dev": "tsx src/server.ts",
     "migrate": "node --no-warnings dist/migrate.js",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "test:unit": "tsx --test test/*.test.mts",
+    "test": "npm run build && node --test test/*.test.mjs && tsx --test test/*.test.mts",
     "clean": "rimraf dist"
   },
   "dependencies": {
