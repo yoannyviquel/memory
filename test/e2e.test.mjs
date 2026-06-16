@@ -307,3 +307,65 @@ test('2.4 auto-recall injects relevant memory into the prompt', { timeout: 240_0
     cleanup(dataDir);
   }
 });
+
+// 2.5 — Doc ingestion (Tier 2): add a page body → chunked + vectorized → found by BM25 and by a
+// no-shared-token paraphrase (semantic) → listed → removed. Idempotent re-ingest doesn't duplicate.
+test('2.5 doc ingestion: chunk, search, list, remove', { timeout: VECTO_TIMEOUT }, async () => {
+  const dataDir = freshDataDir();
+  const env = baseEnv(dataDir); // embed enabled (light) so we exercise the vector path
+  let srv;
+  try {
+    srv = await startServer(env);
+    const URL = 'https://confluence.example.com/display/OCT/Composant-Quarantaine';
+    const BODY =
+      'La quarantaine des offres met en attente les annonces suspectes avant publication. ' +
+      'Une offre passe en quarantaine quand le détecteur de fraude lève une alerte de score élevé. ' +
+      'Un opérateur peut ensuite valider ou rejeter manuellement chaque offre depuis le back-office.';
+
+    const add = await call(srv.client, 'memory_doc_add', {
+      url: URL,
+      title: 'Composant Quarantaine',
+      text: BODY,
+      labels: ['quarantaine', 'fraude'],
+    });
+    assert.match(add, /Doc ingested/, 'add reports success');
+    const docId = (add.match(/doc:[0-9a-f]+/) ?? [])[0];
+    assert.ok(docId, 'a doc_id is returned');
+
+    // BM25 on exact words.
+    const bm25 = await call(srv.client, 'memory_search', { query: 'quarantaine offres', type: 'doc' });
+    assert.match(bm25, /Quarantaine/, 'doc found by BM25 with type filter');
+
+    // Idempotent re-ingest: same URL → still one doc listed.
+    await call(srv.client, 'memory_doc_add', {
+      url: URL,
+      title: 'Composant Quarantaine',
+      text: BODY,
+      labels: ['quarantaine', 'fraude'],
+    });
+    const list = await call(srv.client, 'memory_doc_list', {});
+    assert.match(list, /1 ingested doc/, 're-ingest does not duplicate');
+    assert.match(list, /quarantaine, fraude/, 'labels listed');
+
+    // Semantic: paraphrase with no shared token → only a vector hit can match.
+    const vecto = await pollUntil(
+      async () => {
+        const r = await call(srv.client, 'memory_search', {
+          query: 'mise en attente des annonces douteuses avant mise en ligne',
+        });
+        return /Quarantaine/.test(r) ? r : null;
+      },
+      { timeoutMs: VECTO_TIMEOUT, stepMs: 1000, label: 'doc chunk vectorized + semantically found' },
+    );
+    assert.match(vecto, /Quarantaine/, 'semantic search finds the ingested doc');
+
+    // Remove → gone.
+    const rm = await call(srv.client, 'memory_doc_remove', { doc_id: docId });
+    assert.match(rm, /Removed doc/, 'remove reports success');
+    const after = await call(srv.client, 'memory_doc_list', {});
+    assert.match(after, /No ingested doc/, 'doc gone after remove');
+  } finally {
+    await srv?.close();
+    cleanup(dataDir);
+  }
+});

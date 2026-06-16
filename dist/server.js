@@ -114,7 +114,7 @@ import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { createHash } from "crypto";
 import path2 from "path";
-var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core"];
+var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core", "doc"];
 var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
 function satisfactionFactor(satisfaction, weight) {
   if (weight <= 0 || satisfaction == null || !Number.isFinite(satisfaction)) return 1;
@@ -148,7 +148,12 @@ var COLS = [
   "end_reason",
   "source",
   "satisfaction",
-  "mood"
+  "mood",
+  "url",
+  "doc_id",
+  "title",
+  "labels",
+  "fetched_at"
 ];
 var FTS_COLS = ["summary", "user_prompt", "assistant_text", "tool_brief", "prompts_text"];
 var BM25_WEIGHTS = "3.0, 2.0, 1.0, 1.0, 1.5";
@@ -218,13 +223,18 @@ function rowToDoc(r) {
     end_reason: r.end_reason ?? void 0,
     source: r.source ?? void 0,
     satisfaction: r.satisfaction == null ? void 0 : Number(r.satisfaction),
-    mood: r.mood ?? void 0
+    mood: r.mood ?? void 0,
+    url: r.url ?? void 0,
+    doc_id: r.doc_id ?? void 0,
+    title: r.title ?? void 0,
+    labels: jsonArr(r.labels),
+    fetched_at: r.fetched_at ?? void 0
   };
 }
 function toBlob(arr) {
   return new Uint8Array(Float32Array.from(arr).buffer);
 }
-var MemoryStore = class {
+var MemoryStore = class _MemoryStore {
   constructor(dbPath, dim = 384, model = "", embedTextVersion = 0) {
     this.dbPath = dbPath;
     this.dim = dim;
@@ -281,11 +291,18 @@ var MemoryStore = class {
         tools TEXT, files_read TEXT, files_modified TEXT,
         prompts TEXT, prompts_text TEXT,
         turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT,
-        satisfaction REAL, mood TEXT
+        satisfaction REAL, mood TEXT,
+        url TEXT, doc_id TEXT, title TEXT, labels TEXT, fetched_at TEXT
       );
     `);
     this.ensureColumn("memories", "satisfaction", "REAL");
     this.ensureColumn("memories", "mood", "TEXT");
+    this.ensureColumn("memories", "url", "TEXT");
+    this.ensureColumn("memories", "doc_id", "TEXT");
+    this.ensureColumn("memories", "title", "TEXT");
+    this.ensureColumn("memories", "labels", "TEXT");
+    this.ensureColumn("memories", "fetched_at", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_mem_doc ON memories(type, doc_id);");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);");
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -370,7 +387,12 @@ var MemoryStore = class {
       end_reason: d.end_reason ?? null,
       source: d.source ?? null,
       satisfaction: d.satisfaction ?? null,
-      mood: d.mood ?? null
+      mood: d.mood ?? null,
+      url: d.url ?? null,
+      doc_id: d.doc_id ?? null,
+      title: d.title ?? null,
+      labels: JSON.stringify(d.labels ?? []),
+      fetched_at: d.fetched_at ?? null
     };
     return COLS.map((c) => map[c]);
   }
@@ -754,6 +776,114 @@ var MemoryStore = class {
     } catch {
       return { files: [] };
     }
+  }
+  // ---- Docs (curated, ingested external documentation) -----------------------------------
+  /** Chunk sizing (chars). ~1400 stays inside the e5 token window and the 2000-char embed slice. */
+  static DOC_CHUNK_CHARS = 1400;
+  static DOC_CHUNK_OVERLAP = 150;
+  /** Stable doc_id from a source URL — groups every chunk/pointer of one document. */
+  docIdFor(url) {
+    return "doc:" + createHash("sha1").update(url.trim()).digest("hex").slice(0, 12);
+  }
+  /**
+   * Splits text into ~chunkChars pieces, preferring paragraph/sentence/word boundaries, with a small
+   * overlap so a fact straddling a cut stays recallable from either side.
+   */
+  chunkText(text, chunkChars = _MemoryStore.DOC_CHUNK_CHARS, overlap = _MemoryStore.DOC_CHUNK_OVERLAP) {
+    const clean = text.replace(/\r\n/g, "\n").trim();
+    if (clean.length <= chunkChars) return clean ? [clean] : [];
+    const chunks = [];
+    let i = 0;
+    while (i < clean.length) {
+      let end = Math.min(i + chunkChars, clean.length);
+      if (end < clean.length) {
+        const slice = clean.slice(i, end);
+        const min = chunkChars * 0.5;
+        const para = slice.lastIndexOf("\n\n");
+        const sent = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf(".\n"));
+        const ws = slice.lastIndexOf(" ");
+        const cut = para > min ? para : sent > min ? sent + 1 : ws > min ? ws : -1;
+        if (cut > 0) end = i + cut;
+      }
+      const piece = clean.slice(i, end).trim();
+      if (piece) chunks.push(piece);
+      if (end >= clean.length) break;
+      i = Math.max(end - overlap, i + 1);
+    }
+    return chunks;
+  }
+  /**
+   * Ingests an external documentation source (idempotent on its URL). With `body`, stores it as N
+   * vectorized chunks (Tier 2 — semantic search on the real content); otherwise stores a single
+   * pointer row carrying title + summary + URL (Tier 1 — light, re-fetch on demand). Re-ingesting the
+   * same URL replaces all its rows. Vectors are filled in the background by the server's backfill.
+   */
+  addDoc(input) {
+    const url = input.url.trim();
+    const title = input.title.trim();
+    const docId = this.docIdFor(url);
+    const labels = (input.labels ?? []).filter((s) => typeof s === "string" && s.trim());
+    const fetchedAt = input.fetchedAt ?? (/* @__PURE__ */ new Date()).toISOString();
+    this.removeDoc(docId);
+    const base = {
+      type: "doc",
+      project: input.project,
+      url,
+      doc_id: docId,
+      title,
+      labels,
+      fetched_at: fetchedAt,
+      ts: fetchedAt
+    };
+    const body = (input.body ?? "").trim();
+    if (body) {
+      const pieces = this.chunkText(body);
+      pieces.forEach((piece, i) => {
+        this.upsert(`${docId}:${i}`, {
+          ...base,
+          summary: `${title}
+
+${piece}`.slice(0, 4e3)
+        });
+      });
+      return { docId, chunks: pieces.length };
+    }
+    this.upsert(docId, {
+      ...base,
+      summary: (input.summary ? `${title} \u2014 ${input.summary}` : title).slice(0, 2e3)
+    });
+    return { docId, chunks: 1 };
+  }
+  /** Lists ingested docs (one entry per source URL), most recent first. Scoped to project + globals. */
+  listDocs(project) {
+    const where = ["type='doc'"];
+    const args = [];
+    if (project) {
+      where.push("(project = ? OR project IS NULL)");
+      args.push(project);
+    }
+    const rows = this.db.prepare(
+      `SELECT doc_id, MAX(title) title, MAX(url) url, MAX(labels) labels, MAX(fetched_at) fetched_at,
+                MAX(project) project, COUNT(*) c, MAX(ts_epoch) e
+         FROM memories WHERE ${where.join(" AND ")}
+         GROUP BY doc_id ORDER BY e DESC;`
+    ).all(...args);
+    return rows.map((r) => ({
+      docId: r.doc_id,
+      title: r.title ?? "(untitled)",
+      url: r.url ?? "",
+      labels: jsonArr(r.labels),
+      fetchedAt: r.fetched_at ?? void 0,
+      chunks: Number(r.c),
+      project: r.project ?? void 0
+    }));
+  }
+  /** Removes every row (chunks + pointer) of an ingested doc by its doc_id (+ vectors). */
+  removeDoc(docId) {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE type='doc' AND doc_id = ?;`).all(docId).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE type='doc' AND doc_id = ?;`).run(docId);
+    return Number(info?.changes ?? rids.length);
   }
   /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
   deleteVectors(rowids) {
@@ -1725,7 +1855,7 @@ function ensureNamedBinary(name) {
 }
 
 // src/tools/search.ts
-var TYPES = ["observation", "prompt", "turn", "session", "digest", "insight"];
+var TYPES = ["observation", "prompt", "turn", "session", "digest", "insight", "doc"];
 function moodMarker(d) {
   if (d.satisfaction == null || !Number.isFinite(d.satisfaction)) return "";
   const emoji = d.satisfaction >= 0.66 ? "\u{1F600}" : d.satisfaction <= 0.33 ? "\u{1F641}" : "\u{1F610}";
@@ -1739,8 +1869,10 @@ function fmtDoc(d) {
   const files = (d.files_modified ?? []).slice(0, 4);
   const filesLine = files.length ? `
   \u{1F4DD} ${files.join(", ")}` : "";
+  const docLine = d.type === "doc" && d.url ? `
+  \u{1F4C4} ${d.title ? `${d.title} \xB7 ` : ""}${d.url}` : "";
   return `- **[${d.type}]** \`${proj}\` \xB7 ${date}${moodMarker(d)}
-  ${text}${filesLine}`;
+  ${text}${docLine}${filesLine}`;
 }
 function rerankText(d) {
   const t = d.summary || d.assistant_text || d.user_prompt || d.prompts && d.prompts.join(" ") || d.tool_brief || "";
@@ -1898,7 +2030,7 @@ var memoryReindex = {
 var reindexTools = [memoryReindex];
 
 // src/tools/delete.ts
-var TYPES2 = ["observation", "prompt", "turn", "session", "digest", "insight"];
+var TYPES2 = ["observation", "prompt", "turn", "session", "digest", "insight", "doc"];
 var memoryDelete = {
   name: "memory_delete",
   description: 'DESTRUCTIVE. Deletes memories matching a filter (and their vectors). Filters combine with AND; at least one is required. Use idPrefix "migrated:" to remove claude-mem imports. Always confirm with the user before calling.',
@@ -2032,16 +2164,123 @@ Already core (${existing.length}) \u2014 do not duplicate:`);
 };
 var coreTools = [coreAdd, coreList, coreRemove, coreSuggest];
 
+// src/tools/doc.ts
+function asLabels(v) {
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
+  if (typeof v === "string") return v.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+var docAdd = {
+  name: "memory_doc_add",
+  description: "Ingests an external documentation source (e.g. a Confluence page, a README, a spec) into memory so it becomes searchable later. This plugin does NO network access: YOU fetch the content first (via the Atlassian MCP, a web fetch, or a file) and pass it here. Provide `text` (the full body) to store it as vectorized chunks \u2014 semantic search over the real content offline (Tier 2). Omit `text` and pass a short `summary` to store only a lightweight pointer (title + URL + summary) to re-fetch on demand (Tier 1). Idempotent on `url`: re-ingesting the same URL refreshes it. Use for durable component/business knowledge you want to recall fast and precisely.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      url: {
+        type: "string",
+        description: "Canonical source URL \u2014 the identity key. Re-ingesting the same URL replaces it."
+      },
+      title: { type: "string", description: "Human title of the document/page." },
+      text: {
+        type: "string",
+        description: "Full body to ingest as searchable, vectorized chunks (Tier 2). Omit for a pointer-only memory."
+      },
+      summary: {
+        type: "string",
+        description: "Short summary stored on the pointer (Tier 1, used when `text` is omitted)."
+      },
+      labels: {
+        type: "array",
+        items: { type: "string" },
+        description: "Tags/labels (component, domain\u2026). Optional."
+      },
+      project: {
+        type: "string",
+        description: "Scope to a project (directory basename). Omit for a global doc."
+      },
+      fetched_at: {
+        type: "string",
+        description: "ISO timestamp of when the content was fetched (defaults to now)."
+      }
+    },
+    required: ["url", "title"],
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const url = String(args.url ?? "").trim();
+    const title = String(args.title ?? "").trim();
+    if (!url) return "\u274C `url` is required.";
+    if (!title) return "\u274C `title` is required.";
+    const text = args.text ? String(args.text) : void 0;
+    const { docId, chunks } = store.addDoc({
+      url,
+      title,
+      body: text,
+      summary: args.summary ? String(args.summary) : void 0,
+      labels: asLabels(args.labels),
+      project: args.project ? String(args.project) : void 0,
+      fetchedAt: args.fetched_at ? String(args.fetched_at) : void 0
+    });
+    const tier = text ? `Tier 2 \u2014 ${chunks} searchable chunk(s)` : "Tier 1 \u2014 pointer";
+    return `\u{1F4C4} Doc ingested (${tier}): "${title}"
+  ${url}
+  _doc_id: ${docId}_ \u2014 searchable now via \`memory_search\` (type: doc); vectors fill in the background.`;
+  }
+};
+var docList = {
+  name: "memory_doc_list",
+  description: "Lists ingested documentation sources (one entry per URL): title, labels, chunk count, fetch date. Optionally scoped to a project (also shows globals).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      project: { type: "string", description: "Limit to a project (also includes globals). Optional." }
+    },
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const docs = store.listDocs(args.project ? String(args.project) : void 0);
+    if (docs.length === 0) return "No ingested doc yet. Use `memory_doc_add`.";
+    return `\u{1F4C4} **${docs.length} ingested doc(s)**:
+
+` + docs.map((d) => {
+      const date = (d.fetchedAt ?? "").slice(0, 10);
+      const labels = d.labels.length ? ` [${d.labels.join(", ")}]` : "";
+      const scope = d.project ?? "global";
+      return `- **${d.title}** (${d.chunks} chunk${d.chunks > 1 ? "s" : ""})${labels}
+  \`${scope}\`${date ? ` \xB7 ${date}` : ""} \xB7 ${d.url}
+  _doc_id: ${d.docId}_`;
+    }).join("\n");
+  }
+};
+var docRemove = {
+  name: "memory_doc_remove",
+  description: "Removes an ingested doc and all its chunks by doc_id (get ids from memory_doc_list). Confirm with the user first.",
+  inputSchema: {
+    type: "object",
+    properties: { doc_id: { type: "string", description: 'The doc_id (e.g. "doc:ab12cd34ef56").' } },
+    required: ["doc_id"],
+    additionalProperties: false
+  },
+  handler: async (args, { store }) => {
+    const id = String(args.doc_id ?? "").trim();
+    if (!id) return "\u274C `doc_id` is required.";
+    const n = store.removeDoc(id);
+    return n > 0 ? `\u{1F5D1}\uFE0F Removed doc \`${id}\` (${n} row(s) + vectors).` : `No doc with doc_id \`${id}\`.`;
+  }
+};
+var docTools = [docAdd, docList, docRemove];
+
 // src/tools/index.ts
 var allTools = [
   ...searchTools,
   ...reindexTools,
   ...deleteTools,
-  ...coreTools
+  ...coreTools,
+  ...docTools
 ];
 
 // src/memory-server.ts
-var PKG_VERSION = true ? "0.11.0" : "0.0.0-dev";
+var PKG_VERSION = true ? "0.12.0" : "0.0.0-dev";
 var MemoryServer = class {
   constructor(config, store) {
     this.config = config;

@@ -1,7 +1,7 @@
 import type { ToolDefinition } from './types.js';
 import type { MemoryType } from '../store.js';
 
-const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
+const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight', 'doc'];
 
 /**
  * Destructive: removes memories matching a filter (+ their vectors). At least one filter is

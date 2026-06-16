@@ -11,10 +11,11 @@ export type MemoryType =
   | 'session'
   | 'digest'
   | 'insight'
-  | 'core';
+  | 'core'
+  | 'doc';
 
 // Doc types whose text is worth vectorizing. Observations (tool calls = identifiers) stay BM25-only.
-const VECTORIZABLE = ['prompt', 'turn', 'session', 'digest', 'insight', 'core'] as const;
+const VECTORIZABLE = ['prompt', 'turn', 'session', 'digest', 'insight', 'core', 'doc'] as const;
 const VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(',');
 
 /** Memory document. All fields are optional depending on the type. */
@@ -46,6 +47,17 @@ export interface MemoryDoc {
   satisfaction?: number;
   /** One or two words for the user's mood (e.g. "satisfied", "frustrated"). Set on digest docs. */
   mood?: string;
+  // ---- Doc fields (type 'doc': ingested external documentation) --------------------------
+  /** Canonical source URL of the document (identity key; all chunks of one source share it). */
+  url?: string;
+  /** Stable id grouping every chunk/pointer of one source (hash of the URL). */
+  doc_id?: string;
+  /** Human title of the document/page. */
+  title?: string;
+  /** Tags/labels attached to the doc (component, domain…). */
+  labels?: string[];
+  /** ISO timestamp of when the content was fetched (for staleness display). */
+  fetched_at?: string;
 }
 
 /**
@@ -100,6 +112,7 @@ const COLS = [
   'prompt_number', 'user_prompt', 'assistant_text', 'summary', 'tool_name', 'tool_brief',
   'tools', 'files_read', 'files_modified', 'prompts', 'prompts_text', 'turn_count',
   'started_at', 'ended_at', 'end_reason', 'source', 'satisfaction', 'mood',
+  'url', 'doc_id', 'title', 'labels', 'fetched_at',
 ] as const;
 
 const FTS_COLS = ['summary', 'user_prompt', 'assistant_text', 'tool_brief', 'prompts_text'];
@@ -185,6 +198,11 @@ function rowToDoc(r: any): MemoryDoc {
     source: r.source ?? undefined,
     satisfaction: r.satisfaction == null ? undefined : Number(r.satisfaction),
     mood: r.mood ?? undefined,
+    url: r.url ?? undefined,
+    doc_id: r.doc_id ?? undefined,
+    title: r.title ?? undefined,
+    labels: jsonArr(r.labels),
+    fetched_at: r.fetched_at ?? undefined,
   };
 }
 
@@ -260,13 +278,20 @@ export class MemoryStore {
         tools TEXT, files_read TEXT, files_modified TEXT,
         prompts TEXT, prompts_text TEXT,
         turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT,
-        satisfaction REAL, mood TEXT
+        satisfaction REAL, mood TEXT,
+        url TEXT, doc_id TEXT, title TEXT, labels TEXT, fetched_at TEXT
       );
     `);
     // Columns added after the initial schema: a CREATE TABLE IF NOT EXISTS won't add them to an
     // existing DB, so backfill them with ALTER TABLE (no-op once present).
     this.ensureColumn('memories', 'satisfaction', 'REAL');
     this.ensureColumn('memories', 'mood', 'TEXT');
+    this.ensureColumn('memories', 'url', 'TEXT');
+    this.ensureColumn('memories', 'doc_id', 'TEXT');
+    this.ensureColumn('memories', 'title', 'TEXT');
+    this.ensureColumn('memories', 'labels', 'TEXT');
+    this.ensureColumn('memories', 'fetched_at', 'TEXT');
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_mem_doc ON memories(type, doc_id);');
     this.db.exec('CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);');
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -370,6 +395,11 @@ export class MemoryStore {
       source: d.source ?? null,
       satisfaction: d.satisfaction ?? null,
       mood: d.mood ?? null,
+      url: d.url ?? null,
+      doc_id: d.doc_id ?? null,
+      title: d.title ?? null,
+      labels: JSON.stringify(d.labels ?? []),
+      fetched_at: d.fetched_at ?? null,
     };
     return COLS.map((c) => map[c]);
   }
@@ -860,6 +890,150 @@ export class MemoryStore {
     } catch {
       return { files: [] };
     }
+  }
+
+  // ---- Docs (curated, ingested external documentation) -----------------------------------
+
+  /** Chunk sizing (chars). ~1400 stays inside the e5 token window and the 2000-char embed slice. */
+  private static readonly DOC_CHUNK_CHARS = 1400;
+  private static readonly DOC_CHUNK_OVERLAP = 150;
+
+  /** Stable doc_id from a source URL — groups every chunk/pointer of one document. */
+  private docIdFor(url: string): string {
+    return 'doc:' + createHash('sha1').update(url.trim()).digest('hex').slice(0, 12);
+  }
+
+  /**
+   * Splits text into ~chunkChars pieces, preferring paragraph/sentence/word boundaries, with a small
+   * overlap so a fact straddling a cut stays recallable from either side.
+   */
+  private chunkText(
+    text: string,
+    chunkChars = MemoryStore.DOC_CHUNK_CHARS,
+    overlap = MemoryStore.DOC_CHUNK_OVERLAP,
+  ): string[] {
+    const clean = text.replace(/\r\n/g, '\n').trim();
+    if (clean.length <= chunkChars) return clean ? [clean] : [];
+    const chunks: string[] = [];
+    let i = 0;
+    while (i < clean.length) {
+      let end = Math.min(i + chunkChars, clean.length);
+      if (end < clean.length) {
+        const slice = clean.slice(i, end);
+        const min = chunkChars * 0.5; // don't cut too early — avoids tiny fragments
+        const para = slice.lastIndexOf('\n\n');
+        const sent = Math.max(slice.lastIndexOf('. '), slice.lastIndexOf('.\n'));
+        const ws = slice.lastIndexOf(' ');
+        const cut = para > min ? para : sent > min ? sent + 1 : ws > min ? ws : -1;
+        if (cut > 0) end = i + cut;
+      }
+      const piece = clean.slice(i, end).trim();
+      if (piece) chunks.push(piece);
+      if (end >= clean.length) break;
+      i = Math.max(end - overlap, i + 1);
+    }
+    return chunks;
+  }
+
+  /**
+   * Ingests an external documentation source (idempotent on its URL). With `body`, stores it as N
+   * vectorized chunks (Tier 2 — semantic search on the real content); otherwise stores a single
+   * pointer row carrying title + summary + URL (Tier 1 — light, re-fetch on demand). Re-ingesting the
+   * same URL replaces all its rows. Vectors are filled in the background by the server's backfill.
+   */
+  addDoc(input: {
+    url: string;
+    title: string;
+    summary?: string;
+    body?: string;
+    labels?: string[];
+    project?: string;
+    fetchedAt?: string;
+  }): { docId: string; chunks: number } {
+    const url = input.url.trim();
+    const title = input.title.trim();
+    const docId = this.docIdFor(url);
+    const labels = (input.labels ?? []).filter((s) => typeof s === 'string' && s.trim());
+    const fetchedAt = input.fetchedAt ?? new Date().toISOString();
+    this.removeDoc(docId); // idempotent refresh: drop the previous version's rows + vectors
+
+    const base: Partial<MemoryDoc> = {
+      type: 'doc',
+      project: input.project,
+      url,
+      doc_id: docId,
+      title,
+      labels,
+      fetched_at: fetchedAt,
+      ts: fetchedAt,
+    };
+
+    const body = (input.body ?? '').trim();
+    if (body) {
+      // Tier 2: one searchable+vectorized row per chunk. The title is prepended to each chunk so it
+      // grounds the embedding and matches BM25 on every fragment of the document.
+      const pieces = this.chunkText(body);
+      pieces.forEach((piece, i) => {
+        this.upsert(`${docId}:${i}`, {
+          ...(base as MemoryDoc),
+          summary: `${title}\n\n${piece}`.slice(0, 4000),
+        });
+      });
+      return { docId, chunks: pieces.length };
+    }
+
+    // Tier 1: a single lightweight pointer row.
+    this.upsert(docId, {
+      ...(base as MemoryDoc),
+      summary: (input.summary ? `${title} — ${input.summary}` : title).slice(0, 2000),
+    });
+    return { docId, chunks: 1 };
+  }
+
+  /** Lists ingested docs (one entry per source URL), most recent first. Scoped to project + globals. */
+  listDocs(project?: string): Array<{
+    docId: string;
+    title: string;
+    url: string;
+    labels: string[];
+    fetchedAt?: string;
+    chunks: number;
+    project?: string;
+  }> {
+    const where = ["type='doc'"];
+    const args: unknown[] = [];
+    if (project) {
+      where.push('(project = ? OR project IS NULL)');
+      args.push(project);
+    }
+    const rows = this.db
+      .prepare(
+        `SELECT doc_id, MAX(title) title, MAX(url) url, MAX(labels) labels, MAX(fetched_at) fetched_at,
+                MAX(project) project, COUNT(*) c, MAX(ts_epoch) e
+         FROM memories WHERE ${where.join(' AND ')}
+         GROUP BY doc_id ORDER BY e DESC;`,
+      )
+      .all(...args);
+    return rows.map((r: any) => ({
+      docId: r.doc_id,
+      title: r.title ?? '(untitled)',
+      url: r.url ?? '',
+      labels: jsonArr(r.labels),
+      fetchedAt: r.fetched_at ?? undefined,
+      chunks: Number(r.c),
+      project: r.project ?? undefined,
+    }));
+  }
+
+  /** Removes every row (chunks + pointer) of an ingested doc by its doc_id (+ vectors). */
+  removeDoc(docId: string): number {
+    const rids = this.db
+      .prepare(`SELECT rowid FROM memories WHERE type='doc' AND doc_id = ?;`)
+      .all(docId)
+      .map((r: any) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE type='doc' AND doc_id = ?;`).run(docId);
+    return Number(info?.changes ?? rids.length);
   }
 
   /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */

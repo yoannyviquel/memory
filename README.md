@@ -274,6 +274,13 @@ backfill rate). Notes:
   recurs across many memories (`memory_core_suggest` surfaces signals; the user must agree before it
   is saved). Tools: `memory_core_add` / `memory_core_list` / `memory_core_remove` / `memory_core_suggest`,
   or `/memory:core`. Global by default, or scoped to a project.
+- **Ingested docs** (curated knowledge): feed external documentation — a Confluence page, a README, a
+  spec — into memory so it becomes searchable like everything else. The plugin does **no network
+  access**: Claude fetches the content (e.g. via the Atlassian MCP) and passes it to `memory_doc_add`.
+  Two granularities: **Tier 1** (pointer = title + URL + summary, re-fetch on demand) and **Tier 2**
+  (full body → vectorized chunks, semantic search over the real content offline). Idempotent per URL
+  (re-ingest refreshes). Like core memories, `doc` is *curated* — the digest loop never touches it.
+  Tools: `memory_doc_add` / `memory_doc_list` / `memory_doc_remove`. Filter searches with `type: doc`.
 - **Search** via MCP: `memory_search` (hybrid), `memory_recent`, `memory_stats`.
 - **Reindex** via MCP `memory_reindex` (or `/memory:reindex`): rebuild vectors and/or regenerate digests.
 - **Migration** of claude-mem history (SQLite) → memory database.

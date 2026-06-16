@@ -1,7 +1,7 @@
 import type { ToolDefinition } from './types.js';
 import { satisfactionFactor, type MemoryDoc, type MemoryType } from '../store.js';
 
-const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight'];
+const TYPES = ['observation', 'prompt', 'turn', 'session', 'digest', 'insight', 'doc'];
 
 /** Compact mood marker for a doc carrying a satisfaction signal (😀 satisfied / 😐 neutral / 🙁 not). */
 function moodMarker(d: MemoryDoc): string {
@@ -23,7 +23,9 @@ function fmtDoc(d: MemoryDoc): string {
   const text = label.replace(/\s+/g, ' ').trim().slice(0, 300);
   const files = (d.files_modified ?? []).slice(0, 4);
   const filesLine = files.length ? `\n  📝 ${files.join(', ')}` : '';
-  return `- **[${d.type}]** \`${proj}\` · ${date}${moodMarker(d)}\n  ${text}${filesLine}`;
+  // Docs: surface the source URL so the model can re-fetch the full page when it needs more.
+  const docLine = d.type === 'doc' && d.url ? `\n  📄 ${d.title ? `${d.title} · ` : ''}${d.url}` : '';
+  return `- **[${d.type}]** \`${proj}\` · ${date}${moodMarker(d)}\n  ${text}${docLine}${filesLine}`;
 }
 
 /** Text handed to the cross-encoder reranker for a candidate doc. */

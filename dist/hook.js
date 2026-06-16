@@ -114,7 +114,7 @@ import { fileURLToPath } from "url";
 import { createRequire } from "module";
 import { createHash } from "crypto";
 import path2 from "path";
-var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core"];
+var VECTORIZABLE = ["prompt", "turn", "session", "digest", "insight", "core", "doc"];
 var VECTORIZABLE_SQL = VECTORIZABLE.map((t) => `'${t}'`).join(",");
 function satisfactionFactor(satisfaction, weight) {
   if (weight <= 0 || satisfaction == null || !Number.isFinite(satisfaction)) return 1;
@@ -148,7 +148,12 @@ var COLS = [
   "end_reason",
   "source",
   "satisfaction",
-  "mood"
+  "mood",
+  "url",
+  "doc_id",
+  "title",
+  "labels",
+  "fetched_at"
 ];
 var FTS_COLS = ["summary", "user_prompt", "assistant_text", "tool_brief", "prompts_text"];
 var BM25_WEIGHTS = "3.0, 2.0, 1.0, 1.0, 1.5";
@@ -218,13 +223,18 @@ function rowToDoc(r) {
     end_reason: r.end_reason ?? void 0,
     source: r.source ?? void 0,
     satisfaction: r.satisfaction == null ? void 0 : Number(r.satisfaction),
-    mood: r.mood ?? void 0
+    mood: r.mood ?? void 0,
+    url: r.url ?? void 0,
+    doc_id: r.doc_id ?? void 0,
+    title: r.title ?? void 0,
+    labels: jsonArr(r.labels),
+    fetched_at: r.fetched_at ?? void 0
   };
 }
 function toBlob(arr) {
   return new Uint8Array(Float32Array.from(arr).buffer);
 }
-var MemoryStore = class {
+var MemoryStore = class _MemoryStore {
   constructor(dbPath, dim = 384, model = "", embedTextVersion = 0) {
     this.dbPath = dbPath;
     this.dim = dim;
@@ -281,11 +291,18 @@ var MemoryStore = class {
         tools TEXT, files_read TEXT, files_modified TEXT,
         prompts TEXT, prompts_text TEXT,
         turn_count INTEGER, started_at TEXT, ended_at TEXT, end_reason TEXT, source TEXT,
-        satisfaction REAL, mood TEXT
+        satisfaction REAL, mood TEXT,
+        url TEXT, doc_id TEXT, title TEXT, labels TEXT, fetched_at TEXT
       );
     `);
     this.ensureColumn("memories", "satisfaction", "REAL");
     this.ensureColumn("memories", "mood", "TEXT");
+    this.ensureColumn("memories", "url", "TEXT");
+    this.ensureColumn("memories", "doc_id", "TEXT");
+    this.ensureColumn("memories", "title", "TEXT");
+    this.ensureColumn("memories", "labels", "TEXT");
+    this.ensureColumn("memories", "fetched_at", "TEXT");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_mem_doc ON memories(type, doc_id);");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_mem_recent ON memories(project, type, ts_epoch);");
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -370,7 +387,12 @@ var MemoryStore = class {
       end_reason: d.end_reason ?? null,
       source: d.source ?? null,
       satisfaction: d.satisfaction ?? null,
-      mood: d.mood ?? null
+      mood: d.mood ?? null,
+      url: d.url ?? null,
+      doc_id: d.doc_id ?? null,
+      title: d.title ?? null,
+      labels: JSON.stringify(d.labels ?? []),
+      fetched_at: d.fetched_at ?? null
     };
     return COLS.map((c) => map[c]);
   }
@@ -754,6 +776,114 @@ var MemoryStore = class {
     } catch {
       return { files: [] };
     }
+  }
+  // ---- Docs (curated, ingested external documentation) -----------------------------------
+  /** Chunk sizing (chars). ~1400 stays inside the e5 token window and the 2000-char embed slice. */
+  static DOC_CHUNK_CHARS = 1400;
+  static DOC_CHUNK_OVERLAP = 150;
+  /** Stable doc_id from a source URL — groups every chunk/pointer of one document. */
+  docIdFor(url) {
+    return "doc:" + createHash("sha1").update(url.trim()).digest("hex").slice(0, 12);
+  }
+  /**
+   * Splits text into ~chunkChars pieces, preferring paragraph/sentence/word boundaries, with a small
+   * overlap so a fact straddling a cut stays recallable from either side.
+   */
+  chunkText(text, chunkChars = _MemoryStore.DOC_CHUNK_CHARS, overlap = _MemoryStore.DOC_CHUNK_OVERLAP) {
+    const clean = text.replace(/\r\n/g, "\n").trim();
+    if (clean.length <= chunkChars) return clean ? [clean] : [];
+    const chunks = [];
+    let i = 0;
+    while (i < clean.length) {
+      let end = Math.min(i + chunkChars, clean.length);
+      if (end < clean.length) {
+        const slice = clean.slice(i, end);
+        const min = chunkChars * 0.5;
+        const para = slice.lastIndexOf("\n\n");
+        const sent = Math.max(slice.lastIndexOf(". "), slice.lastIndexOf(".\n"));
+        const ws = slice.lastIndexOf(" ");
+        const cut = para > min ? para : sent > min ? sent + 1 : ws > min ? ws : -1;
+        if (cut > 0) end = i + cut;
+      }
+      const piece = clean.slice(i, end).trim();
+      if (piece) chunks.push(piece);
+      if (end >= clean.length) break;
+      i = Math.max(end - overlap, i + 1);
+    }
+    return chunks;
+  }
+  /**
+   * Ingests an external documentation source (idempotent on its URL). With `body`, stores it as N
+   * vectorized chunks (Tier 2 — semantic search on the real content); otherwise stores a single
+   * pointer row carrying title + summary + URL (Tier 1 — light, re-fetch on demand). Re-ingesting the
+   * same URL replaces all its rows. Vectors are filled in the background by the server's backfill.
+   */
+  addDoc(input) {
+    const url = input.url.trim();
+    const title = input.title.trim();
+    const docId = this.docIdFor(url);
+    const labels = (input.labels ?? []).filter((s) => typeof s === "string" && s.trim());
+    const fetchedAt = input.fetchedAt ?? (/* @__PURE__ */ new Date()).toISOString();
+    this.removeDoc(docId);
+    const base = {
+      type: "doc",
+      project: input.project,
+      url,
+      doc_id: docId,
+      title,
+      labels,
+      fetched_at: fetchedAt,
+      ts: fetchedAt
+    };
+    const body = (input.body ?? "").trim();
+    if (body) {
+      const pieces = this.chunkText(body);
+      pieces.forEach((piece, i) => {
+        this.upsert(`${docId}:${i}`, {
+          ...base,
+          summary: `${title}
+
+${piece}`.slice(0, 4e3)
+        });
+      });
+      return { docId, chunks: pieces.length };
+    }
+    this.upsert(docId, {
+      ...base,
+      summary: (input.summary ? `${title} \u2014 ${input.summary}` : title).slice(0, 2e3)
+    });
+    return { docId, chunks: 1 };
+  }
+  /** Lists ingested docs (one entry per source URL), most recent first. Scoped to project + globals. */
+  listDocs(project) {
+    const where = ["type='doc'"];
+    const args = [];
+    if (project) {
+      where.push("(project = ? OR project IS NULL)");
+      args.push(project);
+    }
+    const rows = this.db.prepare(
+      `SELECT doc_id, MAX(title) title, MAX(url) url, MAX(labels) labels, MAX(fetched_at) fetched_at,
+                MAX(project) project, COUNT(*) c, MAX(ts_epoch) e
+         FROM memories WHERE ${where.join(" AND ")}
+         GROUP BY doc_id ORDER BY e DESC;`
+    ).all(...args);
+    return rows.map((r) => ({
+      docId: r.doc_id,
+      title: r.title ?? "(untitled)",
+      url: r.url ?? "",
+      labels: jsonArr(r.labels),
+      fetchedAt: r.fetched_at ?? void 0,
+      chunks: Number(r.c),
+      project: r.project ?? void 0
+    }));
+  }
+  /** Removes every row (chunks + pointer) of an ingested doc by its doc_id (+ vectors). */
+  removeDoc(docId) {
+    const rids = this.db.prepare(`SELECT rowid FROM memories WHERE type='doc' AND doc_id = ?;`).all(docId).map((r) => Number(r.rowid));
+    this.deleteVectors(rids);
+    const info = this.db.prepare(`DELETE FROM memories WHERE type='doc' AND doc_id = ?;`).run(docId);
+    return Number(info?.changes ?? rids.length);
   }
   /** vec0 has no FK to memories → orphan vectors must be removed explicitly on delete. */
   deleteVectors(rowids) {
