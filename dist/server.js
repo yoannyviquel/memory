@@ -1523,6 +1523,14 @@ import path5 from "path";
 var KINDS = /* @__PURE__ */ new Set(["decision", "bugfix", "discovery", "conclusion"]);
 var INPUT_BUDGET = 48e3;
 var TIMEOUT_MS = 18e4;
+var QUOTA_RE = /usage limit reached|rate[ _-]?limit|\b429\b|\b529\b|overloaded|quota (?:exceeded|reached)|insufficient_quota/i;
+function parseResetMs(text) {
+  const m = text.match(/usage limit reached\s*\|\s*(\d{9,13})/i);
+  if (!m) return void 0;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return void 0;
+  return n < 1e12 ? n * 1e3 : n;
+}
 function renderSession(input) {
   const parts = [];
   let size = 0;
@@ -1620,7 +1628,7 @@ function runClaude(prompt, model) {
   return new Promise((resolve) => {
     const exe = resolveClaudeExe();
     if (!exe) {
-      resolve(null);
+      resolve({ kind: "fail" });
       return;
     }
     const args = [
@@ -1640,11 +1648,18 @@ function runClaude(prompt, model) {
         env: { ...process.env, MEMORY_HOOK_DISABLE: "1" }
       });
     } catch {
-      resolve(null);
+      resolve({ kind: "fail" });
       return;
     }
     let out = "";
+    let err = "";
     let done = false;
+    const classifyFailure = () => {
+      const blob = `${out}
+${err}`;
+      if (QUOTA_RE.test(blob)) return { kind: "rate_limited", retryAtMs: parseResetMs(blob) };
+      return { kind: "fail" };
+    };
     const finish = (v) => {
       if (done) return;
       done = true;
@@ -1655,39 +1670,50 @@ function runClaude(prompt, model) {
       }
       resolve(v);
     };
-    const timer = setTimeout(() => finish(null), TIMEOUT_MS);
+    const timer = setTimeout(() => finish({ kind: "fail" }), TIMEOUT_MS);
     timer.unref?.();
-    child.on("error", () => finish(null));
+    child.on("error", () => finish({ kind: "fail" }));
     child.stdout?.on("data", (d) => out += d);
+    child.stderr?.on("data", (d) => err += d);
     child.on("close", (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       if (code !== 0) {
-        resolve(null);
+        resolve(classifyFailure());
         return;
       }
+      let envelope;
       try {
-        resolve(JSON.parse(out));
+        envelope = JSON.parse(out);
       } catch {
-        resolve(null);
+        resolve(classifyFailure());
+        return;
       }
+      if (envelope?.is_error && QUOTA_RE.test(String(envelope.result ?? out))) {
+        resolve({ kind: "rate_limited", retryAtMs: parseResetMs(String(envelope.result ?? out)) });
+        return;
+      }
+      resolve({ kind: "ok", envelope });
     });
     try {
       child.stdin?.write(prompt);
       child.stdin?.end();
     } catch {
-      finish(null);
+      finish({ kind: "fail" });
     }
   });
 }
 async function digestSession(input) {
-  if (input.turns.length === 0) return null;
-  const envelope = await runClaude(buildPrompt(input), input.model);
-  if (!envelope || typeof envelope.result !== "string") return null;
+  if (input.turns.length === 0) return { status: "skip" };
+  const run = await runClaude(buildPrompt(input), input.model);
+  if (run.kind === "rate_limited") return { status: "rate_limited", retryAtMs: run.retryAtMs };
+  if (run.kind !== "ok") return { status: "skip" };
+  const envelope = run.envelope;
+  if (!envelope || typeof envelope.result !== "string") return { status: "skip" };
   const parsed = extractJsonObject(envelope.result);
   const conclusion = parsed && typeof parsed.conclusion === "string" && parsed.conclusion.trim() || envelope.result.trim().slice(0, 1e3);
-  if (!conclusion) return null;
+  if (!conclusion) return { status: "skip" };
   const rawInsights = parsed && Array.isArray(parsed.insights) ? parsed.insights : [];
   const insights = rawInsights.filter((x) => x && typeof x.text === "string" && x.text.trim()).slice(0, 8).map((x) => ({
     kind: KINDS.has(x.kind) ? x.kind : "discovery",
@@ -1698,12 +1724,15 @@ async function digestSession(input) {
   const satisfaction = Number.isFinite(satRaw) ? Math.max(0, Math.min(1, satRaw)) : 0.5;
   const mood = parsed && typeof parsed.mood === "string" && parsed.mood.trim() ? parsed.mood.trim().slice(0, 40) : void 0;
   return {
-    conclusion,
-    insights,
-    satisfaction,
-    mood,
-    usage: envelope.usage,
-    costUsd: typeof envelope.total_cost_usd === "number" ? envelope.total_cost_usd : void 0
+    status: "ok",
+    result: {
+      conclusion,
+      insights,
+      satisfaction,
+      mood,
+      usage: envelope.usage,
+      costUsd: typeof envelope.total_cost_usd === "number" ? envelope.total_cost_usd : void 0
+    }
   };
 }
 
@@ -1720,6 +1749,9 @@ function uniq(arr) {
 // src/digest-loop.ts
 var DIGEST_INTERVAL_MS = 6e4;
 var DIGEST_PER_TICK = 3;
+var BACKOFF_MIN_MS = 5 * 6e4;
+var BACKOFF_MAX_MS = 60 * 6e4;
+var RESET_BUFFER_MS = 1e4;
 var DigestLoop = class {
   constructor(store, cfg) {
     this.store = store;
@@ -1730,6 +1762,29 @@ var DigestLoop = class {
   running = false;
   timer;
   warnedNoClaude = false;
+  // Quota pause: epoch-ms until which we must NOT call `claude -p` (0 = not paused). `backoffMs`
+  // holds the current exponential step used when the limit carries no explicit reset time.
+  pausedUntilMs = 0;
+  backoffMs = 0;
+  /** Records a usage/rate-limit hit and arms the pause (honoring an explicit reset, else backoff). */
+  pauseForRateLimit(retryAtMs) {
+    const now = Date.now();
+    let until;
+    if (retryAtMs && retryAtMs > now) {
+      until = retryAtMs + RESET_BUFFER_MS;
+    } else {
+      this.backoffMs = this.backoffMs ? Math.min(this.backoffMs * 2, BACKOFF_MAX_MS) : BACKOFF_MIN_MS;
+      until = now + this.backoffMs;
+    }
+    this.pausedUntilMs = until;
+    const iso = new Date(until).toISOString();
+    log(this.cfg.dataDir, `[digest] usage/rate-limit hit \u2192 pausing digests until ${iso}`);
+    writeStatus(this.cfg.dataDir, {
+      state: "idle",
+      digestPending: this.store.countSessionsNeedingDigest(this.cfg.digest.version),
+      digestPausedUntil: iso
+    });
+  }
   /** Kicks one pass now and every interval afterwards. */
   start() {
     if (this.timer || !this.cfg.digest.enabled) return;
@@ -1744,6 +1799,7 @@ var DigestLoop = class {
   /** One drip of digests (up to DIGEST_PER_TICK sessions). Best-effort: never blocks the server. */
   async run() {
     if (this.running || !this.cfg.digest.enabled) return;
+    if (this.pausedUntilMs && Date.now() < this.pausedUntilMs) return;
     if (!claudeAvailable()) {
       if (!this.warnedNoClaude) {
         this.warnedNoClaude = true;
@@ -1763,14 +1819,21 @@ var DigestLoop = class {
           loadPercent: this.cfg.loadPercent
         });
         const t0 = Date.now();
-        const result = await digestSession({
+        const outcome = await digestSession({
           session_id: sess.session_id,
           project: sess.project,
           branch: sess.branch,
           model: this.cfg.digest.model,
           turns
         });
-        if (!result) continue;
+        if (outcome.status === "rate_limited") {
+          this.pauseForRateLimit(outcome.retryAtMs);
+          return;
+        }
+        if (outcome.status !== "ok") continue;
+        this.pausedUntilMs = 0;
+        this.backoffMs = 0;
+        const result = outcome.result;
         const ts = nowIso();
         const base = { session_id: sess.session_id, project: sess.project, branch: sess.branch, ts };
         const digestFiles = uniq(result.insights.flatMap((i) => i.files ?? []));

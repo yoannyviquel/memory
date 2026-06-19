@@ -44,6 +44,39 @@ const KINDS = new Set(['decision', 'bugfix', 'discovery', 'conclusion']);
 const INPUT_BUDGET = 48_000; // chars of session text fed to the model
 const TIMEOUT_MS = 180_000;
 
+/**
+ * Signatures of a usage/rate-limit/quota exhaustion in `claude -p` output (stdout JSON, stderr, or
+ * the human "Claude AI usage limit reached" line). When matched, the digest loop must PAUSE rather
+ * than keep retrying every tick — otherwise it hammers a quota that is already spent.
+ */
+const QUOTA_RE =
+  /usage limit reached|rate[ _-]?limit|\b429\b|\b529\b|overloaded|quota (?:exceeded|reached)|insufficient_quota/i;
+
+/**
+ * Parses a reset time when the CLI exposes one. The headless usage-limit line carries an epoch:
+ * `Claude AI usage limit reached|1700000000`. Returns the reset moment in epoch-ms, or undefined
+ * (caller then falls back to exponential backoff). Tolerates epoch given in seconds or ms.
+ */
+export function parseResetMs(text: string): number | undefined {
+  const m = text.match(/usage limit reached\s*\|\s*(\d{9,13})/i);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n)) return undefined;
+  return n < 1e12 ? n * 1000 : n; // seconds → ms
+}
+
+/** Outcome of one digest attempt: a result, a quota pause signal, or a skippable failure. */
+export type DigestOutcome =
+  | { status: 'ok'; result: DigestResult }
+  | { status: 'rate_limited'; retryAtMs?: number }
+  | { status: 'skip' };
+
+/** Outcome of one `claude -p` invocation. */
+type ClaudeRun =
+  | { kind: 'ok'; envelope: any }
+  | { kind: 'rate_limited'; retryAtMs?: number }
+  | { kind: 'fail' };
+
 /** Builds the session text fed to the digest model (chronological, budget-capped). */
 function renderSession(input: DigestInput): string {
   const parts: string[] = [];
@@ -157,11 +190,11 @@ export function claudeAvailable(): boolean {
  * without a shell (native exe) so the empty-string arg survives. Prompt via stdin. Returns the JSON
  * envelope, or null. Verified flags for CLI v2.1.x (no --max-turns in this version).
  */
-function runClaude(prompt: string, model?: string): Promise<any | null> {
+function runClaude(prompt: string, model?: string): Promise<ClaudeRun> {
   return new Promise((resolve) => {
     const exe = resolveClaudeExe();
     if (!exe) {
-      resolve(null);
+      resolve({ kind: 'fail' });
       return;
     }
     const args = [
@@ -181,12 +214,19 @@ function runClaude(prompt: string, model?: string): Promise<any | null> {
         env: { ...process.env, MEMORY_HOOK_DISABLE: '1' },
       });
     } catch {
-      resolve(null);
+      resolve({ kind: 'fail' });
       return;
     }
     let out = '';
+    let err = '';
     let done = false;
-    const finish = (v: any | null) => {
+    // Classifies a non-success run: a quota/rate-limit signal (→ pause) vs a generic failure (→ skip).
+    const classifyFailure = (): ClaudeRun => {
+      const blob = `${out}\n${err}`;
+      if (QUOTA_RE.test(blob)) return { kind: 'rate_limited', retryAtMs: parseResetMs(blob) };
+      return { kind: 'fail' };
+    };
+    const finish = (v: ClaudeRun) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
@@ -197,44 +237,60 @@ function runClaude(prompt: string, model?: string): Promise<any | null> {
       }
       resolve(v);
     };
-    const timer = setTimeout(() => finish(null), TIMEOUT_MS);
+    const timer = setTimeout(() => finish({ kind: 'fail' }), TIMEOUT_MS);
     timer.unref?.();
-    child.on('error', () => finish(null)); // ENOENT: claude not on PATH
+    child.on('error', () => finish({ kind: 'fail' })); // ENOENT: claude not on PATH
     child.stdout?.on('data', (d) => (out += d));
+    child.stderr?.on('data', (d) => (err += d));
     child.on('close', (code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
       if (code !== 0) {
-        resolve(null);
+        resolve(classifyFailure());
         return;
       }
+      let envelope: any;
       try {
-        resolve(JSON.parse(out));
+        envelope = JSON.parse(out);
       } catch {
-        resolve(null);
+        resolve(classifyFailure());
+        return;
       }
+      // A zero exit can still carry an in-band error (is_error) whose text is a quota signal.
+      if (envelope?.is_error && QUOTA_RE.test(String(envelope.result ?? out))) {
+        resolve({ kind: 'rate_limited', retryAtMs: parseResetMs(String(envelope.result ?? out)) });
+        return;
+      }
+      resolve({ kind: 'ok', envelope });
     });
     try {
       child.stdin?.write(prompt);
       child.stdin?.end();
     } catch {
-      finish(null);
+      finish({ kind: 'fail' });
     }
   });
 }
 
-/** Compresses a session into a conclusion + typed insights. Best-effort: null on any failure. */
-export async function digestSession(input: DigestInput): Promise<DigestResult | null> {
-  if (input.turns.length === 0) return null;
-  const envelope = await runClaude(buildPrompt(input), input.model);
-  if (!envelope || typeof envelope.result !== 'string') return null;
+/**
+ * Compresses a session into a conclusion + typed insights. Best-effort: returns `skip` on any
+ * non-quota failure (raw turns stay searchable), or `rate_limited` when `claude -p` reports a
+ * usage/rate-limit so the caller can pause instead of hammering a spent quota.
+ */
+export async function digestSession(input: DigestInput): Promise<DigestOutcome> {
+  if (input.turns.length === 0) return { status: 'skip' };
+  const run = await runClaude(buildPrompt(input), input.model);
+  if (run.kind === 'rate_limited') return { status: 'rate_limited', retryAtMs: run.retryAtMs };
+  if (run.kind !== 'ok') return { status: 'skip' };
+  const envelope = run.envelope;
+  if (!envelope || typeof envelope.result !== 'string') return { status: 'skip' };
 
   const parsed = extractJsonObject(envelope.result);
   const conclusion =
     (parsed && typeof parsed.conclusion === 'string' && parsed.conclusion.trim()) ||
     envelope.result.trim().slice(0, 1000);
-  if (!conclusion) return null;
+  if (!conclusion) return { status: 'skip' };
 
   const rawInsights: any[] = parsed && Array.isArray(parsed.insights) ? parsed.insights : [];
   const insights: Insight[] = rawInsights
@@ -257,11 +313,14 @@ export async function digestSession(input: DigestInput): Promise<DigestResult | 
       : undefined;
 
   return {
-    conclusion,
-    insights,
-    satisfaction,
-    mood,
-    usage: envelope.usage,
-    costUsd: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : undefined,
+    status: 'ok',
+    result: {
+      conclusion,
+      insights,
+      satisfaction,
+      mood,
+      usage: envelope.usage,
+      costUsd: typeof envelope.total_cost_usd === 'number' ? envelope.total_cost_usd : undefined,
+    },
   };
 }

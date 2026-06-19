@@ -43,6 +43,8 @@ export interface MemStatus {
   missing?: number;
   /** sessions still awaiting an LLM digest (digesting state). */
   digestPending?: number;
+  /** ISO time until which digesting is paused after a `claude -p` usage/rate-limit (quota). */
+  digestPausedUntil?: string;
   /** active background-load cap (duty-cycle %); <100 means the loops are pacing themselves. */
   loadPercent?: number;
   updatedAt: string;
